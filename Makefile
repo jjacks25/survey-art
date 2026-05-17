@@ -44,4 +44,4 @@ process: build ## Scraper | Scrape records for an address: make process ADDRESS=
 	  --env-file .env \
 	  -v $(PWD)/tmp:/app/tmp \
 	  $(IMAGE):$(TAG) \
-	  uv run land-survey-scraper $(ADDRESS)
+	  uv run land-survey-scraper "$(ADDRESS)"

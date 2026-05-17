@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     weld_erecording_username: str = ""
     weld_erecording_password: str = ""
 
+    # Denver County Clerk & Recorder (Kofile Tech) login
+    co_denver_username: str = ""
+    co_denver_password: str = ""
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
