@@ -88,8 +88,11 @@ async def _get_owner_info(address: str) -> tuple[dict | None, float, int, int]:
         f"On the property detail page, read and return EXACTLY the following fields:\n\n"
         f"  SCHEDULE: [the account number or schedule number shown on the page]\n"
         f"  OWNER: [the current owner name shown on the page]\n"
-        f"  LEGAL: [the full legal description shown on the page]\n\n"
-        f"Return only those three lines. No explanation, no extra text."
+        f"  LEGAL: [the full legal description shown on the page]\n"
+        f"  PREV_OWNER: [the previous/prior owner name if shown in sale/transfer history, else blank]\n"
+        f"  RECEPTIONS: [any reception numbers or document numbers visible on the page,\n"
+        f"               comma-separated; else blank]\n\n"
+        f"Return only those five lines. No explanation, no extra text."
     )
     agent = Agent(task=task, llm=get_llm(), use_thinking=False, calculate_cost=True)
     result = await agent.run()
@@ -98,19 +101,29 @@ async def _get_owner_info(address: str) -> tuple[dict | None, float, int, int]:
     text = str(result).strip()
     logger.debug("Spatialest agent raw result: %s", text)
 
-    info: dict = {"schedule": "", "owner": "", "legal": ""}
+    info: dict = {"schedule": "", "owner": "", "legal": "", "prev_owner": "", "receptions": ""}
     for line in text.splitlines():
-        if line.upper().startswith("SCHEDULE:"):
-            info["schedule"] = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("OWNER:"):
-            info["owner"] = line.split(":", 1)[1].strip()
-        elif line.upper().startswith("LEGAL:"):
-            info["legal"] = line.split(":", 1)[1].strip()
+        # Strip leading bullet points, dashes, asterisks, and whitespace so the
+        # parser handles "- SCHEDULE: ..." and "  OWNER: ..." in addition to the
+        # bare "SCHEDULE: ..." format we asked for.
+        stripped = re.sub(r"^[\s\-\*\•]+", "", line).strip()
+        upper = stripped.upper()
+        if upper.startswith("SCHEDULE:"):
+            info["schedule"] = stripped.split(":", 1)[1].strip()
+        elif upper.startswith("OWNER:"):
+            info["owner"] = stripped.split(":", 1)[1].strip()
+        elif upper.startswith("LEGAL:"):
+            info["legal"] = stripped.split(":", 1)[1].strip()
+        elif upper.startswith("PREV_OWNER:"):
+            info["prev_owner"] = stripped.split(":", 1)[1].strip()
+        elif upper.startswith("RECEPTIONS:"):
+            info["receptions"] = stripped.split(":", 1)[1].strip()
 
     if info["owner"] or info["schedule"]:
         logger.info(
-            "Denver Assessor: schedule=%s owner=%s legal=%s",
-            info["schedule"], info["owner"], info["legal"],
+            "Denver Assessor: schedule=%s owner=%s prev_owner=%s receptions=%s legal=%s",
+            info["schedule"], info["owner"], info["prev_owner"],
+            info["receptions"], info["legal"],
         )
         return info, cost, in_tok, out_tok
 
@@ -142,48 +155,94 @@ async def _download_documents(
         owner = owner_info.get("owner", "")
         schedule = owner_info.get("schedule", "")
         legal = owner_info.get("legal", "")
+        prev_owner = owner_info.get("prev_owner", "")
+        receptions = owner_info.get("receptions", "")
         keyword = _distinctive_word(owner) if owner else ""
+
+        # Build a list of name variants to try in Kofile when the full name fails.
+        # Kofile normalises '&' to 'AND' internally, so a search for the literal '&'
+        # may return zero results even when the document exists.
+        name_variants: list[str] = [owner]
+        if "&" in owner:
+            name_variants.append(owner.replace("&", "AND"))
+            before_amp = owner.split("&")[0].strip()
+            after_amp = owner.split("&", 1)[1].strip()
+            if before_amp:
+                name_variants.append(before_amp)
+            if after_amp:
+                name_variants.append(after_amp)
+        if keyword and keyword not in name_variants:
+            name_variants.append(keyword)
+        if prev_owner and prev_owner not in name_variants:
+            name_variants.append(prev_owner)
+
+        variant_lines = "\n".join(
+            f"    {chr(96 + i)}. '{v}'" for i, v in enumerate(name_variants[1:], start=1)
+        )
+
+        reception_step = ""
+        if receptions:
+            reception_step = (
+                f"STEP 4b — If names search finds nothing, search by Reception Number:\n"
+                f"  Select the 'Reception Number' search type.\n"
+                f"  Try each of these numbers: {receptions}\n"
+                f"  Download every document returned.\n\n"
+            )
+
+        prev_owner_step = ""
+        if prev_owner:
+            prev_kw = _distinctive_word(prev_owner)
+            prev_owner_step = (
+                f"STEP 4c — Search by previous owner (documents recorded before current owner):\n"
+                f"  Select the 'Names' search type.\n"
+                f"  In the Last Name field enter the previous owner: '{prev_owner}'\n"
+                f"  Click Search. Look for SURVEY, PLAT MAP, DEED, EASEMENT documents.\n"
+                f"  If too many results, narrow to distinctive keyword: '{prev_kw}'\n"
+                f"  Download any you have not already downloaded.\n\n"
+            )
 
         owner_block = (
             f"Property owner (from Denver Assessor): {owner}\n"
             f"Schedule Number: {schedule}\n"
-            f"Legal Description: {legal}\n\n"
+            f"Legal Description: {legal}\n"
+            + (f"Previous owner: {prev_owner}\n" if prev_owner else "")
+            + (f"Known reception numbers: {receptions}\n" if receptions else "")
+            + "\n"
         )
         search_steps = (
-            f"STEP 3 — Search by full owner name:\n"
+            f"STEP 3 — Search Kofile by owner name (try variants if needed):\n"
             f"  Select the 'Names' search type.\n"
             f"  In the Last Name field enter the FULL owner name: '{owner}'\n"
-            f"  Leave the First Name field blank.\n"
-            f"  Click Search.\n\n"
-            f"  IMPORTANT — If the search returns more than 50 results, the owner name is\n"
-            f"  too broad. Clear the form and search again using only the distinctive\n"
-            f"  keyword: '{keyword}' (avoid generic words like LLC, INC, CAFE, GROUP, etc.).\n\n"
-            f"  The ISP (Improvement Survey Plat), any ALTA surveys, deeds, and easements\n"
-            f"  for this property will appear in these results because the current owner\n"
-            f"  '{owner}' is listed as a party on those documents.\n"
-            f"  Look through the results for doc types: SURVEY, PLAT MAP, WARRANTY DEED,\n"
-            f"  QUIT CLAIM DEED, DEED OF TRUST, EASEMENT. Download all of them.\n\n"
-            f"STEP 4 — Search by distinctive keyword for older documents:\n"
-            f"  Clear the form. Select the 'Names' search type.\n"
-            f"  In the Last Name field enter '{keyword}'.\n"
-            f"  Click Search.\n"
-            f"  This finds any documents filed before the current owner acquired the property\n"
-            f"  where '{keyword}' still appears as a party. Download any surveys or plats\n"
-            f"  you have not already downloaded.\n\n"
+            f"  Leave the First Name field blank. Click Search.\n\n"
+            f"  If the search returns MORE THAN 50 results: it's too broad. Try '{keyword}'.\n\n"
+            f"  If the search returns ZERO results: Kofile may store the name differently.\n"
+            f"  Try each of these variants IN ORDER until you get results:\n"
+            f"{variant_lines}\n\n"
+            f"  Once you have results, look through them for doc types:\n"
+            f"  SURVEY, PLAT MAP, WARRANTY DEED, QUIT CLAIM DEED, DEED OF TRUST, EASEMENT.\n"
+            f"  Download all that relate to '{address}'.\n\n"
+            f"{reception_step}"
+            f"{prev_owner_step}"
         )
         dl_step = "STEP 5"
     else:
         owner = ""
         owner_block = ""
         search_steps = (
-            f"STEP 3 — Search by address street name:\n"
+            f"STEP 3 — Look up the property owner in Denver Assessor (new tab):\n"
+            f"  Open a new tab and go to {_SPATIALEST_URL}\n"
+            f"  Search for '{address}' using the search box.\n"
+            f"  Click the matching property in the results.\n"
+            f"  On the detail page, note the current owner name and schedule number.\n"
+            f"  Close the tab and return to the Kofile tab.\n\n"
+            f"STEP 4 — Search Kofile by the owner name you just found:\n"
             f"  Select the 'Names' search type.\n"
-            f"  In the Last Name field enter 'YORK' (the street name from the address).\n"
-            f"  Set Document Type filter to 'SURVEY' or 'PLAT MAP' if available.\n"
-            f"  Click Search. Look for surveys or plats referencing this property.\n"
-            f"  Download any matching documents.\n\n"
+            f"  Enter the full owner name in the Last Name field.\n"
+            f"  Click Search. Download all matching SURVEY, PLAT MAP, DEED, and EASEMENT docs.\n"
+            f"  IMPORTANT: Kofile searches party names — do NOT search by street address\n"
+            f"  or street name; those searches will return unrelated results.\n\n"
         )
-        dl_step = "STEP 4"
+        dl_step = "STEP 5"
 
     task = (
         f"You are researching property records for a professional land surveying firm.\n"
@@ -210,10 +269,19 @@ async def _download_documents(
         f"    4. Deeds (warranty deed, quit claim deed, special warranty deed)\n"
         f"    5. Easements, right-of-way dedications, liens\n\n"
         f"  For each matching document:\n"
-        f"    - Click the row to open the document detail page.\n"
-        f"    - Click the Download, Save Image, or printer icon to download the PDF.\n"
-        f"    - If a modal/dialog appears, confirm and click through to save the file.\n"
-        f"    - Close the document detail and return to the search results.\n\n"
+        f"    a. Click the row in the search results to open the document detail page.\n"
+        f"    b. The document opens in an image viewer with a toolbar at the top.\n"
+        f"       In that toolbar look for ONE of these download triggers (try in order):\n"
+        f"         1. A button or link labelled 'Save Image' or 'Get Image'\n"
+        f"         2. A floppy-disk icon or down-arrow download icon\n"
+        f"         3. A button labelled 'Download' or 'Export'\n"
+        f"       Click whichever you find. A file save dialog or automatic download\n"
+        f"       should begin — confirm/save if prompted.\n"
+        f"    c. CRITICAL — Do NOT use the browser's Print function or Ctrl+P.\n"
+        f"       Do NOT use File > Save Page As. Do NOT right-click > Save as PDF.\n"
+        f"       Only use the in-page Save Image / Download button in the viewer toolbar.\n"
+        f"    d. After the file saves, use the browser Back button or breadcrumb to\n"
+        f"       return to the search results and repeat for the next document.\n\n"
         f"When all downloads are complete, say 'Done — downloaded N files.'"
     )
 
@@ -221,10 +289,18 @@ async def _download_documents(
     await agent.run()
 
     _VALID_SUFFIXES = {".pdf", ".tif", ".tiff", ".jpg", ".jpeg", ".png"}
+    # Exclude URL-derived PDFs that browser-use generates when it intercepts
+    # print events on Kofile pages (disclaimer, search results, etc.)
+    _KOFILE_URL_FRAGMENTS = (
+        "countyfusion", "kofiletech", "disclaimer", "searchentry",
+        "logindisplay", "countyweb",
+    )
     local_paths = [
         Path(p)
         for p in (agent.available_file_paths or [])
-        if Path(p).suffix.lower() in _VALID_SUFFIXES and Path(p).exists()
+        if Path(p).suffix.lower() in _VALID_SUFFIXES
+        and Path(p).exists()
+        and not any(frag in Path(p).stem.lower() for frag in _KOFILE_URL_FRAGMENTS)
     ]
     logger.info("Denver County: browser downloaded %d file(s)", len(local_paths))
 

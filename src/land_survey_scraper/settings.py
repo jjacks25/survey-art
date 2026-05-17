@@ -10,14 +10,27 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # LLM — set MODEL in .env to any OpenRouter or Anthropic model string.
-    # If OPENROUTER_API_KEY is set, the model is served via OpenRouter (supports free models).
-    # Otherwise falls back to Anthropic directly using ANTHROPIC_API_KEY.
+    # LLM provider selection.
+    # Set LLM_PROVIDER to one of: openrouter, anthropic, nvidia, openai
+    # If omitted, the first provider with a configured API key is used (openrouter → anthropic).
+    llm_provider: str = ""
+
+    # Model string — meaning depends on provider.
+    # OpenRouter: "google/gemini-2.0-flash-exp:free", "meta/llama-3.3-70b-instruct:free", etc.
+    # Anthropic:  "claude-sonnet-4-6", "claude-haiku-4-5", etc.
+    # NVIDIA:     "meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct", etc.
     model: str
+
     openrouter_api_key: str = ""
     anthropic_api_key: str = ""
+    nvidia_api_key: str = ""
 
-    # Weld County eRecording shared surveyor login (only required for Weld County scraping)
+    # Weld County Clerk & Recorder portal (recording.weld.gov) — free registration required
+    # Register at https://recording.weld.gov then set these in .env
+    weld_recorder_username: str = ""
+    weld_recorder_password: str = ""
+
+    # Legacy eRecording credentials (old Java system — no longer used)
     weld_erecording_username: str = ""
     weld_erecording_password: str = ""
 

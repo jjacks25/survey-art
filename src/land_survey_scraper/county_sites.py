@@ -12,8 +12,8 @@ SUPPORTED_COUNTIES: list[dict] = [
         "county": "Weld",
         "scraper_key": "CO:weld",
         "urls": {
-            "property_portal": "https://maps.weld.gov/propertyportal/",
-            "erecording": "https://erecording.weld.gov/recorder/web/login.jsp",
+            "property_portal": "https://apps.weld.gov/propertyportal/",
+            "recorder": "https://recording.weld.gov/web/user/disclaimer",
         },
     },
     {

@@ -41,20 +41,43 @@ _RECORDS_URL = "https://landrecords.co.jefferson.co.us/RealEstate/SearchEntry.as
 _ASSESSOR_API = "https://propertysearch.jeffco.us/api"
 
 # Required by the assessor API for all list endpoints — without these it returns 500.
-_LIST_PARAMS = {"Skip": 0, "Take": 100, "page": 1, "sortBy": "houseNumber", "sortDirection": "asc"}
-_PAGE_SIZE = 100
+# Address search uses Take=500: most streets have < 500 properties, so this resolves in one
+# call and the API returns full result objects including the subdivision field.
+# The pagination loop handles streets with > 500 properties.
+_LIST_PARAMS = {"Skip": 0, "Take": 500, "page": 1, "sortBy": "houseNumber", "sortDirection": "asc"}
+_PAGE_SIZE = 500
 
 
-async def _get_parcel_info(house_number: str, street_name: str) -> dict | None:
+async def _get_parcel_info(house_number: str, street_fragment: str) -> dict | None:
     """
     Call the Jefferson County Assessor REST API to retrieve parcel details.
     Returns subdivision, block, lot, and any previously recorded instrument numbers.
     No browser required — all endpoints are unauthenticated JSON.
+
+    street_fragment is everything after the house number in the geocoded address,
+    e.g. "S POPPY ST". Used both to derive the API streetName param and to verify
+    the matched property address (avoids matching "2180 S POPPY CT" when looking
+    for "2180 S POPPY ST").
     """
+    # Derive the streetName API param: skip directional prefix, take the street name word.
+    # Preserve original case from the geocoded address — the assessor API is case-sensitive
+    # and returns richer result objects (including subdivision) when the casing matches
+    # what is stored (e.g. "Poppy" not "POPPY").
+    # e.g. "S Poppy Street" → skip "S" → "Poppy"
+    frag_tokens = street_fragment.split()
+    if frag_tokens and frag_tokens[0].upper() in ("N", "S", "E", "W", "NE", "NW", "SE", "SW"):
+        frag_tokens = frag_tokens[1:]
+    street_name = frag_tokens[0] if frag_tokens else street_fragment
+
+    # Use only the street name word for address matching (case-insensitive).
+    # The Census geocoder may return "Street" but the assessor stores "ST", so matching the
+    # full fragment including suffix would fail. The street name alone ("POPPY") is
+    # sufficient to disambiguate in almost all cases.
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         # 1. Address search → uniquePropertyId
         # The streetName search returns ALL streets with that name county-wide (can be 1000+).
-        # We page through in chunks until we find a propertyAddress starting with house_number.
+        # We page through in chunks until we find an exact address match.
         prop = None
         skip = 0
         total_count: int | None = None
@@ -77,7 +100,10 @@ async def _get_parcel_info(house_number: str, street_name: str) -> dict | None:
                 if total_count is None:
                     total_count = results.get("totalCount", 0) if isinstance(results, dict) else 0
                 prop = next(
-                    (p for p in items if str(p.get("propertyAddress", "")).startswith(house_number)),
+                    (
+                        p for p in items
+                        if str(p.get("propertyAddress", "")).startswith(house_number)
+                    ),
                     None,
                 )
                 if prop:
@@ -124,13 +150,27 @@ async def _get_parcel_info(house_number: str, street_name: str) -> dict | None:
         except Exception as exc:
             logger.warning("Transfer history lookup failed: %s", exc)
 
-        # Subdivision name comes from the address search result
+        # Subdivision name: prefer the address search result; fall back to property detail.
+        # The address API sometimes returns an empty subdivision field — the property
+        # detail endpoint is more reliable but slower, so only call it when needed.
         subdivision = prop.get("subdivision", "")
+        if not subdivision:
+            try:
+                r4 = await client.get(f"{_ASSESSOR_API}/property/{uid}")
+                r4.raise_for_status()
+                detail = r4.json() or {}
+                # Response structure: {"propertyDetails": {"subdivision": "...", ...}}
+                subdivision = (detail.get("propertyDetails") or {}).get("subdivision") or ""
+            except Exception as exc:
+                logger.warning("Property detail lookup failed: %s", exc)
 
     # Strip leading numeric code from subdivision (e.g. "693499 SOLTERRA SUB FLG NO 17" → "SOLTERRA SUB FLG NO 17")
     parts = subdivision.split(" ", 1)
     if parts and parts[0].isdigit():
         subdivision = parts[1] if len(parts) > 1 else subdivision
+
+    if not subdivision:
+        logger.warning("Assessor: subdivision name could not be resolved; legal=%s", legal)
 
     return {
         "subdivision": subdivision,
@@ -158,21 +198,42 @@ async def _download_documents(
         lot = parcel["lot"]
         instruments = parcel["instruments"]
         instrument_str = ", ".join(instruments[:5]) if instruments else "none"
+        subdiv_keyword = subdivision.split()[0] if subdivision else ""
+
+        # Build subdivision-dependent steps only when we have a subdivision name
+        if subdivision:
+            subdiv_steps = (
+                f"STEP 1 — Search by legal description (finds ISPs, ILCs, easements, deeds for this lot):\n"
+                f"  Navigate to {_RECORDS_URL}\n"
+                f"  The Subdivision field is likely an autocomplete. To fill it:\n"
+                f"    - Click the Subdivision field and type the first word only: '{subdiv_keyword}'\n"
+                f"    - Wait 1–2 seconds for a dropdown list to appear\n"
+                f"    - Select the entry that most closely matches '{subdivision}'\n"
+                f"    - If no dropdown appears, clear the field and leave it blank\n"
+                f"  Fill in Block='{block}' and Lot='{lot}', then click Search.\n\n"
+                f"STEP 2 — Search by subdivision name only (finds the recorded subdivision plat):\n"
+                f"  Clear the form. The subdivision plat is filed for the whole subdivision and will NOT\n"
+                f"  appear in a block/lot search — you must search by subdivision name with Block and Lot blank.\n"
+                f"  Fill in the Subdivision field using the same autocomplete technique above (type '{subdiv_keyword}',\n"
+                f"  wait for dropdown, select the entry matching '{subdivision}').\n"
+                f"  Leave Block and Lot blank. Click Search.\n\n"
+            )
+            next_step = "STEP 3"
+        else:
+            subdiv_steps = (
+                f"STEP 1 — Search by block and lot:\n"
+                f"  Navigate to {_RECORDS_URL}\n"
+                f"  Fill in Block='{block}' and Lot='{lot}' (no subdivision available), then click Search.\n\n"
+            )
+            next_step = "STEP 2"
+
         search_instructions = (
             f"The property's legal description is: Subdivision='{subdivision}', "
             f"Block='{block}', Lot='{lot}'. "
             f"Known deed instrument numbers from the assessor: {instrument_str}.\n\n"
             f"You must perform ALL of the following searches — do not stop early.\n\n"
-            f"STEP 1 — Search by legal description (finds ISPs, ILCs, easements, deeds for this lot):\n"
-            f"  Navigate to {_RECORDS_URL}\n"
-            f"  Fill in Subdivision='{subdivision}', Block='{block}', Lot='{lot}' and click Search.\n"
-            f"  If the subdivision field is a dropdown or autocomplete, type the first few words "
-            f"  and select the closest match.\n\n"
-            f"STEP 2 — Search by subdivision name only (finds the recorded subdivision plat):\n"
-            f"  Clear the form. Fill in only Subdivision='{subdivision}' (leave Block and Lot blank) "
-            f"  and click Search. The subdivision plat document is filed for the whole subdivision "
-            f"  and will NOT appear in a block/lot search.\n\n"
-            f"STEP 3 — Search by each known instrument number (finds the recorded deeds):\n"
+            f"{subdiv_steps}"
+            f"{next_step} — Search by each known instrument number (finds the recorded deeds):\n"
             f"  Clear the form. Enter each of these instrument numbers individually in the "
             f"  Instrument # field and search: {instrument_str}.\n\n"
         )
@@ -187,7 +248,7 @@ async def _download_documents(
         f"You are researching property records for a professional land surveying firm. "
         f"Property address: {address}\n\n"
         f"{search_instructions}"
-        f"STEP 4 — Download ALL matching documents found across all searches above:\n"
+        f"FINAL STEP — Download ALL matching documents found across all searches above:\n"
         f"  {doc_filter.to_prompt_fragment()}\n"
         "  IMPORTANT: Survey plats (Land Survey Plat, Subdivision Plat, Improvement Survey Plat) "
         "  are the highest priority — download these even if you also found deeds.\n"
@@ -231,17 +292,16 @@ async def scrape(
     address = geocoded.one_line()
     logger.info("Jefferson County scraper starting for: %s", address)
 
-    # Parse house number and street name from the geocoded address
-    street = geocoded.street  # e.g. "2180 S Poppy Street"
+    # Parse house number and street fragment from the geocoded address.
+    # geocoded.street is the Census USPS-normalized form, e.g. "2180 S POPPY ST".
+    # We pass the full fragment after the house number so the assessor lookup
+    # can verify street suffix (ST vs CT vs DR) and avoid false matches.
+    street = geocoded.street
     parts = street.split()
     house_number = parts[0] if parts else ""
-    # Strip directional prefix (N/S/E/W) and use just the street name
-    street_parts = parts[1:] if len(parts) > 1 else parts
-    if street_parts and street_parts[0].upper() in ("N", "S", "E", "W", "NE", "NW", "SE", "SW"):
-        street_parts = street_parts[1:]
-    street_name = street_parts[0] if street_parts else ""
+    street_fragment = " ".join(parts[1:]) if len(parts) > 1 else ""
 
-    parcel = await _get_parcel_info(house_number, street_name)
+    parcel = await _get_parcel_info(house_number, street_fragment)
     if parcel:
         logger.info(
             "Assessor: subdivision=%s block=%s lot=%s instruments=%s",
