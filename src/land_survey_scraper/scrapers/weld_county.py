@@ -27,7 +27,7 @@ from land_survey_scraper.county_sites import SUPPORTED_COUNTIES
 from land_survey_scraper.document_filter import DEFAULT_FILTER, DocumentFilter
 from land_survey_scraper.download import download_all_async
 from land_survey_scraper.geocode import GeocodedAddress
-from land_survey_scraper.llm import get_llm
+from land_survey_scraper.llm import agent_cost, get_llm
 from land_survey_scraper.types import DocumentLink
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ _ERECORDING_URL = _ENTRY["urls"]["erecording"]
 
 
 
-async def _get_reception_numbers(address: str) -> list[str]:
+async def _get_reception_numbers(address: str) -> tuple[list[str], float, int, int]:
     """Use browser-use to navigate the Weld Property Portal and extract Reception Numbers."""
     task = (
         f"Go to {_PORTAL_URL}. "
@@ -48,19 +48,20 @@ async def _get_reception_numbers(address: str) -> list[str]:
         "Find the document history section and collect all Reception Numbers listed. "
         "Return them as a plain comma-separated list, nothing else."
     )
-    agent = Agent(task=task, llm=get_llm())
+    agent = Agent(task=task, llm=get_llm(), use_thinking=False, calculate_cost=True)
     result = await agent.run()
     raw = str(result).strip()
     numbers = [r.strip() for r in raw.replace("\n", ",").split(",") if r.strip()]
     logger.info("Weld Property Portal returned %d reception numbers", len(numbers))
-    return numbers
+    cost, in_tok, out_tok = agent_cost(agent)
+    return numbers, cost, in_tok, out_tok
 
 
 async def _get_document_urls(
     address: str,
     reception_numbers: list[str],
     doc_filter: DocumentFilter,
-) -> list[str]:
+) -> tuple[list[str], float, int, int]:
     """Login to eRecording and collect document URLs matching the filter."""
     reception_list = ", ".join(reception_numbers) if reception_numbers else "none"
 
@@ -74,35 +75,39 @@ async def _get_document_urls(
         f"{doc_filter.to_prompt_fragment()}\n"
         "Return all download URLs as a plain newline-separated list, nothing else."
     )
-    agent = Agent(task=task, llm=get_llm())
+    agent = Agent(task=task, llm=get_llm(), use_thinking=False, calculate_cost=True)
     result = await agent.run()
     raw = str(result).strip()
     urls = [u.strip() for u in raw.splitlines() if u.strip().startswith("http")]
     logger.info("eRecording returned %d document URLs", len(urls))
-    return urls
+    cost, in_tok, out_tok = agent_cost(agent)
+    return urls, cost, in_tok, out_tok
 
 
 async def scrape(
     geocoded: GeocodedAddress,
     tmp_dir: Path,
     doc_filter: DocumentFilter = DEFAULT_FILTER,
-) -> tuple[list[Path], str | None]:
+) -> tuple[list[Path], str | None, float, int, int]:
     """Scrape Weld County property records for the given address."""
     s = get_settings()
     if not s.weld_erecording_username or not s.weld_erecording_password:
         return [], (
             "Weld County eRecording credentials are not configured. "
             "Set WELD_ERECORDING_USERNAME and WELD_ERECORDING_PASSWORD in .env."
-        )
+        ), 0.0, 0, 0
     address = geocoded.one_line()
     logger.info("Weld County scraper starting for: %s", address)
 
-    reception_numbers = await _get_reception_numbers(address)
-    doc_urls = await _get_document_urls(address, reception_numbers, doc_filter)
+    reception_numbers, cost1, in_tok1, out_tok1 = await _get_reception_numbers(address)
+    doc_urls, cost2, in_tok2, out_tok2 = await _get_document_urls(address, reception_numbers, doc_filter)
+    total_cost = cost1 + cost2
+    total_in = in_tok1 + in_tok2
+    total_out = out_tok1 + out_tok2
 
     if not doc_urls:
-        return [], f"No documents found for {address} in Weld County."
+        return [], f"No documents found for {address} in Weld County.", total_cost, total_in, total_out
 
     links = [DocumentLink(url=u, text="", content_type="") for u in doc_urls]
     saved = await download_all_async(links, geocoded.county, address, base=tmp_dir)
-    return saved, None
+    return saved, None, total_cost, total_in, total_out

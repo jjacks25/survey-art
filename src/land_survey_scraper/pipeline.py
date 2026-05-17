@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 
-from land_survey_scraper.console import county_resolved, download_done, files_table, model_banner
+from land_survey_scraper.console import county_resolved, download_done, files_table, model_banner, run_cost
 from land_survey_scraper.document_filter import DEFAULT_FILTER, DocumentFilter
 from land_survey_scraper.geocode import GeocodedAddress, address_to_county
 from land_survey_scraper.settings import get_settings
@@ -65,7 +65,9 @@ async def run_async(
             f"Supported counties: {supported}"
         )
 
-    saved, err = await scrape_fn(geocoded, tmp, doc_filter)
+    saved, err, cost, in_tok, out_tok = await scrape_fn(geocoded, tmp, doc_filter)
+    if not quiet:
+        run_cost(cost, in_tok, out_tok)
     if err:
         return [], err
 

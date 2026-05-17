@@ -23,6 +23,21 @@ def success(msg: str, **kwargs: Any) -> None:
     _console.print(f"[green]✓[/] {msg}", **kwargs)
 
 
+def run_cost(cost_usd: float, input_tokens: int, output_tokens: int) -> None:
+    """Print the total LLM cost and token breakdown for the run."""
+    total = input_tokens + output_tokens
+    _console.print(
+        Panel(
+            f"[bold green]${cost_usd:.4f}[/]  "
+            f"[dim]{total:,} tokens "
+            f"({input_tokens:,} in / {output_tokens:,} out)[/]",
+            title="[bold]Run Cost[/]",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+
 def model_banner(model: str) -> None:
     """Print the active LLM model prominently."""
     _console.print(
