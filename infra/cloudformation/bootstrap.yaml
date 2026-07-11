@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bootstrap stack for land-survey-scraper: deploy IAM user, S3 bucket for
+  future CloudFormation templates, and a Secrets Manager secret holding the
+  deploy user's access key. Deployed once via TemplateBody (no S3 bucket
+  exists yet to host it). Future stacks should deploy via TemplateURL
+  against the bucket this stack creates.
+
+Parameters:
+  SecretName:
+    Type: String
+    Default: land-survey-scraper/deploy-credentials
+    Description: Name of the Secrets Manager secret to hold the deploy user's access key.
+
+Resources:
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DeployUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: land-survey-scraper-deploy
+
+  DeploySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref SecretName
+      Description: Access key credentials for the land-survey-scraper deploy user. Populated post-create by infra/bootstrap.py.
+      SecretString: '{"AccessKeyId":"PENDING","SecretAccessKey":"PENDING"}'
+
+  DeployUserPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: land-survey-scraper-deploy-policy
+      Users:
+        - !Ref DeployUser
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFormationDeploy
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:CreateChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:ListStacks
+              - cloudformation:GetTemplate
+              - cloudformation:ValidateTemplate
+            Resource:
+              - !Ref AWS::StackId
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/land-survey-scraper-*/*"
+          - Sid: DeployBucketAccess
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt DeployBucket.Arn
+              - !Sub "${DeployBucket.Arn}/*"
+          - Sid: DeploySecretAccess
+            Effect: Allow
+            Action:
+              - secretsmanager:PutSecretValue
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource:
+              - !Ref DeploySecret
+
+  DeployAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref DeployUser
+
+Outputs:
+  DeployUserName:
+    Value: !Ref DeployUser
+  DeployBucketName:
+    Value: !Ref DeployBucket
+  DeployAccessKeyId:
+    Value: !Ref DeployAccessKey
+  DeployAccessKeySecret:
+    Value: !GetAtt DeployAccessKey.SecretAccessKey
+  DeploySecretArn:
+    Value: !Ref DeploySecret

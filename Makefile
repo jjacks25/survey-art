@@ -40,8 +40,11 @@ down: ## Container | Stop and remove the container (when run in background with 
 	docker rm $(CONTAINER) 2>/dev/null || true
 
 process: build ## Scraper | Scrape records: make process ADDRESS="123 Main St" [ARGS="--county CO_weld"]
+	# Mount .env (read-only) instead of using --env-file so pydantic-settings
+	# reads it the same way as local runs — Docker's --env-file parser keeps
+	# surrounding quotes as literal characters, while python-dotenv strips them.
 	docker run --rm \
-	  --env-file .env \
+	  -v $(PWD)/.env:/app/.env:ro \
 	  -v $(PWD)/tmp:/app/tmp \
 	  $(IMAGE):$(TAG) \
 	  uv run land-survey-scraper "$(ADDRESS)" $(ARGS)
