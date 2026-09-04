@@ -1,0 +1,10 @@
+{
+  "apiBase": "http://localhost:8000",
+  "authDisabled": true,
+  "cognito": {
+    "authority": "",
+    "clientId": "",
+    "domain": "",
+    "scope": "openid email profile"
+  }
+}
