@@ -1,4 +1,4 @@
-# Land Survey Scraper
+# Survey Art
 
 Automated land survey research for Colorado counties. Given a street address, account
 number, parcel ID, owner name, or PLSS coordinates, the tool navigates county government
@@ -23,7 +23,7 @@ uv run playwright install chromium
 cp .env.example .env  # then edit
 
 # 3. Run for the example parcel
-uv run land-survey-scraper "R1611986" --county CO_weld
+uv run survey-art "R1611986" --county CO_weld
 ```
 
 Output lands in `tmp/CO_weld/R1611986/`:
@@ -53,48 +53,50 @@ The query auto-detects its type by pattern:
 
 ```bash
 # 1. By address — geocodes to determine the county, then dispatches
-uv run land-survey-scraper "1234 Main St, Greeley, CO 80631"
+uv run survey-art "1234 Main St, Greeley, CO 80631"
 
 # 2. By account number — bypasses geocoding, fastest for Weld
-uv run land-survey-scraper "R1611986" --county CO_weld
+uv run survey-art "R1611986" --county CO_weld
 
 # 3. By parcel ID
-uv run land-survey-scraper "095715000012" --county CO_weld
+uv run survey-art "095715000012" --county CO_weld
 
 # 4. By owner name (SOP "Priority 4 — last resort")
-uv run land-survey-scraper "any address" --county CO_weld --owner "STRATUS DELANTERO"
+uv run survey-art "any address" --county CO_weld --owner "STRATUS DELANTERO"
 
 # 5. By Section / Township / Range (PLSS) — requires --sop-strict (browser walk)
-uv run land-survey-scraper "any address" --county CO_weld \
+uv run survey-art "any address" --county CO_weld \
     --str "15,5N,67W" --sop-strict
 
 # 6. SOP-strict mode — literal Playwright walk through the GIS Hub UI
 #    (slower; useful for demos or when the HTTP shortcut fails)
-uv run land-survey-scraper "R1611986" --county CO_weld --sop-strict
+uv run survey-art "R1611986" --county CO_weld --sop-strict
 
 # 7. Watch the browser drive itself (only useful with --sop-strict or Phase 3)
-WELD_HEADED=1 uv run land-survey-scraper "R1611986" --county CO_weld --sop-strict
+WELD_HEADED=1 uv run survey-art "R1611986" --county CO_weld --sop-strict
 
 # 8. Custom output directory
-uv run land-survey-scraper "R1611986" --county CO_weld -t ./output
+uv run survey-art "R1611986" --county CO_weld -t ./output
 
 # 9. Re-download files that already exist
-uv run land-survey-scraper "R1611986" --county CO_weld --no-skip-existing
+uv run survey-art "R1611986" --county CO_weld --no-skip-existing
 
 # 10. Suppress progress UI (CI-friendly)
-uv run land-survey-scraper "R1611986" --county CO_weld --quiet
+uv run survey-art "R1611986" --county CO_weld --quiet
 ```
 
 ### Docker
 
-Recommended for reproducibility and CI — no host Python/Chromium needed.
+Recommended for reproducibility and CI — no host Python/Chromium needed. Runs via the
+local docker-compose stack (see [`docs/architecture.md`](docs/architecture.md) for what
+else is in it — API, web, LocalStack).
 
 ```bash
-make build                                                # build the image (one time)
+make up                                                   # build + start the stack (one time / after changes)
 make process ADDRESS="R1611986" ARGS="--county CO_weld"   # run end-to-end
-make shell                                                # interactive bash inside the image
-make dev                                                  # bash with local src/ mounted (live edits)
-make down                                                 # stop a backgrounded container
+make sh-worker                                            # interactive bash inside the worker container
+make logs                                                 # tail stack logs
+make down                                                 # stop and remove the stack
 ```
 
 Pass extra flags via `ARGS="..."`:
@@ -106,6 +108,10 @@ make process ADDRESS="STRATUS DELANTERO" ARGS="--county CO_weld --owner 'STRATUS
 
 > **Docker limitation:** `WELD_HEADED=1` does nothing inside the container — there's no
 > display. Use local `uv run` to watch the browser.
+
+The worker mounts your `~/.aws` read-only and uses `AWS_PROFILE` (default: `default`).
+LocalStack ignores credentials, but Bedrock doesn't and has no LocalStack equivalent, so
+the worker talks to real AWS for that one client and to LocalStack for everything else.
 
 ### CLI reference
 
@@ -125,19 +131,23 @@ make process ADDRESS="STRATUS DELANTERO" ARGS="--county CO_weld --owner 'STRATUS
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `MODEL` | Yes for non-Weld counties | — | LLM model id (e.g. `claude-haiku-4-5`) |
-| `LLM_PROVIDER` | No | auto-detect | One of `nvidia`, `openrouter`, `anthropic`, `openai` |
-| `ANTHROPIC_API_KEY` | If using Anthropic | — | Claude API key |
-| `OPENROUTER_API_KEY` | If using OpenRouter | — | OpenRouter key (free tier available) |
-| `NVIDIA_API_KEY` | If using NVIDIA NIM | — | Free tier at build.nvidia.com |
-| `OPENAI_API_KEY` | If using OpenAI | — | OpenAI key |
+| `MODEL` | Yes for non-Weld counties | — | Bedrock model ID or cross-region inference profile ID (e.g. `us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
+| `ID_EXTRACTION_MODEL` | No | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock model that reads a scanned ALTA for the record IDs it cites (Weld Step 3A.5) |
+| `AWS_REGION` | No | `us-west-2` | Bedrock region |
+| `APPLICATION_MODE` | No | `regular` | `demo` caps the Step 3A.5 exception downloads at 5 so a walkthrough finishes in minutes |
 | `WELD_RECORDER_USERNAME` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `WELD_RECORDER_PASSWORD` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
+| `CO_DENVER_USERNAME` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
+| `CO_DENVER_PASSWORD` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
 | `WELD_HEADED` | No | `0` | Set to `1` to show the Playwright browser window |
 
-**No LLM is invoked for Weld today.** Phases 1, 2, and 3 are pure HTTP + Playwright with
-hard-coded selectors. The LLM env vars are only used by the Denver / Jefferson / Arapahoe
-scrapers.
+**Weld's navigation uses no LLM.** Phases 1, 2, and 3 are pure HTTP + Playwright with
+hard-coded selectors. The one exception is Step 3A.5, which reads the downloaded ALTA
+for the documents it cites — free when the PDF has a text layer, and Bedrock otherwise
+(see [Reading the ALTA](#reading-the-alta-step-3a5)). The Denver / Jefferson / Arapahoe
+scrapers go through Bedrock throughout (`llm.py`). Auth is IAM only (the Fargate task
+role in prod, or your local `aws sso login`/profile credentials via boto3's default
+chain), so no API key belongs in `.env`.
 
 Weld Phase 3 (document image download) requires a free registered account at
 `recording.weld.gov` → Log In → "new registered user". Without credentials the scraper
@@ -173,7 +183,7 @@ record updated after each phase. A crash mid-pipeline still leaves a valid file.
     "section_township_range": "S15-T5N-R67W",
     "source": "http"
   },
-  "account_information": { "Account": "...", "Parcel": "...", "Acres": "...", ... },
+  "account_information": { "account_type": "...", "legal_description": "...", "tax_year": "...", ... },
   "owners": { "Owner Name": "...", "Address": "..." },
   "land_information": { "Code": "...", "Description": "...", "Acres": "270.840", ... },
   "valuation_information": { "Actual Value": "37,320", ... },
@@ -201,12 +211,12 @@ record updated after each phase. A crash mid-pipeline still leaves a valid file.
   "survey_documents": [
     { "reception": "4970002", "doc_type": "SWD", ..., "download_status": "downloaded", "downloaded_to": "tmp/.../reception_4970002.pdf" }
   ],
-  "raw_property_report_fields": { /* every label parsed from propertyreport.weld.gov, verbatim */ }
+  "raw_report_fields": { /* every label parsed from propertyreport.weld.gov, verbatim/undeduplicated */ }
 }
 ```
 
 The schema is open: downstream consumers can read `Overview` via the
-[overview.py](src/land_survey_scraper/overview.py) helper or just parse JSON.
+[overview.py](apps/worker/survey_art/overview.py) helper or just parse JSON.
 
 ---
 
@@ -214,7 +224,7 @@ The schema is open: downstream consumers can read `Overview` via the
 
 | County | State | Scraper key | Approach | Status |
 |---|---|---|---|---|
-| Weld | CO | `CO_weld` | Pure HTTP + Playwright (no LLM) | Phase 1 + 2 fully working; Phase 3 needs registered account |
+| Weld | CO | `CO_weld` | Pure HTTP + Playwright (no LLM) | Paths A + B working (needs registered recorder account); Path C, GLO, road ROW not yet automated |
 | Denver | CO | `CO_denver` | browser-use + LLM | Works; requires `CO_DENVER_USERNAME/PASSWORD` |
 | Jefferson | CO | `CO_jefferson` | Hybrid REST API + browser-use | Works (no auth) |
 | Arapahoe | CO | `CO_arapahoe` | browser-use + LLM | Proof-of-concept |
@@ -244,8 +254,10 @@ read it before modifying scraper logic. Key points:
   Picks the most-recent SURV row as the ALTA + the most-recent WD/SWD/QCD/GEN
   as the vesting deed, then downloads each as a single complete PDF via Tyler's
   `#printCustom` endpoint. Files land at `tmp/{county}/{account}/{role}_{reception}.pdf`.
-  Requires `WELD_RECORDER_USERNAME` / `WELD_RECORDER_PASSWORD` in `.env`. Step
-  3A.5 (Schedule B-2 exception walk) is not yet implemented.
+  Requires `WELD_RECORDER_USERNAME` / `WELD_RECORDER_PASSWORD` in `.env`.
+  Step 3A.5 (Schedule B-2 exception walk — implemented) then reads that ALTA for
+  the documents it cites and downloads each as `exception_{reception}.pdf`; see
+  [Reading the ALTA](#reading-the-alta-step-3a5).
 - **Phase 3B** (Alternative Research 1 — implemented): runs when
   `path == "alternate_partial"` (rows present but missing survey or deed).
   Downloads the most-recent vesting deed (if any), then drives the Advanced
@@ -255,28 +267,77 @@ read it before modifying scraper logic. Key points:
   implemented — would require OCR since Tyler PDFs are scanned images.
 - **Phase 3C** (Alternative Research 2 — not yet implemented): would run for
   `alternate_empty` (empty Document History + "No documents found." text).
+- **Phase 4** (GLO original survey of record) and **Phase 5** (county + state road
+  right-of-way) — not yet implemented. Both run independently of which research path
+  fired; see [docs/weld_county_sop.md](docs/weld_county_sop.md#phase-4--glo-original-survey-of-record).
 
 Document type codes (`SURV`, `WD`, `SWD`, `QCD`, `EASE`, `ROW`, etc.) and the
 Decision Matrix routing are defined in the SOP and mirrored in
-[scrapers/weld_county.py](src/land_survey_scraper/scrapers/weld_county.py).
+[scrapers/weld_county.py](apps/worker/survey_art/scrapers/weld_county.py).
+
+### Reading the ALTA (Step 3A.5)
+
+An ALTA's Schedule B-2 lists every easement, right-of-way and prior deed burdening
+the parcel, each with a reception number — documents that do *not* appear in the
+parcel's own Document History, so nothing earlier in the pipeline can find them.
+[`id_extraction.py`](apps/worker/survey_art/id_extraction.py) reads them off the survey and
+feeds them back into the same downloader, cheapest path first:
+
+1. **Text layer** — `pypdf` plus a labelled regex (`RECORDING NO: 1766550`,
+   `BOOK 999 AT PAGE 426`). Free and exact, but only born-digital PDFs have one.
+2. **Bedrock** — a scanned PDF has no text at all. A 36"x24" survey sheet holds far
+   too much fine print to survive being squeezed into one model-sized image, so each
+   page is split into overlapping tiles that stay legible (30 for a full-size sheet)
+   and sent as images with a forced tool call. Roughly `$0.30` per 5-sheet ALTA on
+   Haiku 4.5.
+
+Measured on Weld ALTA 4571638 (account R1611986, 78 title-commitment items citing 81
+distinct reception numbers): **79/81 found, 2 missed**. Tile resolution is the whole
+ballgame — at a third of the tile count the same sheet scored 20/36 with 11 digit
+transpositions. `_TILE_MAX_NATIVE_PX` in `id_extraction.py` carries the scores; re-run
+them before raising it.
+
+A misread reception usually 404s and disappears, but it can also fetch a real *wrong*
+document. Two did in that run. Treat `extracted_ids` as a strong lead list, not a
+verified index — a surveyor should still eyeball the exception PDFs against Schedule B-2.
+
+**Runtime.** This step turns a Weld run from two downloads into up to ~90, and the
+recorder starts refusing requests after roughly 40 in a row (a non-200 from the print
+endpoint, or a viewer page with no download button). `_download_documents()` paces
+itself, re-asserts the disclaimer cookie, and retries every failure, so expect a
+commercial ALTA to take 10-20 minutes rather than one. Set `APPLICATION_MODE=demo`
+to stop after the first 10 — enough to show the step working without the wait.
+
+Every ID found is written to `overview.json` under `extracted_ids` (and so shows up
+in the UI's Property Metadata tab) with its type and context, demo mode included —
+the cap applies to downloading, never to what gets recorded. Only reception numbers
+are auto-downloaded — the recorder's document URL takes nothing else — so book/page
+and other formats are recorded for the surveyor to pull by hand.
+
+> **Bedrock model access:** Anthropic models on Bedrock need the *Anthropic use case
+> details* form submitted once per account (Bedrock console → Model access). Until
+> then every call fails with `ResourceNotFoundException: Model use case details have
+> not been submitted`, and extraction returns nothing rather than failing the scrape —
+> the ALTA and vesting deed still download normally.
 
 ---
 
 ## Configuration (`.env`)
 
-Create `.env` in the project root (gitignored). Minimum for Weld:
+Create `.env` in the project root (gitignored, see [`.env.example`](.env.example)).
+Minimum for Weld:
 
 ```bash
-# Optional — Weld doesn't use the LLM, but other counties do:
-ANTHROPIC_API_KEY=sk-ant-...
-MODEL=claude-haiku-4-5
+# Optional — Weld doesn't use the LLM, but other counties do (AWS Bedrock, IAM auth):
+MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 
 # Optional — only needed for Weld Phase 3 document downloads:
 WELD_RECORDER_USERNAME=your_email@example.com
 WELD_RECORDER_PASSWORD=your_password
 ```
 
-Docker reads this same file via `--env-file .env`.
+`make up`/`make process` read this file too — docker-compose loads `.env` from the
+project root automatically to fill in the `${VAR}` substitutions in `docker-compose.yml`.
 
 ---
 
@@ -285,41 +346,51 @@ Docker reads this same file via `--env-file .env`.
 ```
 Query (address / account / parcel / owner / S-T-R)
    │
-   ▼ _resolve_parcel() — SOP Priority routing
-Phase 1: Parcel discovery
+   ▼ _resolve_parcel() — priority routing
+Parcel discovery
    ├── HTTP path: POST apps.weld.gov/propertyportal/index.cfm  (default)
    └── Browser path: literal SOP walk (--sop-strict)
    │
    ▼ ParcelInfo (Owner, Account, Parcel, S-T-R, …)
    ▼ → overview.json: identify_results
-Phase 1.6: Property Report
+Property Report
    │  GET propertyreport.weld.gov/?account=R…
-   ▼  parse every accordion section in one HTTP response
-   ▼ → overview.json: account_information, owners, valuation, tax, …
-Phase 1.7: Map accordion
+   ▼  parse every accordion section in one HTTP response, incl. Document History
+   ▼ → overview.json: account_information, owners, valuation, tax, document_history
+Map capture
    │  Playwright renders maps.weld.gov/mapanaccount/?Account=R…
    ▼  screenshot ESRI map with parcel boundary highlighted
    ▼ → tmp/.../map.png  +  overview.json: map.image_path
-Phase 2: Document History
-   │  parse Document History rows from property report HTML
-   ▼ → overview.json: document_history, survey_documents
-Phase 3: Document Download
-   │  Playwright iterates recording.weld.gov/web/web/integration/document/{id}
-   │  injects disclaimerAccepted cookie  (bypasses reCAPTCHA-gated button)
-   │  authenticated session (if credentials set) → captures image responses
-   ▼ → tmp/.../reception_{id}.{ext}
-   ▼ → overview.json: survey_documents[].download_status
+Decision Matrix (_decision_matrix()) — branches on Document History
+   │
+   ├── Path A (direct): SURV row + vesting deed both present
+   │      Playwright downloads both via recording.weld.gov, then reads the ALTA's
+   │      Schedule B-2 (id_extraction.py) and fetches every referenced exception too
+   │      ▼ → tmp/.../{role}_{reception}.pdf  +  overview.json: phase_3a, extracted_ids
+   │
+   ├── Path B (alternate_partial): rows present, missing the deed and/or survey
+   │      downloads the vesting deed (if any), then drives recorder Advanced Search
+   │      by S/T/R (+ subdivision) filtered to easement/ROW document types
+   │      ▼ → tmp/.../{role}_{reception}.pdf  +  overview.json: phase_3b
+   │
+   └── Path C (alternate_empty): no rows, "No documents found." — not yet automated;
+          the scraper logs the path and stops
 ```
 
+All document downloads inject a `disclaimerAccepted=true` cookie (bypasses the
+reCAPTCHA-gated disclaimer button) and require an authenticated session — see
+[`docs/weld_county_sop.md`](docs/weld_county_sop.md) for the full decision tree and
+what's not yet automated (Path C, GLO survey-of-record, road ROW).
+
 For Denver / Jefferson / Arapahoe the architecture differs — see each scraper file
-under `src/land_survey_scraper/scrapers/`.
+under `apps/worker/survey_art/scrapers/`.
 
 ---
 
 ## Adding a new county
 
 1. Add an entry to `SUPPORTED_COUNTIES` in
-   [county_sites.py](src/land_survey_scraper/county_sites.py) with the county name,
+   [county_sites.py](apps/worker/survey_art/county_sites.py) with the county name,
    state, scraper key, and relevant URLs.
 2. Create `scrapers/{state}_{county}.py` exposing:
 
@@ -332,7 +403,7 @@ under `src/land_survey_scraper/scrapers/`.
    ) -> tuple[list[Path], str | None, float, int, int]: ...
    ```
 
-3. Register it in `COUNTY_SCRAPERS` in [pipeline.py](src/land_survey_scraper/pipeline.py).
+3. Register it in `COUNTY_SCRAPERS` in [pipeline.py](apps/worker/survey_art/pipeline.py).
 4. Add tests in `tests/test_{county}_scraper.py`.
 
 ---

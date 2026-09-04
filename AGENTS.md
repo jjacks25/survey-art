@@ -1,4 +1,4 @@
-# Land Survey Scraper — Agent & Developer Guide
+# Survey Art — Agent & Developer Guide
 
 ## Project Goal
 
@@ -12,18 +12,44 @@ spend significant time manually navigating county portals before fieldwork.
 
 ---
 
-## Supported Counties (MVP)
+## Where to read what
 
-| County | State | Scraper Key |
-|--------|-------|-------------|
-| Weld | CO | `CO_weld` |
-| Denver | CO | `CO_denver` |
-| Arapahoe | CO | `CO_arapahoe` |
-| Jefferson | CO | `CO_jefferson` |
+This file covers only what isn't documented closer to the code. **Do not duplicate
+material from these into this file** — they are the source of truth for their area:
+
+| For | Read |
+|---|---|
+| Running the CLI, all flags, env vars, `.env` setup, output format, troubleshooting | [`README.md`](README.md) |
+| Weld's end-to-end procedure (the spec the scraper implements) | [`docs/weld_county_sop.md`](docs/weld_county_sop.md) |
+| AWS architecture, request/job flow, repo layout, local docker-compose stack | [`docs/architecture.md`](docs/architecture.md) |
+| CloudFormation stacks, deploy model, deploy gotchas | [`infra/AGENTS.md`](infra/AGENTS.md) |
+| Job broker API endpoints and auth | [`apps/api/AGENTS.md`](apps/api/AGENTS.md) |
+| SPA structure and metadata rendering | [`apps/web/AGENTS.md`](apps/web/AGENTS.md) |
+| Worker internals: job log streaming, property metadata, map capture | [`apps/worker/survey_art/AGENTS.md`](apps/worker/survey_art/AGENTS.md) |
+| `Job` model, DynamoDB/S3 helpers, storage prefixes | [`packages/survey_shared/AGENTS.md`](packages/survey_shared/AGENTS.md) |
+| Adding a new county (current `scrape()` signature) | [`README.md`](README.md) → "Adding a new county" |
+
+Monorepo layout, one deployable per `apps/` subdir: `apps/api` (survey-api), `apps/web`
+(SPA), `apps/dispatcher` (SQS→ECS Lambda), `apps/worker` (survey-art — core scraper +
+worker, the heavy one). `packages/survey_shared` holds code shared *between* deployables
+(jobs/AWS helpers) — not a service itself. `infra/` (CloudFormation + boto3 deploy
+harness) is deploy tooling, not app code. Wired as a **uv workspace** so the API image
+stays lean (no browser deps) — see [`apps/worker/survey_art/AGENTS.md`](apps/worker/survey_art/AGENTS.md)
+for why the heavy deps are isolated there.
+
+Common commands (`make help` lists all):
+
+```bash
+make up / make down / make logs   # local containerized stack (web + api + worker + LocalStack)
+make test / make lint / make lock # quality (run in containers; host needs no uv)
+make build-push                   # build + push api/worker images to ECR
+make deploy                       # AWS deploy entrypoint — `make deploy help` lists targets
+                                   # (bootstrap, network, ecr, backend, frontend, all, web, diff, destroy)
+```
 
 ---
 
-## Architecture
+## Scraper architecture
 
 ```
 Address Input
@@ -38,101 +64,104 @@ pipeline.py         Dispatches to county-specific scraper via COUNTY_SCRAPERS di
     ├── scrapers/denver_county.py
     ├── scrapers/arapahoe_county.py
     └── scrapers/jefferson_county.py
-         │  browser-use (LLM agent) navigates portals
-         │  Crawl4AI extracts structured document links
+         │  Weld: pure HTTP + Playwright. Others: browser-use (LLM agent) + Crawl4AI.
          ▼
     download.py         Async parallel downloads → local filesystem
 ```
 
-### Key Modules
+### Key modules (`apps/worker/survey_art/`)
 
 | Module | Purpose |
 |--------|---------|
-| `config.py` | Pydantic settings — lazy `get_settings()`, reads `.env` or injected env vars |
-| `llm.py` | LLM factory — returns OpenRouter or Anthropic client based on credentials |
-| `document_filter.py` | Defines document types and file formats relevant to land surveying |
+| `settings.py` | Pydantic settings — lazy `get_settings()`; LLM model + county portal credentials |
+| `llm.py` | LLM factory for the browser-use scrapers |
+| `document_filter.py` | Document types and file formats relevant to land surveying |
 | `geocode.py` | US Census Bureau geocoder → `GeocodedAddress` + `County` |
 | `county_sites.py` | Static registry of supported county URLs |
-| `scrapers/` | County-specific scrape logic (browser-use + Crawl4AI) |
+| `scrapers/` | County-specific scrape logic |
 | `pipeline.py` | Orchestration: geocode → dispatch → download |
 | `download.py` | Async file downloader with semaphore concurrency |
+| `overview.py` | Incremental `overview.json` writer (per-phase, crash-safe) |
+| `id_extraction.py` | Reads a survey PDF for the record IDs it cites — text layer if there is one, else Bedrock over tiled page images |
+| `worker.py` | AWS job entrypoint (Fargate one-shot or local SQS poll) |
 | `console.py` | Rich terminal UI helpers |
 | `types.py` | Shared dataclasses (`DocumentLink`) |
 
+> Note the two distinct settings accessors: `survey_art.settings.get_settings()` (scraper
+> config: model, county logins) and `survey_shared.config.get_shared_settings()` (AWS
+> wiring: queue, table, bucket). The worker imports both — don't conflate them.
+
 ---
 
-## County Workflows
+## County data sources
+
+Portal URLs live in `county_sites.py`. What's recorded here is the non-obvious part: which
+identifier joins the systems together, and which quirks have already bitten us.
 
 ### Weld County
 
-**Data sources:**
-- **Property Portal** — `apps.weld.gov/propertyportal/`
-  React SPA. Parcel lookup by situs address, owner name, account number, or parcel number.
-  Returns account number (e.g. R1234567), owner, and links to the property report page.
-- **Property Report** — `propertyreport.weld.gov/?account=RXXXXXXX`
-  Standard HTML page. Shows owner, legal description, and document history with Reception Numbers.
-- **Clerk & Recorder** — `recording.weld.gov` (Tyler Technologies)
-  Public access — click-through disclaimer only, no login required.
-  Supports grantor/grantee name search and reception number search.
+- **Property Portal** — `apps.weld.gov/propertyportal/` (React SPA). Parcel lookup by situs
+  address, owner name, account number, or parcel number. Returns account number (e.g.
+  `R1234567`), owner, and a link to the property report.
+- **Property Report** — `propertyreport.weld.gov/?account=RXXXXXXX`. Server-rendered HTML;
+  owner, legal description, and document history with Reception Numbers.
+- **Clerk & Recorder** — `recording.weld.gov` (Tyler Technologies). Public access behind a
+  click-through disclaimer; document *images* need a free registered account.
 
-**Notes:**
-- Reception Numbers are the canonical lookup key — collect them from the property report first.
-- The old Java eRecording site (`erecording.weld.gov`) has been replaced by the Tyler Tech portal.
-- Owner name search in Tyler Tech uses "Last Name, First Name" for individuals and full name for businesses.
-
-**Full SOP:** See [docs/weld_county_sop.md](docs/weld_county_sop.md) for the human-validated
-three-path procedure (Happy Path / Research Path 1 / Research Path 2), document-type cheat
-sheet, URL reference, and a worked example for parcel `R1611986`. The SOP is the
-source-of-truth specification the scraper should implement end-to-end — today only Path A
-is automated.
+Notes:
+- **Reception Numbers are the canonical lookup key** — collect them from the property
+  report before touching the recorder portal.
+- The old Java eRecording site (`erecording.weld.gov`) was replaced by the Tyler portal;
+  the `WELD_ERECORDING_*` settings are vestigial.
+- Tyler owner-name search wants "Last Name, First Name" for individuals, full name for
+  businesses.
+- [`docs/weld_county_sop.md`](docs/weld_county_sop.md) is the human-validated spec — read it
+  before changing scraper logic. README's "Weld County — the SOP" section tracks which
+  phases are actually implemented today.
+- The SOP also documents two supplemental phases that run independent of the research
+  path taken: retrieving the BLM GLO original survey of record (see "BLM GLO Records"
+  below), and assembling the county/state road right-of-way packet. Neither is automated
+  yet — see [`docs/weld_county_sop.md`](docs/weld_county_sop.md#whats-not-yet-automated).
 
 ### Denver County
 
-**Data sources:**
-- **Denver Assessor** — property lookup by address → Schedule Number
-- **Denver Clerk & Recorder** — recorded documents search by Schedule Number
-
-**Notes:**
-- Denver is a combined city-county. Multiple departments manage permits and ROW.
-- The Schedule Number (also called Account Number) is the join key between Assessor and Recorder.
+- **Denver Assessor** — address → Schedule Number.
+- **Denver Clerk & Recorder** (Kofile Tech, login required) — recorded documents by Schedule
+  Number.
+- The Schedule Number (a.k.a. Account Number) is the join key. Denver is a combined
+  city-county, and multiple departments manage permits and ROW.
 
 ### Arapahoe County
 
-**Data sources:**
-- **Arapahoe Assessor** — `arapahoegov.com/assessor` → parcel number
-- **Arapahoe Recorder** — `recording.arapahoegov.com` → recorded documents
+- **Assessor** `arapahoegov.com/assessor` → parcel number →
+  **Recorder** `recording.arapahoegov.com` → recorded documents.
 
 ### Jefferson County
 
-**Data sources:**
-- **Jeffco Records Search** — `jeffco.us/1027/Records-Search` (direct search, no separate assessor step required)
-- **Jeffco Assessor** — `jeffco.us/assessor` (used for parcel enrichment if needed)
+- **Records Search** `jeffco.us/1027/Records-Search` — searchable directly, no separate
+  assessor step. `jeffco.us/assessor` only if parcel enrichment is needed.
 
 ---
 
 ## Document Types
 
-All document types and accepted file formats are defined centrally in `document_filter.py`
-as `SURVEY_DOCUMENT_TYPES` and `SURVEY_FILE_EXTENSIONS`. The `DocumentFilter` class converts
-these into a prompt fragment injected into every browser-use agent task.
+Document types and accepted file formats are defined centrally in `document_filter.py` as
+`SURVEY_DOCUMENT_TYPES` and `SURVEY_FILE_EXTENSIONS`. `DocumentFilter` turns them into a
+prompt fragment injected into every browser-use agent task. To change what gets collected,
+edit those two constants — no scraper code changes needed.
 
-**Document categories covered:** survey plats, subdivision/exemption plats, vesting deeds,
-easements, right-of-way dedications, liens, and encumbrances.
-
-**File formats accepted:** PDF, TIF/TIFF, JPG/PNG, DWG/DXF (CAD), SHP/KML/KMZ (GIS), ZIP archives.
-
-To adjust what gets collected, edit `SURVEY_DOCUMENT_TYPES` or `SURVEY_FILE_EXTENSIONS` in
-`document_filter.py` — no scraper code changes needed.
+Covered: survey plats, subdivision/exemption plats, vesting deeds, easements, ROW
+dedications, liens, encumbrances. Formats: PDF, TIF/TIFF, JPG/PNG, DWG/DXF, SHP/KML/KMZ, ZIP.
 
 ---
 
-## Statewide / Supplemental Sources (Future)
+## Statewide / Supplemental Sources (not yet integrated)
 
 | Source | URL | Purpose |
 |--------|-----|---------|
 | Monument Records (DORA) | `dpo.colorado.gov/AES/MonumentRecords` | Corner records for field prep |
 | Monument Records (cp-db) | `cp-db.com` | Alternate monument lookup |
-| BLM GLO Records | `glorecords.blm.gov` | Original government survey plats |
+| BLM GLO Records | `glorecords.blm.gov` | Original government survey plats — Weld's SOP calls this out as its own Phase 4, see [`docs/weld_county_sop.md`](docs/weld_county_sop.md#phase-4--glo-original-survey-of-record) |
 | NOAA Geodesy | `geodesy.noaa.gov/datasheets/` | Control networks |
 | USGS Topo | `ngmdb.usgs.gov/topoview/viewer/` | Quad sheets |
 | COGCC GIS | `cogccmap.state.co.us/cogcc_gis_online/` | Energy/mineral records |
@@ -140,113 +169,12 @@ To adjust what gets collected, edit `SURVEY_DOCUMENT_TYPES` or `SURVEY_FILE_EXTE
 
 ---
 
-## Tool Stack
+## graphify
 
-| Tool | Role |
-|------|------|
-| **browser-use** | LLM-driven browser agent. Navigates county portals using natural language task descriptions. Eliminates brittle CSS selectors — resilient to site layout changes. |
-| **Crawl4AI** | Structured page extraction. Converts property result pages to JSON document lists. |
-| **Playwright** | Underlying browser driver for browser-use (Chromium). |
-| **httpx** | Async HTTP client for file downloads. |
-| **pydantic-settings** | Typed configuration from `.env` or injected environment variables. |
-| **langchain-openai** | OpenRouter LLM client (free models via OpenRouter API). |
-| **langchain-anthropic** | Anthropic LLM client (fallback when `ANTHROPIC_API_KEY` is set). |
-| **rich** | Terminal progress UI. |
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
 
----
-
-## Configuration & Credentials
-
-Settings are loaded via `get_settings()` (lazy, cached) from environment variables or a
-local `.env` file. The app fails fast at startup with a clear error if required vars are missing.
-
-| Env Var | Required | Description |
-|---------|----------|-------------|
-| `LLM_PROVIDER` | No | Provider to use: `nvidia`, `openrouter`, `anthropic`, `openai`. Auto-detects from available keys if omitted. |
-| `MODEL` | Yes | Model string for the chosen provider (see examples below) |
-| `NVIDIA_API_KEY` | If provider=nvidia | NVIDIA NIM API key (free tier at build.nvidia.com) |
-| `OPENROUTER_API_KEY` | If provider=openrouter | OpenRouter API key (free models available) |
-| `ANTHROPIC_API_KEY` | If provider=anthropic | Anthropic API key |
-| `WELD_RECORDER_USERNAME` | Yes (Weld) | Weld County Recorder portal login (free registration at recording.weld.gov) |
-| `WELD_RECORDER_PASSWORD` | Yes (Weld) | Weld County Recorder portal password |
-
-**Recommended models by provider:**
-- NVIDIA (free): `meta/llama-3.3-70b-instruct` or `nvidia/llama-3.1-nemotron-70b-instruct-hf`
-- OpenRouter (free): `google/gemini-2.0-flash-exp:free`
-- Anthropic: `claude-sonnet-4-6` (most capable), `claude-haiku-4-5` (fastest/cheapest)
-
-**Local dev:** create a `.env` file (gitignored) in the project root:
-```bash
-OPENROUTER_API_KEY=sk-or-...
-MODEL=google/gemini-2.0-flash-exp:free
-WELD_ERECORDING_USERNAME=your_username
-WELD_ERECORDING_PASSWORD=your_password
-```
-
-**Docker:** vars are passed via `--env-file .env` in the `make process` target.
-
-> The Weld County eRecording credentials are a community login used by Colorado surveyors.
-> Never hardcode them in source. Store only in `.env` or a secrets manager.
-
----
-
-## Running the Tool
-
-```bash
-# Local
-uv run land-survey-scraper "123 Main St, Greeley, CO 80631"
-
-# Docker (preferred — handles Chromium and all deps)
-make process ADDRESS="123 Main St, Greeley, CO 80631"
-
-# Force a specific county (bypass geocoding)
-uv run land-survey-scraper "123 Main St" --county CO_weld
-
-# Save to a custom output directory
-uv run land-survey-scraper "123 Main St, Denver, CO 80202" -t ./output
-
-# Re-download files that already exist locally
-uv run land-survey-scraper "123 Main St, Greeley, CO 80631" --no-skip-existing
-```
-
-Output is saved to `./tmp/{county_key}/{address_slug}/`.
-
----
-
-## Adding a New County
-
-1. Add an entry to `SUPPORTED_COUNTIES` in `county_sites.py` with the county name,
-   state, scraper key, and relevant URLs.
-2. Create `scrapers/{state}_{county}.py` exposing:
-   ```python
-   async def scrape(
-       geocoded: GeocodedAddress,
-       tmp_dir: Path,
-       doc_filter: DocumentFilter = DEFAULT_FILTER,
-   ) -> tuple[list[Path], str | None]
-   ```
-3. Register the scraper in `COUNTY_SCRAPERS` in `pipeline.py`.
-4. Add tests in `tests/test_{county}_scraper.py`.
-
----
-
-## Development
-
-```bash
-uv run pytest --cov=src tests/    # run tests with coverage
-uv run ruff check src tests       # lint
-uv run ruff format src tests      # format
-make build                        # build Docker image
-make process ADDRESS="..."        # run end-to-end
-```
-
----
-
-## Future Roadmap
-
-- **AWS Secrets Manager** — graduate credentials out of `.env`
-- **S3 output** — cloud storage for downloaded documents, team sharing
-- **Document parsing** — Claude API to extract metadata, classify document types from content
-- **Monument records** — integrate `cp-db.com` for field prep phase
-- **Batch processing** — Lambda + EventBridge for multi-address jobs
-- **Statewide sources** — BLM GLO, DORA monuments, USGS quads
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

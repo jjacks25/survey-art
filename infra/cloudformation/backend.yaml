@@ -1,0 +1,448 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Backend stack for survey-art: data (S3 storage, DynamoDB jobs, SQS + DLQ,
+  Secrets Manager), identity (Cognito user pool + IAM roles), and compute (ECS
+  cluster + Fargate scraper task, FastAPI Lambda container, SQS->ECS dispatcher
+  Lambda, and an HTTP API Gateway with a Cognito JWT authorizer). Imports network
+  ids; exports the API endpoint and Cognito ids for the frontend stack.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: survey-art
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Injected as ENVIRONMENT into the API Lambda and worker task.
+  ApiImageTag:
+    Type: String
+    Default: latest
+  WorkerImageTag:
+    Type: String
+    Default: latest
+  LLMProvider:
+    Type: String
+    Default: openrouter
+    Description: Pin the LLM provider so the worker fails fast if creds are missing.
+  Model:
+    Type: String
+    Default: google/gemini-2.0-flash-exp:free
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:5173/'
+    Description: Cognito allowed callback URLs. Add the CloudFront URL after the frontend stack is first deployed.
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:5173/'
+  CognitoDomainPrefix:
+    Type: String
+    Default: ''
+    Description: Globally-unique Cognito hosted-UI domain prefix. Defaults to <project>-<account>.
+
+Conditions:
+  DefaultCognitoDomain: !Equals [!Ref CognitoDomainPrefix, '']
+
+Resources:
+  # ---------------- Data ----------------
+  # One bucket, two prefixes, kept apart by lifecycle scope rather than by
+  # separate resources:
+  #   scratch/     - ephemeral per-job artifacts (map screenshots). 90-day
+  #                  expiry via the Filter-scoped rule below.
+  #   documents/   - durable per-property archive of every file downloaded
+  #                  from a county site, organized {state}/{county}/{id}/
+  #                  (see worker.py's _doc_prefix()). No expiry - these are
+  #                  the actual survey records, meant to accumulate across
+  #                  repeated searches for the same property.
+  StorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: scratch-intelligent-tiering-and-expiry
+            Status: Enabled
+            Prefix: scratch/
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: false
+
+  JobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 1800
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDLQ.Arn
+        maxReceiveCount: 3
+
+  # App runtime credentials (LLM key + county recorder logins). Populate the value
+  # out-of-band (asm-exec / console); the template only creates the container.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/app-credentials'
+      Description: LLM API key(s) and county recorder credentials for the scraper worker.
+      SecretString: '{"OPENROUTER_API_KEY":"","ANTHROPIC_API_KEY":"","NVIDIA_API_KEY":"","WELD_RECORDER_USERNAME":"","WELD_RECORDER_PASSWORD":"","CO_DENVER_USERNAME":"","CO_DENVER_PASSWORD":""}'
+
+  # ---------------- Identity (Cognito) ----------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true   # invite-only; no public self sign-up
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-web'
+      GenerateSecret: false            # public SPA client (PKCE)
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref LogoutUrls
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !If
+        - DefaultCognitoDomain
+        - !Sub '${ProjectName}-${AWS::AccountId}'
+        - !Ref CognitoDomainPrefix
+
+  # ---------------- IAM roles ----------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-app-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${StorageBucket.Arn}/*'
+              - Effect: Allow
+                # Cross-region inference profiles fan out to the underlying model in
+                # other regions, so the foundation-model grant can't be region-scoped.
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: api-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt StorageBucket.Arn
+                  - !Sub '${StorageBucket.Arn}/*'
+              - Effect: Allow
+                Action: ecs:StopTask
+                Resource: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ProjectName}-cluster/*'
+
+  DispatcherFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dispatcher-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt JobQueue.Arn
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref WorkerTaskDefinition
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt JobsTable.Arn
+
+  # ---------------- Compute ----------------
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-worker'
+      RetentionInDays: 30
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-worker'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/worker:${WorkerImageTag}'
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+          Environment:
+            - {Name: STORAGE_BUCKET, Value: !Ref StorageBucket}
+            - {Name: JOBS_TABLE, Value: !Ref JobsTable}
+            - {Name: AWS_REGION, Value: !Ref AWS::Region}
+            - {Name: ENVIRONMENT, Value: !Ref Environment}
+            - {Name: LLM_PROVIDER, Value: !Ref LLMProvider}
+            - {Name: MODEL, Value: !Ref Model}
+          Secrets:
+            - {Name: OPENROUTER_API_KEY, ValueFrom: !Sub '${AppSecret}:OPENROUTER_API_KEY::'}
+            - {Name: ANTHROPIC_API_KEY, ValueFrom: !Sub '${AppSecret}:ANTHROPIC_API_KEY::'}
+            - {Name: NVIDIA_API_KEY, ValueFrom: !Sub '${AppSecret}:NVIDIA_API_KEY::'}
+            - {Name: WELD_RECORDER_USERNAME, ValueFrom: !Sub '${AppSecret}:WELD_RECORDER_USERNAME::'}
+            - {Name: WELD_RECORDER_PASSWORD, ValueFrom: !Sub '${AppSecret}:WELD_RECORDER_PASSWORD::'}
+            - {Name: CO_DENVER_USERNAME, ValueFrom: !Sub '${AppSecret}:CO_DENVER_USERNAME::'}
+            - {Name: CO_DENVER_PASSWORD, ValueFrom: !Sub '${AppSecret}:CO_DENVER_PASSWORD::'}
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api'
+      PackageType: Image
+      Code:
+        ImageUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/api:${ApiImageTag}'
+      Role: !GetAtt ApiFunctionRole.Arn
+      Timeout: 29
+      MemorySize: 512
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          STORAGE_BUCKET: !Ref StorageBucket
+          JOB_QUEUE_URL: !Ref JobQueue
+          CLUSTER_ARN: !GetAtt EcsCluster.Arn
+          CORS_ORIGINS: '*'
+          ENVIRONMENT: !Ref Environment
+
+  DispatcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dispatcher'
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt DispatcherFunctionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          CLUSTER_ARN: !GetAtt EcsCluster.Arn
+          TASK_DEFINITION: !Ref WorkerTaskDefinition
+          CONTAINER_NAME: worker
+          JOBS_TABLE: !Ref JobsTable
+          SUBNET_ID:
+            Fn::ImportValue: !Sub '${ProjectName}-PublicSubnetId'
+          SECURITY_GROUP_ID:
+            Fn::ImportValue: !Sub '${ProjectName}-WorkerSecurityGroupId'
+      Code:
+        # The handler source is spliced in from apps/dispatcher/handler.py by
+        # infra/deploy.py at upload time — never edit the code here by hand.
+        ZipFile: |
+          # {{ dispatcher_handler }}
+
+  DispatcherEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt JobQueue.Arn
+      FunctionName: !Ref DispatcherFunction
+      BatchSize: 1
+
+  # ---------------- API Gateway (HTTP API + Cognito JWT authorizer) ----------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-http-api'
+      ProtocolType: HTTP
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: cognito
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /api/{proxy+}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/api/*'
+
+Outputs:
+  ApiEndpoint:
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-ApiEndpoint'
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${ProjectName}-UserPoolId'
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${ProjectName}-UserPoolClientId'
+  CognitoDomain:
+    Value: !If
+      - DefaultCognitoDomain
+      - !Sub '${ProjectName}-${AWS::AccountId}'
+      - !Ref CognitoDomainPrefix
+    Export:
+      Name: !Sub '${ProjectName}-CognitoDomain'
+  StorageBucketName:
+    Value: !Ref StorageBucket
