@@ -66,17 +66,25 @@ pipeline.py         Dispatches to county-specific scraper via COUNTY_SCRAPERS di
 ### Weld County
 
 **Data sources:**
-- **Property Portal** — `maps.weld.gov/propertyportal/`
-  Parcel lookup by situs address. Returns parcel ID, owner info, and document history
-  with Reception Numbers (the primary cross-reference key for all Weld recordings).
-- **eRecording** — `erecording.weld.gov/recorder/web/login.jsp`
-  Authenticated search. Uses shared surveyor community login (credentials in `.env`).
-  Supports search by Reception Number and by document type.
+- **Property Portal** — `apps.weld.gov/propertyportal/`
+  React SPA. Parcel lookup by situs address, owner name, account number, or parcel number.
+  Returns account number (e.g. R1234567), owner, and links to the property report page.
+- **Property Report** — `propertyreport.weld.gov/?account=RXXXXXXX`
+  Standard HTML page. Shows owner, legal description, and document history with Reception Numbers.
+- **Clerk & Recorder** — `recording.weld.gov` (Tyler Technologies)
+  Public access — click-through disclaimer only, no login required.
+  Supports grantor/grantee name search and reception number search.
 
 **Notes:**
-- Scanned records typically only go back to the 1990s.
-- Reception Numbers are the canonical lookup key — always retrieve them from the portal first.
-- The eRecording site is a Java web app (`login.jsp`) — expect slower page loads.
+- Reception Numbers are the canonical lookup key — collect them from the property report first.
+- The old Java eRecording site (`erecording.weld.gov`) has been replaced by the Tyler Tech portal.
+- Owner name search in Tyler Tech uses "Last Name, First Name" for individuals and full name for businesses.
+
+**Full SOP:** See [docs/weld_county_sop.md](docs/weld_county_sop.md) for the human-validated
+three-path procedure (Happy Path / Research Path 1 / Research Path 2), document-type cheat
+sheet, URL reference, and a worked example for parcel `R1611986`. The SOP is the
+source-of-truth specification the scraper should implement end-to-end — today only Path A
+is automated.
 
 ### Denver County
 
@@ -154,17 +162,18 @@ local `.env` file. The app fails fast at startup with a clear error if required 
 
 | Env Var | Required | Description |
 |---------|----------|-------------|
-| `OPENROUTER_API_KEY` | If no Anthropic key | API key for OpenRouter (supports free models) |
-| `MODEL` | No (defaults to `google/gemini-2.0-flash-exp:free`) | LLM model string |
-| `ANTHROPIC_API_KEY` | If no OpenRouter key | Anthropic API key (alternative to OpenRouter) |
-| `WELD_ERECORDING_USERNAME` | Yes | Weld County eRecording shared login |
-| `WELD_ERECORDING_PASSWORD` | Yes | Weld County eRecording shared login |
+| `LLM_PROVIDER` | No | Provider to use: `nvidia`, `openrouter`, `anthropic`, `openai`. Auto-detects from available keys if omitted. |
+| `MODEL` | Yes | Model string for the chosen provider (see examples below) |
+| `NVIDIA_API_KEY` | If provider=nvidia | NVIDIA NIM API key (free tier at build.nvidia.com) |
+| `OPENROUTER_API_KEY` | If provider=openrouter | OpenRouter API key (free models available) |
+| `ANTHROPIC_API_KEY` | If provider=anthropic | Anthropic API key |
+| `WELD_RECORDER_USERNAME` | Yes (Weld) | Weld County Recorder portal login (free registration at recording.weld.gov) |
+| `WELD_RECORDER_PASSWORD` | Yes (Weld) | Weld County Recorder portal password |
 
-**LLM priority:** OpenRouter is used when `OPENROUTER_API_KEY` is set; otherwise falls back
-to Anthropic. At least one must be configured.
-
-**Recommended free model for POC:** `google/gemini-2.0-flash-exp:free` via OpenRouter —
-strong tool use, 1500 req/day free tier.
+**Recommended models by provider:**
+- NVIDIA (free): `meta/llama-3.3-70b-instruct` or `nvidia/llama-3.1-nemotron-70b-instruct-hf`
+- OpenRouter (free): `google/gemini-2.0-flash-exp:free`
+- Anthropic: `claude-sonnet-4-6` (most capable), `claude-haiku-4-5` (fastest/cheapest)
 
 **Local dev:** create a `.env` file (gitignored) in the project root:
 ```bash

@@ -12,8 +12,8 @@ SUPPORTED_COUNTIES: list[dict] = [
         "county": "Weld",
         "scraper_key": "CO:weld",
         "urls": {
-            "property_portal": "https://maps.weld.gov/propertyportal/",
-            "erecording": "https://erecording.weld.gov/recorder/web/login.jsp",
+            "property_portal": "https://apps.weld.gov/propertyportal/",
+            "recorder": "https://recording.weld.gov/web/user/disclaimer",
         },
     },
     {
@@ -21,11 +21,8 @@ SUPPORTED_COUNTIES: list[dict] = [
         "county": "Denver",
         "scraper_key": "CO:denver",
         "urls": {
-            "assessor": "https://www.denvergov.org/Government/Agencies-Departments-Offices/"
-            "Agencies-Departments-Offices-Directory/Assessors-Office",
-            "recorder": "https://www.denvergov.org/Government/Agencies-Departments-Offices/"
-            "Agencies-Departments-Offices-Directory/Denver-Clerk-and-Recorder/"
-            "Recording-Division/find-records",
+            "assessor": "https://property.spatialest.com/co/denver",
+            "recorder": "https://countyfusion3.kofiletech.us/countyweb/loginDisplay.action?countyname=Denver",
         },
     },
     {

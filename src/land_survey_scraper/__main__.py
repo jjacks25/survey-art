@@ -40,6 +40,35 @@ def main() -> None:
             f"(supported: {', '.join(COUNTY_SCRAPERS)})"
         ),
     )
+    parser.add_argument(
+        "--str",
+        dest="str_input",
+        metavar="S,T,R",
+        default="",
+        help=(
+            "Weld only: Section,Township,Range PLSS lookup (e.g. '15,5N,67W'). "
+            "SOP Priority 2/3 — used when address is unknown."
+        ),
+    )
+    parser.add_argument(
+        "--owner",
+        dest="owner_input",
+        metavar="NAME",
+        default="",
+        help=(
+            "Weld only: owner-name lookup (e.g. 'STRATUS DELANTERO LLC'). "
+            "SOP Priority 4 — last resort when address and S/T/R fail."
+        ),
+    )
+    parser.add_argument(
+        "--sop-strict",
+        action="store_true",
+        help=(
+            "Weld only: drive the literal SOP browser walk (GIS Hub → "
+            "Interactive Maps → Property Portal → Identify Results) "
+            "instead of the HTTP shortcut."
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
@@ -51,6 +80,9 @@ def main() -> None:
         skip_existing=not args.no_skip_existing,
         quiet=args.quiet,
         county_override=args.county,
+        str_input=args.str_input,
+        owner_input=args.owner_input,
+        sop_strict=args.sop_strict,
     )
 
     if err:

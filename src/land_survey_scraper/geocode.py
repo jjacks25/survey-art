@@ -1,5 +1,6 @@
 """Resolve a free-form address to normalized components and county (state + name)."""
 
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -100,16 +101,53 @@ def _fips_to_state(fips: str) -> str | None:
     return fips_map.get(fips.zfill(2))
 
 
+_STATE_NAMES: dict[str, str] = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI",
+    "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX",
+    "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+
+
+def _normalize_state(state: str) -> str:
+    """Return a 2-letter state abbreviation, accepting full names or abbreviations."""
+    s = state.strip()
+    if len(s) == 2:
+        return s.upper()
+    return _STATE_NAMES.get(s.lower(), s)
+
+
 def _parse_address_parts(addr: str) -> dict[str, str]:
-    """Split '123 Main St, City, ST 12345' into street, city, state, zip."""
+    """Split an address string into street, city, state, and zip.
+
+    Handles both the combined form ('123 Main St, City, ST 12345') and the
+    separated form ('123 Main St, City, Colorado, 80401') where state and zip
+    are in separate comma-delimited fields and the state may be a full name.
+    """
     addr = addr.strip()
     parts = [p.strip() for p in addr.split(",")]
     street = parts[0] if len(parts) > 0 else ""
     city = parts[1] if len(parts) > 1 else ""
-    state_zip = parts[2] if len(parts) > 2 else ""
-    state_zip = state_zip.strip().split()
-    state = state_zip[0] if len(state_zip) >= 1 else ""
-    zip_code = state_zip[1] if len(state_zip) >= 2 else ""
+
+    # 4-part form: "Street, City, State, Zip"
+    if len(parts) >= 4 and re.match(r"^\d{5}(-\d{4})?$", parts[-1].strip()):
+        state = _normalize_state(parts[2])
+        zip_code = parts[-1].strip()
+    else:
+        # 3-part form: "Street, City, ST 12345"
+        state_zip = (parts[2] if len(parts) > 2 else "").split()
+        state = _normalize_state(state_zip[0]) if state_zip else ""
+        zip_code = state_zip[1] if len(state_zip) >= 2 else ""
+
     return {"street": street, "city": city, "state": state, "zip": zip_code}
 
 

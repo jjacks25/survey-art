@@ -1,191 +1,350 @@
 # Land Survey Scraper
 
-Automated land survey research tool for Colorado counties. Given a street address, the tool
-navigates county government websites to locate and download all relevant property records —
-deeds, plats, surveys, and easements — that a surveyor would normally gather manually.
+Automated land survey research for Colorado counties. Given a street address, account
+number, parcel ID, owner name, or PLSS coordinates, the tool navigates county government
+websites to locate and download all relevant property records — deeds, plats, surveys,
+easements, right-of-way agreements — that a surveyor would normally gather manually.
 
-## Prerequisites
-
-| Requirement | Version | Install |
-|-------------|---------|---------|
-| [Python](https://www.python.org/) | 3.13+ | `brew install python` or pyenv |
-| [uv](https://docs.astral.sh/uv/) | latest | `brew install uv` |
-| [Docker](https://www.docker.com/products/docker-desktop/) | latest | Docker Desktop |
-| [OpenRouter API key](https://openrouter.ai/) | — | Free account at openrouter.ai |
-| Weld County eRecording login | — | Shared surveyor community credentials |
-
-**OpenRouter** is used to run the AI browser agent that navigates county websites. A free
-account gives you 1500 requests/day — enough for POC use. Sign up at openrouter.ai, generate
-an API key, and add it to your `.env` file.
-
-**`.env` file** — create this in the project root before running anything:
-
-```bash
-# LLM (free tier via OpenRouter — recommended for POC)
-OPENROUTER_API_KEY=sk-or-...
-MODEL=google/gemini-2.0-flash-exp:free
-
-# Weld County eRecording shared surveyor login
-WELD_ERECORDING_USERNAME=your_username
-WELD_ERECORDING_PASSWORD=your_password
-```
-
-> `.env` is gitignored. Never commit it. For Docker, vars are passed in via `--env-file .env`.
+> **Current focus:** Weld County. Other counties (Denver, Jefferson, Arapahoe) are
+> scaffolded but less mature. See [docs/weld_county_sop.md](docs/weld_county_sop.md)
+> for the human-validated source-of-truth procedure the Weld scraper implements.
 
 ---
 
-## How It Works
-
-The tool chains together several steps that mirror how a survey technician researches a project:
-
-```
-Address
-  │
-  ▼ Census Bureau Geocoder
-County (e.g. Weld, CO)
-  │
-  ▼ browser-use (Claude AI agent)
-County portal navigation
-  • Looks up the parcel by situs address
-  • Extracts parcel ID / schedule number / Reception Numbers
-  • Logs into authenticated portals (e.g. Weld eRecording)
-  • Searches for deeds, plats, surveys, easements by ID and document type
-  │
-  ▼ Crawl4AI
-Document links extracted from result pages
-  │
-  ▼ httpx (async)
-PDFs downloaded in parallel → ./tmp/{county}/{address}/
-```
-
-Rather than hard-coded CSS selectors that break when county sites update, the scraper uses
-**browser-use** — an open-source LLM browser agent — to describe navigation tasks in natural
-language and let Claude figure out how to execute them. This makes the scraper resilient to
-layout changes across different county portals.
-
-## Supported Counties
-
-| County | State | Scraper Key | Primary Sources |
-|--------|-------|-------------|-----------------|
-| Weld | CO | `CO_weld` | Property Portal + eRecording (authenticated) |
-| Denver | CO | `CO_denver` | Denver Assessor + Clerk & Recorder |
-| Arapahoe | CO | `CO_arapahoe` | Arapahoe Assessor + Recorder |
-| Jefferson | CO | `CO_jefferson` | Jeffco Records Search |
-
-## Setup
-
-Once prerequisites are in place (`.env` created, Docker running):
+## Quickstart
 
 ```bash
+# 1. Install prerequisites (one time)
+brew install python uv docker poppler
 uv sync
-uv run playwright install chromium   # installs the Chromium browser for local runs
+uv run playwright install chromium
+
+# 2. Create .env (see "Configuration" below)
+cp .env.example .env  # then edit
+
+# 3. Run for the example parcel
+uv run land-survey-scraper "R1611986" --county CO_weld
 ```
 
-## Usage
+Output lands in `tmp/CO_weld/R1611986/`:
+
+```
+tmp/CO_weld/R1611986/
+├── overview.json       # all scraped data (see "Output format" below)
+├── map.png             # ESRI satellite view with parcel boundary highlighted
+└── reception_*.pdf     # downloaded recorded documents (when credentials set)
+```
+
+---
+
+## How to run
+
+The scraper has one positional argument (the **query**) and several optional flags.
+The query auto-detects its type by pattern:
+
+| Query example | Auto-detected as | SOP Priority |
+|---|---|---|
+| `"123 Main St, Greeley, CO 80631"` | Address | 1 |
+| `"R1611986"` | Weld account number | (skips Phase 1) |
+| `"095715000012"` | 12-digit Weld parcel ID | (skips Phase 1) |
+| `"STRATUS DELANTERO"` (with `--owner`) | Owner name | 4 |
+
+### All run modes
 
 ```bash
-# Recommended: run via Docker (handles all deps including Chromium)
-make process ADDRESS="1234 Main St, Greeley, CO 80631"
-
-# Or run locally with uv
+# 1. By address — geocodes to determine the county, then dispatches
 uv run land-survey-scraper "1234 Main St, Greeley, CO 80631"
 
-# Force a specific county (skip geocoding — useful for testing)
-uv run land-survey-scraper "1234 Main St" --county CO_weld
+# 2. By account number — bypasses geocoding, fastest for Weld
+uv run land-survey-scraper "R1611986" --county CO_weld
 
-# Save to a custom directory
-uv run land-survey-scraper "1234 Main St, Lakewood, CO 80215" -t ./output
+# 3. By parcel ID
+uv run land-survey-scraper "095715000012" --county CO_weld
+
+# 4. By owner name (SOP "Priority 4 — last resort")
+uv run land-survey-scraper "any address" --county CO_weld --owner "STRATUS DELANTERO"
+
+# 5. By Section / Township / Range (PLSS) — requires --sop-strict (browser walk)
+uv run land-survey-scraper "any address" --county CO_weld \
+    --str "15,5N,67W" --sop-strict
+
+# 6. SOP-strict mode — literal Playwright walk through the GIS Hub UI
+#    (slower; useful for demos or when the HTTP shortcut fails)
+uv run land-survey-scraper "R1611986" --county CO_weld --sop-strict
+
+# 7. Watch the browser drive itself (only useful with --sop-strict or Phase 3)
+WELD_HEADED=1 uv run land-survey-scraper "R1611986" --county CO_weld --sop-strict
+
+# 8. Custom output directory
+uv run land-survey-scraper "R1611986" --county CO_weld -t ./output
+
+# 9. Re-download files that already exist
+uv run land-survey-scraper "R1611986" --county CO_weld --no-skip-existing
+
+# 10. Suppress progress UI (CI-friendly)
+uv run land-survey-scraper "R1611986" --county CO_weld --quiet
 ```
 
-**Output** is saved to `./tmp/{county_key}/{address_slug}/`. Example:
+### Docker
 
-```
-tmp/
-  CO_weld/
-    1234_main_st_greeley_co_80631/
-      warranty_deed_2021.pdf
-      land_survey_plat_2019.pdf
-      easement_agreement.pdf
-```
-
-Existing files are skipped by default. Use `--no-skip-existing` to re-download.
-
-## Docker
+Recommended for reproducibility and CI — no host Python/Chromium needed.
 
 ```bash
-make build          # build image
-make dev            # shell with source mounted (live code changes)
-make process ADDRESS="123 Main St, Greeley, CO 80631"   # run end-to-end
+make build                                                # build the image (one time)
+make process ADDRESS="R1611986" ARGS="--county CO_weld"   # run end-to-end
+make shell                                                # interactive bash inside the image
+make dev                                                  # bash with local src/ mounted (live edits)
+make down                                                 # stop a backgrounded container
 ```
 
-The `process` target builds if needed, passes `.env` into the container, and mounts
-`./tmp` so downloaded files land on your host machine.
-
-## Development
+Pass extra flags via `ARGS="..."`:
 
 ```bash
-uv run pytest --cov=src tests/   # run tests with coverage
-uv run ruff check src tests      # lint
-uv run ruff format src tests     # format
+make process ADDRESS="R1611986" ARGS="--county CO_weld --sop-strict"
+make process ADDRESS="STRATUS DELANTERO" ARGS="--county CO_weld --owner 'STRATUS DELANTERO LLC'"
 ```
 
-## Adding a New County
+> **Docker limitation:** `WELD_HEADED=1` does nothing inside the container — there's no
+> display. Use local `uv run` to watch the browser.
 
-1. **Add the county entry** to `SUPPORTED_COUNTIES` in `src/land_survey_scraper/county_sites.py`:
+### CLI reference
 
-   ```python
-   {
-       "state": "CO",
-       "county": "Boulder",
-       "scraper_key": "CO_boulder",
-       "urls": {
-           "assessor": "https://www.bouldercounty.gov/property-and-land/assessor/",
-           "recorder": "https://www.bouldercounty.gov/property-and-land/recording/",
-       },
-   }
-   ```
+| Flag | Applies to | Default | Description |
+|---|---|---|---|
+| (positional) | All | — | Address, account, parcel ID, or any string to dispatch from |
+| `-t / --tmp PATH` | All | `./tmp` | Output directory root |
+| `--county KEY` | All | (geocode) | Override county dispatch (e.g. `CO_weld`). Required when query isn't an address. |
+| `--no-skip-existing` | All | (skip) | Re-download files even if they're already on disk |
+| `--quiet` | All | (verbose) | Suppress Rich progress panels |
+| `--str S,T,R` | Weld | — | PLSS lookup, comma-separated (e.g. `15,5N,67W`). Requires `--sop-strict`. |
+| `--owner NAME` | Weld | — | Owner-name lookup (SOP Priority 4) |
+| `--sop-strict` | Weld | (off) | Drive the literal SOP browser walk instead of HTTP shortcut |
+| `--version` | All | — | Print version |
 
-2. **Create the scraper** at `src/land_survey_scraper/scrapers/boulder_county.py`.
-   Copy an existing county scraper as a template. The only required export is:
+### Environment variables
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `MODEL` | Yes for non-Weld counties | — | LLM model id (e.g. `claude-haiku-4-5`) |
+| `LLM_PROVIDER` | No | auto-detect | One of `nvidia`, `openrouter`, `anthropic`, `openai` |
+| `ANTHROPIC_API_KEY` | If using Anthropic | — | Claude API key |
+| `OPENROUTER_API_KEY` | If using OpenRouter | — | OpenRouter key (free tier available) |
+| `NVIDIA_API_KEY` | If using NVIDIA NIM | — | Free tier at build.nvidia.com |
+| `OPENAI_API_KEY` | If using OpenAI | — | OpenAI key |
+| `WELD_RECORDER_USERNAME` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
+| `WELD_RECORDER_PASSWORD` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
+| `WELD_HEADED` | No | `0` | Set to `1` to show the Playwright browser window |
+
+**No LLM is invoked for Weld today.** Phases 1, 2, and 3 are pure HTTP + Playwright with
+hard-coded selectors. The LLM env vars are only used by the Denver / Jefferson / Arapahoe
+scrapers.
+
+Weld Phase 3 (document image download) requires a free registered account at
+`recording.weld.gov` → Log In → "new registered user". Without credentials the scraper
+still completes Phases 1 and 2, and `overview.json` will list each document with
+`download_status: "failed"`.
+
+---
+
+## Output format
+
+Every run produces `tmp/{county_key}/{address_slug}/overview.json` — an incremental
+record updated after each phase. A crash mid-pipeline still leaves a valid file.
+
+```json
+{
+  "meta": {
+    "county_key": "CO_weld",
+    "input_address": "R1611986, , CO ",
+    "account": "R1611986",
+    "sop_path": "A",
+    "source_urls": ["https://apps.weld.gov/...", "https://propertyreport.weld.gov/..."],
+    "last_updated": "2026-05-17T16:50:25+00:00"
+  },
+  "identify_results": {
+    "owner": "STRATUS DELANTERO LLC",
+    "account": "R1611986",
+    "parcel_id": "095715000012",
+    "address": "GREELEY",
+    "subdivision": "",
+    "section": "15",
+    "township": "5N",
+    "range": "67W",
+    "section_township_range": "S15-T5N-R67W",
+    "source": "http"
+  },
+  "account_information": { "Account": "...", "Parcel": "...", "Acres": "...", ... },
+  "owners": { "Owner Name": "...", "Address": "..." },
+  "land_information": { "Code": "...", "Description": "...", "Acres": "270.840", ... },
+  "valuation_information": { "Actual Value": "37,320", ... },
+  "tax_authorities": { "Tax Area": "...", "Mill Levy": "...", ... },
+  "map": {
+    "image_path": "tmp/CO_weld/R1611986/map.png",
+    "iframe_url": "https://maps.weld.gov/mapanaccount/?Account=R1611986"
+  },
+  "document_history": [
+    { "reception": "...", "rec_date": "...", "doc_type": "WD", "grantor": "...", "grantee": "...", "doc_fee": "...", "sale_date": "...", "sale_price": "...", "url": "..." }
+  ],
+  "decision_matrix": {
+    "path": "direct",
+    "sop_letter": "A",
+    "reasoning": ["Condition A matched: ...", "Most recent SURV: ...", "→ Route to Phase 3A."],
+    "vesting_deed_present": true,
+    "survey_present": true,
+    "empty_state_message_present": false,
+    "row_count": 5,
+    "vesting_deeds": [ /* all matching rows */ ],
+    "survey_rows":   [ /* all SURV rows */ ],
+    "most_recent_survey": { /* the most recent SURV row */ },
+    "most_recent_vesting_deed": { /* the most recent vesting deed */ }
+  },
+  "survey_documents": [
+    { "reception": "4970002", "doc_type": "SWD", ..., "download_status": "downloaded", "downloaded_to": "tmp/.../reception_4970002.pdf" }
+  ],
+  "raw_property_report_fields": { /* every label parsed from propertyreport.weld.gov, verbatim */ }
+}
+```
+
+The schema is open: downstream consumers can read `Overview` via the
+[overview.py](src/land_survey_scraper/overview.py) helper or just parse JSON.
+
+---
+
+## Supported counties
+
+| County | State | Scraper key | Approach | Status |
+|---|---|---|---|---|
+| Weld | CO | `CO_weld` | Pure HTTP + Playwright (no LLM) | Phase 1 + 2 fully working; Phase 3 needs registered account |
+| Denver | CO | `CO_denver` | browser-use + LLM | Works; requires `CO_DENVER_USERNAME/PASSWORD` |
+| Jefferson | CO | `CO_jefferson` | Hybrid REST API + browser-use | Works (no auth) |
+| Arapahoe | CO | `CO_arapahoe` | browser-use + LLM | Proof-of-concept |
+
+---
+
+## Weld County — the SOP
+
+The Weld scraper implements the procedure documented in
+**[docs/weld_county_sop.md](docs/weld_county_sop.md)**. That doc is the source of truth —
+read it before modifying scraper logic. Key points:
+
+- **Phase 1** (parcel discovery): SOP Steps 1.1–1.5 yield an Identify Results panel
+  with Owner / Account / Parcel / Address / Subdivision / S-T-R. Steps 1.6 + 1.7 capture
+  all Property Report accordion sections (server-rendered) and a screenshot of the Map
+  iframe (`tmp/.../map.png`).
+- **Phase 2** (Decision Matrix): evaluates Conditions A/B/C against the Document History
+  to choose a routing path. Result lands in `overview.json` as `meta.sop_path` plus a
+  `decision_matrix` section with human-readable reasoning. Each path has a descriptive
+  label (used in code) and a SOP letter (kept for cross-reference with the surveyor doc):
+  - **`direct`** (SOP A) — both vesting deed AND SURV row → direct extraction in Phase 3A.
+  - **`alternate_partial`** (SOP B) — rows present, missing survey or deed → S/T/R Advanced Search in 3B.
+  - **`alternate_empty`** (SOP C) — empty + `No documents found.` text → owner-name search in 3C.
+  - **`unroutable`** — 0 rows without the empty-state message → UI error (per
+    tie-breaker rule #3); retry the run.
+- **Phase 3** (Document Download — not yet implemented): retrieves PDFs from
+  `recording.weld.gov` per the routed path.
+
+Document type codes (`SURV`, `WD`, `SWD`, `QCD`, `EASE`, `ROW`, etc.) and the
+Decision Matrix routing are defined in the SOP and mirrored in
+[scrapers/weld_county.py](src/land_survey_scraper/scrapers/weld_county.py).
+
+---
+
+## Configuration (`.env`)
+
+Create `.env` in the project root (gitignored). Minimum for Weld:
+
+```bash
+# Optional — Weld doesn't use the LLM, but other counties do:
+ANTHROPIC_API_KEY=sk-ant-...
+MODEL=claude-haiku-4-5
+
+# Optional — only needed for Weld Phase 3 document downloads:
+WELD_RECORDER_USERNAME=your_email@example.com
+WELD_RECORDER_PASSWORD=your_password
+```
+
+Docker reads this same file via `--env-file .env`.
+
+---
+
+## How it works (Weld)
+
+```
+Query (address / account / parcel / owner / S-T-R)
+   │
+   ▼ _resolve_parcel() — SOP Priority routing
+Phase 1: Parcel discovery
+   ├── HTTP path: POST apps.weld.gov/propertyportal/index.cfm  (default)
+   └── Browser path: literal SOP walk (--sop-strict)
+   │
+   ▼ ParcelInfo (Owner, Account, Parcel, S-T-R, …)
+   ▼ → overview.json: identify_results
+Phase 1.6: Property Report
+   │  GET propertyreport.weld.gov/?account=R…
+   ▼  parse every accordion section in one HTTP response
+   ▼ → overview.json: account_information, owners, valuation, tax, …
+Phase 1.7: Map accordion
+   │  Playwright renders maps.weld.gov/mapanaccount/?Account=R…
+   ▼  screenshot ESRI map with parcel boundary highlighted
+   ▼ → tmp/.../map.png  +  overview.json: map.image_path
+Phase 2: Document History
+   │  parse Document History rows from property report HTML
+   ▼ → overview.json: document_history, survey_documents
+Phase 3: Document Download
+   │  Playwright iterates recording.weld.gov/web/web/integration/document/{id}
+   │  injects disclaimerAccepted cookie  (bypasses reCAPTCHA-gated button)
+   │  authenticated session (if credentials set) → captures image responses
+   ▼ → tmp/.../reception_{id}.{ext}
+   ▼ → overview.json: survey_documents[].download_status
+```
+
+For Denver / Jefferson / Arapahoe the architecture differs — see each scraper file
+under `src/land_survey_scraper/scrapers/`.
+
+---
+
+## Adding a new county
+
+1. Add an entry to `SUPPORTED_COUNTIES` in
+   [county_sites.py](src/land_survey_scraper/county_sites.py) with the county name,
+   state, scraper key, and relevant URLs.
+2. Create `scrapers/{state}_{county}.py` exposing:
 
    ```python
    async def scrape(
        geocoded: GeocodedAddress,
        tmp_dir: Path,
-       pdf_only: bool = False,
-   ) -> tuple[list[Path], str | None]: ...
+       doc_filter: DocumentFilter = DEFAULT_FILTER,
+       **kwargs,
+   ) -> tuple[list[Path], str | None, float, int, int]: ...
    ```
 
-   Write browser-use agent tasks that describe the navigation in plain English.
-   The agent will use Claude to figure out the specifics of each portal.
+3. Register it in `COUNTY_SCRAPERS` in [pipeline.py](src/land_survey_scraper/pipeline.py).
+4. Add tests in `tests/test_{county}_scraper.py`.
 
-3. **Register the scraper** in `COUNTY_SCRAPERS` in `src/land_survey_scraper/pipeline.py`:
+---
 
-   ```python
-   from land_survey_scraper.scrapers import boulder_county
+## Development
 
-   COUNTY_SCRAPERS = {
-       ...
-       "CO_boulder": boulder_county.scrape,
-   }
-   ```
+```bash
+uv run pytest --cov=src tests/    # tests with coverage
+uv run ruff check src tests       # lint
+uv run ruff format src tests      # format
+make build                        # rebuild Docker image after dependency changes
+```
 
-4. **Add tests** in `tests/test_boulder_county_scraper.py` following the patterns in
-   `tests/test_pipeline_dispatch.py`.
+`AGENTS.md` (which `CLAUDE.md` symlinks to) is the developer/agent guide. Keep it
+in sync with reality — agents read it before touching the code.
 
-## Weld County Workflow (Detail)
+---
 
-Weld is the most complex county — two separate systems must be queried:
+## Troubleshooting
 
-1. **Property Portal** (`maps.weld.gov/propertyportal/`) — The agent searches by situs
-   address, opens the parcel's property report, and extracts all Reception Numbers from the
-   document history. Reception Numbers are Weld County's canonical cross-reference key for
-   all recorded documents.
-
-2. **eRecording** (`erecording.weld.gov`) — The agent logs in with the shared surveyor
-   community credentials and searches by:
-   - Each Reception Number found in step 1
-   - Document types: Land Survey Plats, Subdivision Exemptions, ALTA Surveys, Warranty Deeds,
-     Quit Claim Deeds
-
-   > Note: Weld County scanned records typically only go back to the 1990s.
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `Phase 1 failed: could not resolve … to a Weld parcel` | Address not in Weld portal index | Try the account number directly, or use `--owner` |
+| `WELD_RECORDER_USERNAME/PASSWORD not set` (Phase 3) | Anonymous access blocked at `recording.weld.gov` | Register at `recording.weld.gov` (free) and set env vars |
+| `Disclaimer accept failed: Timeout … #submitDisclaimerAccept` | Old binary — cookie-injection fix not picked up | Pull latest; the scraper now bypasses the reCAPTCHA-gated button |
+| `No #ImageDiv found` for every reception | Disclaimer cookie not set OR not registered | Run Phase 3 with credentials set in `.env` |
+| Map.png shows tiles but no red boundary | ESRI selection layer didn't render in time | The 15s wait is usually enough; rerun |
+| `pdftoppm is not installed` (when reading PDFs) | poppler missing | `brew install poppler` |

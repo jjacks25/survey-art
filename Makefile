@@ -39,9 +39,9 @@ down: ## Container | Stop and remove the container (when run in background with 
 	docker stop $(CONTAINER) 2>/dev/null || true
 	docker rm $(CONTAINER) 2>/dev/null || true
 
-process: build ## Scraper | Scrape records for an address: make process ADDRESS="123 Main St, Greeley, CO 80631"
+process: build ## Scraper | Scrape records: make process ADDRESS="123 Main St" [ARGS="--county CO_weld"]
 	docker run --rm \
 	  --env-file .env \
 	  -v $(PWD)/tmp:/app/tmp \
 	  $(IMAGE):$(TAG) \
-	  uv run land-survey-scraper $(ADDRESS)
+	  uv run land-survey-scraper "$(ADDRESS)" $(ARGS)

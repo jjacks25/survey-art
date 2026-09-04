@@ -68,3 +68,6 @@ Thumbs.db
 .cache/
 county_sites_cache.json
 tmp/
+
+# Claude
+.claude/settings.local.json

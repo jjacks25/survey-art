@@ -100,12 +100,12 @@ class DocumentFilter:
         types_str = ", ".join(self.doc_types)
         exts_str = ", ".join(self.file_extensions)
         return (
-            f"You are researching documents for a professional land surveying firm. "
-            f"Collect download links for any of the following document types: {types_str}. "
+            f"Collect and download any of the following document types: {types_str}. "
             f"Accept files in any of these formats: {exts_str}. "
-            "Do not collect navigation links, search forms, help pages, or unrelated records. "
-            "If a document viewer is shown instead of a direct download link, look for a "
-            "'Download', 'Print', or 'View PDF' button and collect that URL instead."
+            "Survey plats (Land Survey Plat, Subdivision Plat, Improvement Survey Plat, "
+            "ALTA/NSPS Survey, Boundary Survey) are the highest priority — never skip these. "
+            "Deeds and easements are also important. "
+            "Do not collect navigation links, search forms, help pages, or unrelated records."
         )
 
 
