@@ -1,0 +1,16 @@
+{
+  "counties": [
+    {
+      "state": "CA",
+      "county": "Los Angeles",
+      "base_url": "https://example.gov",
+      "search_path": "/property-search"
+    },
+    {
+      "state": "UT",
+      "county": "Utah",
+      "base_url": "https://www.utahcounty.gov",
+      "search_path": "/LandRecords/AddressSearchForm.asp"
+    }
+  ]
+}

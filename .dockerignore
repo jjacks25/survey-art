@@ -1,0 +1,44 @@
+# Virtual env and uv
+.venv
+.uv
+# *.lock — keep uv.lock in context for RUN --mount=type=bind,source=uv.lock
+
+# Git and IDE
+.git
+.gitignore
+.cursor
+.idea
+.vscode
+*.swp
+*.swo
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+htmlcov
+*.egg-info
+.eggs
+dist
+build
+
+# Local and env
+.env
+.env.*
+!.env.example
+
+# Runtime output — never include downloaded files in the build context
+tmp/
+
+# Docs and misc
+*.md
+!README.md
+docs
+Dockerfile*
+compose*
+.dockerignore
