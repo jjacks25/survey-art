@@ -101,6 +101,29 @@ Evaluate the Document History table top-to-bottom and stop at the first matching
 
 The ALTA was recorded against this parcel and is referenced in the GIS portal.
 
+> **Implementation.** Wired in [scrapers/weld_county.py](../src/land_survey_scraper/scrapers/weld_county.py)
+> as `_select_phase_3a_targets()` + `_download_documents()`. Runs only when
+> `decision_matrix.path == "direct"`. Targets the `most_recent_survey` and
+> `most_recent_vesting_deed` rows captured during the Decision Matrix. Each
+> document is saved page-by-page as `tmp/{county}/{account}/{role}_{reception}_p{n}.pdf`
+> (or `_{role}_{reception}.pdf` for single-page docs).
+>
+> **Disclaimer + reCAPTCHA bypass.** The disclaimer page at `recording.weld.gov`
+> has a reCAPTCHA-gated "I Accept" button that headless Chromium can't pass.
+> We inject the `disclaimerAccepted=true` cookie directly into the Playwright
+> context — the document viewer only checks for that cookie's presence.
+>
+> **Login.** Anonymous viewing on `recording.weld.gov` returns a "must be a
+> registered user" stub instead of the document images. We POST credentials
+> directly to `/web/user/login` via `ctx.request.post()` (the in-page button
+> is a jQuery Mobile fragment whose handler doesn't fire under Playwright).
+> Set `WELD_RECORDER_USERNAME` / `WELD_RECORDER_PASSWORD` in `.env`. Register
+> for free at `https://recording.weld.gov/web/user/register` if needed.
+>
+> Step 3A.5 (Schedule B-2 exception walk) is **not yet implemented** — it
+> requires PDF text extraction from the saved ALTA to find `REC. NO.`
+> references, then a Document Number lookup per reference.
+
 1. **Click the `SURV` reception link** — the most recent `Type = SURV` row. A new tab opens
    the Tyler Tech Self Service Web at `https://recording.tylerhost.net/Welcome` with the
    document viewer loaded.
@@ -123,6 +146,36 @@ The ALTA was recorded against this parcel and is referenced in the GIS portal.
 ---
 
 ## Phase 3B — Research Path 1 (rows present, but missing survey or deed)
+
+> **Implementation.** Wired in [scrapers/weld_county.py](../src/land_survey_scraper/scrapers/weld_county.py)
+> as `_select_phase_3b_targets()` + `_run_advanced_search()`. Runs only when
+> `decision_matrix.path == "alternate_partial"`. Two passes:
+>
+> 1. **Step 3B.2** — most-recent vesting deed (if Document History has one).
+>    Downloaded the same way Phase 3A grabs documents (`#printCustom` endpoint).
+> 2. **Step 3B.4 + 3B.5** — Advanced Search at
+>    `/web/search/DOCSEARCH524S12`. The form's direct HTTP POST endpoint
+>    (`/web/searchPost/...`) returns only metadata, so we drive the page UI
+>    via Playwright (`#field_PLSSLegalID_DOT_Section/Township/Range`, then
+>    click `#searchButton`). Results are extracted from `li.ss-search-row`
+>    elements: `data-documentid` (Tyler ID), header `<h1>` carrying
+>    `<reception> • <type> • <date>`. Authentication is required — the
+>    Advanced Search returns no rows for anonymous sessions.
+> 3. **Step 3B.7** — if `parcel.subdivision` is non-empty, a second Advanced
+>    Search runs with `Platted Legal → Subdivision`, and the result rows are
+>    deduplicated against the S/T/R pass by reception number.
+>
+> The SOP's Document Types multiselect (`EASEMENT`, `RIGHT OF WAY`, etc.) is an
+> autocomplete input that's awkward to drive headlessly, so we post-filter the
+> result rows in Python against `_PHASE_3B_DOC_TYPES` instead. Match is loose:
+> any row whose Type contains `EASEMENT`, `RIGHT OF WAY`, `R/W`, or `ROW` is
+> kept.
+>
+> Step 3B.3 (Exhibit A cross-reference harvest) is **not implemented** — Tyler
+> PDFs are scanned images with no text layer, so extracting `Excluding portions
+> conveyed in Deed recorded …` references would require OCR (tesseract) or a
+> vision LLM. The S/T/R Advanced Search in Step 3B.5 already finds all
+> easements in the same section, so the practical recall loss is small.
 
 The ALTA was either delivered out-of-band or never recorded. The agent must build the
 easement / right-of-way packet via Advanced Search on S/T/R.

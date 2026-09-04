@@ -836,23 +836,31 @@ _DOC_EXTENSIONS = (".tif", ".tiff", ".pdf", ".jpg", ".jpeg", ".png")
 
 async def _download_documents(
     address: str,
-    docs: list[_DocRecord],
+    targets: list[tuple[str, _DocRecord]],
     doc_filter: DocumentFilter,
     dest_dir: Path,
     username: str = "",
     password: str = "",
-) -> tuple[list[Path], float, int, int]:
-    """Phase 3: download documents using Playwright with a full browser-side session.
+) -> tuple[list[tuple[str, _DocRecord, list[Path]]], float, int, int]:
+    """Phase 3: download recorder documents via Playwright with disclaimer bypass.
 
-    Does disclaimer acceptance and login entirely in the browser — no httpx cookie
-    injection — so the JSESSIONID remains consistent throughout and Tyler Tech's
-    session validation passes.
+    Accepts a list of `(role, _DocRecord)` tuples. The `role` is used as the
+    filename prefix so callers can distinguish ALTA / vesting_deed / exception
+    output without re-parsing the doc record. Examples:
+      - ("alta", doc)        -> "alta_4571638.tif"
+      - ("vesting_deed", doc) -> "vesting_deed_4970002.pdf"
+      - ("exception", doc)   -> "exception_1766550_p2.tif"
 
-    When authenticated, the Tyler Tech viewer server-renders document images into
-    #ImageDiv as <img> tags. The browser fetches those image URLs as separate HTTP
-    requests, which we capture via the response interceptor.
+    The disclaimer page at recording.weld.gov is gated by a Google reCAPTCHA on
+    the "I Accept" button. Headless Chromium can't pass reCAPTCHA, so we inject
+    the `disclaimerAccepted=true` cookie directly — the document viewer only
+    checks for the cookie's presence.
+
+    Returns `(results, cost, in_tokens, out_tokens)` where `results` is a list
+    of `(role, doc_record, [saved_paths])` so the caller can map each downloaded
+    document back to its semantic role.
     """
-    if not docs:
+    if not targets:
         return [], 0.0, 0, 0
 
     import asyncio as _asyncio
@@ -860,7 +868,7 @@ async def _download_documents(
     from playwright.async_api import async_playwright
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[Path] = []
+    results: list[tuple[str, _DocRecord, list[Path]]] = []
 
     # Set WELD_HEADED=1 to watch the browser drive itself (useful for debugging).
     import os
@@ -888,126 +896,380 @@ async def _download_documents(
         }])
         setup_page = await ctx.new_page()
 
-        # Step 2: Login if credentials are provided
+        # Step 2: Login if credentials are provided.
+        #
+        # The login page is a jQuery Mobile fragment — loading `/web/user/login`
+        # directly leaves jQuery undefined, so clicking the in-page submit
+        # button (or calling the JS handler) doesn't work. The button's JS
+        # handler ultimately POSTs the serialized form to `/web/user/login`
+        # and expects a JSON `{success, message}` response, so we just do
+        # that POST directly through Playwright's request context. The
+        # response cookies are shared with subsequent page navigations.
         if username and password:
             try:
-                await setup_page.goto(
-                    _RECORDER_LOGIN_URL, wait_until="domcontentloaded", timeout=20_000
+                resp = await ctx.request.post(
+                    _RECORDER_LOGIN_URL,
+                    form={"field_UserId": username, "field_Password": password},
+                    headers={"X-Requested-With": "XMLHttpRequest"},
                 )
-                await setup_page.fill('[name="field_UserId"]', username)
-                await setup_page.fill('[name="field_Password"]', password)
-                await setup_page.click('[type="submit"]')
-                await setup_page.wait_for_load_state("networkidle", timeout=20_000)
-
-                # If still showing the password field, login failed
-                still_has_password = await setup_page.query_selector('[name="field_Password"]')
-                if still_has_password:
+                body = await resp.text()
+                # Server returns JSON: {"success": bool, "message": str, ...}
+                import json as _json
+                try:
+                    payload = _json.loads(body)
+                except _json.JSONDecodeError:
+                    payload = {"success": False, "message": body[:200]}
+                if not payload.get("success"):
                     logger.error(
-                        "Login failed — check WELD_RECORDER_USERNAME/PASSWORD. "
-                        "Register for free at recording.weld.gov"
+                        "Login failed (HTTP %s): %s. "
+                        "Check WELD_RECORDER_USERNAME/PASSWORD in .env, or "
+                        "register at recording.weld.gov.",
+                        resp.status, payload.get("message", "(no message)"),
                     )
                     await browser.close()
                     return [], 0.0, 0, 0
                 logger.info("Logged in as %s", username)
             except Exception as exc:
-                logger.warning("Login failed: %s", exc)
+                logger.warning("Login POST failed: %s", exc)
+                await browser.close()
+                return [], 0.0, 0, 0
 
         await setup_page.close()
 
-        # Step 3: Download each document
-        for doc in docs:
-            captured: list[tuple[str, bytes]] = []
-
-            async def handle_response(resp, _doc=doc):
-                url = resp.url
-                if "recording.weld.gov" not in url:
-                    return
-                ct = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-                url_path = url.lower().split("?")[0]
-                is_doc = ct in _BINARY_CONTENT_TYPES or any(
-                    url_path.endswith(ext) for ext in _DOC_EXTENSIONS
-                )
-                if not is_doc:
-                    return
-                try:
-                    body = await resp.body()
-                    if body and len(body) > 5_000:
-                        captured.append((url, body))
-                        logger.info("Captured %d bytes from %s", len(body), url[:80])
-                except Exception as exc:
-                    logger.debug("Could not read response body: %s", exc)
-
+        # Step 3: Download each document as a single complete PDF.
+        #
+        # Tyler's viewer uses PDF.js with HTTP Range requests, so trying to
+        # snoop the network for "the PDF" yields fragmented byte chunks rather
+        # than a usable file. The viewer's print toolbar button (`#printCustom`)
+        # has a `data-href` pointing at Tyler's native single-file endpoint
+        # (`/web/document-image-pdf/.../<reception>-1.pdf?index=1`) which
+        # serves the complete multi-page document. We open the viewer just
+        # long enough to read that href, then fetch it directly.
+        for role, doc in targets:
+            doc_saved: list[Path] = []
             doc_page = await ctx.new_page()
-            doc_page.on("response", handle_response)
-
             try:
                 await doc_page.goto(doc.url, wait_until="domcontentloaded", timeout=30_000)
-                logger.info("Navigated to %s", doc.url)
                 await doc_page.wait_for_load_state("networkidle", timeout=20_000)
-                await _asyncio.sleep(2)
 
-                # Fallback: check ImageDiv for <img> srcs in case we missed the network event
-                if not captured:
-                    img_srcs: list[str] = await doc_page.evaluate(
-                        """() => {
-                            const div = document.getElementById('ImageDiv');
-                            if (!div) return [];
-                            return Array.from(div.querySelectorAll('img'))
-                                       .map(i => i.src)
-                                       .filter(s => s && s.includes('recording.weld.gov'));
-                        }"""
-                    )
-                    for src in img_srcs:
-                        try:
-                            body = await (await ctx.request.get(src)).body()
-                            if body and len(body) > 5_000:
-                                captured.append((src, body))
-                                logger.info(
-                                    "DOM fallback: captured %d bytes from %s",
-                                    len(body),
-                                    src[:80],
-                                )
-                        except Exception as exc:
-                            logger.debug("DOM fallback fetch failed: %s", exc)
-
-                if not captured:
-                    # Log ImageDiv text to diagnose auth/access issues
-                    image_div = await doc_page.query_selector("#ImageDiv")
-                    if image_div:
-                        text = (await image_div.inner_text()).strip()[:200]
-                        logger.warning("ImageDiv for %s: %s", doc.reception, text)
-                    else:
-                        logger.warning("No #ImageDiv found for reception %s", doc.reception)
-
-            except Exception as exc:
-                logger.warning("Navigation error for %s: %s", doc.url, exc)
-
-            for idx, (url, body) in enumerate(captured):
-                suffix = Path(url.split("?")[0]).suffix.lower()
-                if suffix not in _DOC_EXTENSIONS:
-                    suffix = ".bin"
-                if len(captured) > 1:
-                    fname = f"reception_{doc.reception}_{idx + 1}{suffix}"
-                else:
-                    fname = f"reception_{doc.reception}{suffix}"
-                dst = dest_dir / fname
-                dst.write_bytes(body)
-                saved.append(dst)
-                logger.info("Saved %s (%d bytes)", dst.name, len(body))
-
-            if not captured:
-                logger.warning(
-                    "No document data captured for reception %s (%s)",
-                    doc.reception,
-                    doc.doc_type,
+                href = await doc_page.evaluate(
+                    "() => { const b = document.getElementById('printCustom');"
+                    " return b ? b.getAttribute('data-href') : null; }"
                 )
-
-            await doc_page.close()
+                if not href:
+                    image_div = await doc_page.query_selector("#ImageDiv")
+                    msg = (await image_div.inner_text()).strip()[:200] if image_div else ""
+                    logger.warning(
+                        "No printCustom button for %s reception %s — %s",
+                        role, doc.reception, msg or "(no diagnostic message)",
+                    )
+                else:
+                    pdf_url = f"https://recording.weld.gov{href}"
+                    resp = await ctx.request.get(pdf_url)
+                    body = await resp.body() if resp.status == 200 else b""
+                    if resp.status != 200:
+                        logger.warning(
+                            "Print endpoint returned HTTP %s for %s reception %s",
+                            resp.status, role, doc.reception,
+                        )
+                    elif not body or body[:5] != b"%PDF-":
+                        logger.warning(
+                            "Print endpoint returned non-PDF body for %s reception %s "
+                            "(head=%r, %d bytes)",
+                            role, doc.reception, body[:8], len(body),
+                        )
+                    else:
+                        dst = dest_dir / f"{role}_{doc.reception}.pdf"
+                        dst.write_bytes(body)
+                        doc_saved.append(dst)
+                        logger.info(
+                            "Saved %s (%d bytes) for %s reception %s",
+                            dst.name, len(body), role, doc.reception,
+                        )
+            except Exception as exc:
+                logger.warning("Download error for %s reception %s: %s", role, doc.reception, exc)
+            finally:
+                results.append((role, doc, doc_saved))
+                await doc_page.close()
 
         await browser.close()
 
-    logger.info("Weld County: saved %d file(s)", len(saved))
-    return saved, 0.0, 0, 0
+    total_files = sum(len(paths) for _, _, paths in results)
+    logger.info("Weld County: saved %d file(s) across %d document(s)", total_files, len(results))
+    return results, 0.0, 0, 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A — Direct Extraction (Happy Path)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Phase 3B — Alternative Research Path 1 (S/T/R Advanced Search)
+# ---------------------------------------------------------------------------
+
+# SOP Step 3B.5 — Document Types multiselect filter list for the Advanced
+# Search. Every variant of EASEMENT / RIGHT OF WAY the SOP enumerates. The
+# Self Service Web search UI is an autocomplete input that's awkward to drive
+# headlessly, so we let the Advanced Search return ALL rows matching the S/T/R
+# and post-filter on the Type column rendered in each result row.
+_PHASE_3B_DOC_TYPES = {
+    "EASEMENT",
+    "EASEMENT & RIGHT OF WAY",
+    "EASEMENT DEED",
+    "EASEMENT PLAT",
+    "EASEMENT RIGHT OF WAY & SURFACE USE AGR",
+    "EASEMENT RIGHT OF WAY AND SURFACE USE AGR",
+    "EASEMENT & SURFACE USE AGR",
+    "GRANT & RELEASE OF EASEMENT",
+    "RIGHT OF WAY",
+    "RIGHT OF WAY EASEMENT",
+    "RIGHT OF WAY AGREEMENT",
+    "AMENDED RIGHT OF WAY",
+    "R/W AGREEMENT",
+    "ROW",
+    "RIGHT OF WAY (RW)",
+}
+
+_ADVANCED_SEARCH_URL = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
+
+
+def _matches_easement_filter(doc_type_label: str) -> bool:
+    """Loose match: a doc type passes if any easement keyword appears in it."""
+    upper = doc_type_label.upper().strip()
+    if upper in _PHASE_3B_DOC_TYPES:
+        return True
+    # The label may carry extra punctuation/spacing; match the canonical
+    # tokens conservatively.
+    return any(t in upper for t in ("EASEMENT", "RIGHT OF WAY", "R/W", "ROW"))
+
+
+async def _run_advanced_search(
+    page,
+    *,
+    section: str = "",
+    township: str = "",
+    range_: str = "",
+    subdivision: str = "",
+) -> list[dict]:
+    """SOP Step 3B.4–3B.5 — drive the Advanced Search UI and return rows.
+
+    The Self Service Web's direct HTTP POST to `/web/searchPost/...` returns
+    only metadata; the actual results render only when the search is driven
+    through the page UI. Each result is parsed into:
+
+        {"reception": str, "doc_type": str, "rec_date": str, "doc_id": str}
+
+    where `doc_id` is Tyler's internal DOC ID (e.g. 'DOC808S1754'). Note this
+    returns ALL rows matching the legal-description criteria — caller should
+    post-filter by `doc_type`.
+    """
+    await page.goto(_ADVANCED_SEARCH_URL, wait_until="networkidle", timeout=30_000)
+    # The form opens with a "Continue session?" dialog if any user state exists.
+    try:
+        await page.click("button:has-text('Yes - Continue')", timeout=3_000)
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except Exception:
+        pass
+
+    # Fill the relevant legal-description fields. Empty strings are ignored.
+    if section:
+        await page.fill("#field_PLSSLegalID_DOT_Section", section)
+    if township:
+        # SOP Step 3B.5: Township should be entered as the numeric portion
+        # only (e.g. "5", not "5N"). Strip any trailing N/S direction.
+        await page.fill("#field_PLSSLegalID_DOT_Township", township.rstrip("NnSs"))
+    if range_:
+        await page.fill("#field_PLSSLegalID_DOT_Range", range_.rstrip("EeWw"))
+    if subdivision:
+        await page.fill("#field_PlattedLegalID_DOT_Subdivision", subdivision)
+
+    await page.click("#searchButton")
+    await page.wait_for_load_state("networkidle", timeout=30_000)
+    await page.wait_for_timeout(2_000)  # results render via AJAX
+
+    rows = await page.evaluate(
+        """() => {
+            const items = document.querySelectorAll('li.ss-search-row[data-documentid]');
+            return Array.from(items).map(li => {
+                const docId = li.getAttribute('data-documentid') || '';
+                const text = (li.querySelector('h1')?.textContent || '').replace(/\\s+/g, ' ').trim();
+                // Header format: "<reception> • <type> • <date>"
+                const parts = text.split(/\\s*•\\s*/);
+                return {
+                    doc_id: docId,
+                    reception: (parts[0] || '').trim(),
+                    doc_type: (parts[1] || '').trim(),
+                    rec_date: (parts[2] || '').trim(),
+                };
+            });
+        }"""
+    )
+    logger.info(
+        "Advanced Search (S=%s T=%s R=%s Sub=%s): %d row(s)",
+        section, township, range_, subdivision, len(rows),
+    )
+    return rows
+
+
+def _select_phase_3a_targets(
+    decision: dict, all_docs: list[_DocRecord]
+) -> list[tuple[str, _DocRecord]]:
+    """SOP Phase 3A — pick the documents to download given a "direct" routing.
+
+    Returns role-tagged docs in download order:
+      - ("alta", most_recent_survey)        (Step 3A.1–3A.3)
+      - ("vesting_deed", most_recent_deed)  (Step 3A.4)
+
+    Schedule B-2 exception references (Step 3A.5) are not yet implemented —
+    that requires parsing the ALTA PDF after Step 3A.3, which needs a separate
+    pass once the ALTA is on disk.
+    """
+    targets: list[tuple[str, _DocRecord]] = []
+
+    survey_dict = decision.get("most_recent_survey")
+    deed_dict = decision.get("most_recent_vesting_deed")
+
+    # Re-hydrate from the in-memory _DocRecord list so we have the dataclass,
+    # not just the dict copy stored in the decision matrix.
+    by_reception = {d.reception: d for d in all_docs}
+
+    if survey_dict and survey_dict.get("reception") in by_reception:
+        targets.append(("alta", by_reception[survey_dict["reception"]]))
+    if deed_dict and deed_dict.get("reception") in by_reception:
+        targets.append(("vesting_deed", by_reception[deed_dict["reception"]]))
+
+    return targets
+
+
+async def _select_phase_3b_targets(
+    decision: dict,
+    all_docs: list[_DocRecord],
+    parcel: ParcelInfo,
+    username: str = "",
+    password: str = "",
+) -> list[tuple[str, _DocRecord]]:
+    """SOP Phase 3B — pick targets for the partial-history research path.
+
+    Returns role-tagged docs in download order:
+      - ("vesting_deed", most_recent_vesting)   if a vesting deed is present
+      - ("easement_or_row", row)                for each easement / ROW
+                                                matching the parcel's S/T/R
+                                                (and subdivision if known)
+
+    Requires authenticated session to drive the Advanced Search UI — caller
+    must supply credentials. SOP Step 3B.3 (Exhibit A cross-reference harvest)
+    is not implemented: Tyler PDFs are scanned images, so extracting cited
+    receptions would require OCR or a vision LLM. Without it we miss
+    "Excluding portions conveyed in Deed recorded ..." references that aren't
+    already discoverable via S/T/R Advanced Search.
+    """
+    import os
+    from playwright.async_api import async_playwright
+
+    targets: list[tuple[str, _DocRecord]] = []
+    by_reception = {d.reception: d for d in all_docs}
+
+    # Step 3B.2 — most-recent vesting deed (if present in Document History).
+    deed_dict = decision.get("most_recent_vesting_deed")
+    if deed_dict and deed_dict.get("reception") in by_reception:
+        targets.append(("vesting_deed", by_reception[deed_dict["reception"]]))
+
+    if not (parcel.section and parcel.township and parcel.range_):
+        logger.warning(
+            "Phase 3B: parcel S/T/R is incomplete (%s/%s/%s) — "
+            "skipping Advanced Search.",
+            parcel.section, parcel.township, parcel.range_,
+        )
+        return targets
+
+    if not (username and password):
+        logger.warning(
+            "Phase 3B: WELD_RECORDER_USERNAME/PASSWORD not set — "
+            "Advanced Search needs authenticated session. Skipping easement scan."
+        )
+        return targets
+
+    headed = os.environ.get("WELD_HEADED", "").lower() in ("1", "true", "yes")
+    seen_receptions: set[str] = {r for r, _ in [(d.reception, d) for d in all_docs]}
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=not headed,
+            args=["--disable-blink-features=AutomationControlled"],
+            slow_mo=400 if headed else 0,
+        )
+        ctx = await browser.new_context(user_agent=_HTTP_HEADERS["User-Agent"])
+        await ctx.add_cookies([{
+            "name": "disclaimerAccepted", "value": "true",
+            "domain": "recording.weld.gov", "path": "/",
+        }])
+        # Authenticate (Advanced Search returns no rows for anonymous sessions).
+        try:
+            resp = await ctx.request.post(
+                _RECORDER_LOGIN_URL,
+                form={"field_UserId": username, "field_Password": password},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+            import json as _json
+            payload = _json.loads(await resp.text())
+            if not payload.get("success"):
+                logger.error(
+                    "Phase 3B login failed: %s", payload.get("message", "(no msg)"),
+                )
+                await browser.close()
+                return targets
+        except Exception as exc:
+            logger.warning("Phase 3B login error: %s", exc)
+            await browser.close()
+            return targets
+
+        page = await ctx.new_page()
+        try:
+            # Step 3B.5 — S/T/R Advanced Search (numeric township + range).
+            section = parcel.section.lstrip("0") or parcel.section
+            township = parcel.township  # _run_advanced_search strips N/S
+            range_ = parcel.range_      # and E/W respectively
+            rows = await _run_advanced_search(
+                page, section=section, township=township, range_=range_,
+            )
+            # Step 3B.7 — if a Subdivision is on file, repeat with Platted Legal.
+            if parcel.subdivision:
+                sub_rows = await _run_advanced_search(
+                    page, subdivision=parcel.subdivision,
+                )
+                # Deduplicate by reception across the two searches.
+                by_reception_in_results = {r["reception"]: r for r in rows}
+                for r in sub_rows:
+                    by_reception_in_results.setdefault(r["reception"], r)
+                rows = list(by_reception_in_results.values())
+
+            for r in rows:
+                reception = r["reception"]
+                if not reception or reception in seen_receptions:
+                    continue
+                if not _matches_easement_filter(r["doc_type"]):
+                    continue
+                seen_receptions.add(reception)
+                # Synthesize a _DocRecord pointing at the integration URL so
+                # the existing downloader can fetch it via #printCustom.
+                rec = _DocRecord(
+                    reception=reception,
+                    rec_date=r["rec_date"],
+                    doc_type=r["doc_type"],
+                    grantor="", grantee="",
+                    url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
+                )
+                targets.append(("easement_or_row", rec))
+        finally:
+            await browser.close()
+
+    logger.info(
+        "Phase 3B: selected %d target(s) (%d vesting, %d easements/ROW)",
+        len(targets),
+        sum(1 for role, _ in targets if role == "vesting_deed"),
+        sum(1 for role, _ in targets if role == "easement_or_row"),
+    )
+    return targets
 
 
 async def _resolve_parcel(
@@ -1157,55 +1419,80 @@ async def scrape(
         decision["path"], decision["reasoning"][0],
     )
 
-    # --- STOP: Phase 2 complete. Phase 3 (Document Download via Path 3A/B/C) ---
-    # --- is intentionally not run yet. Restore by deleting this block.       ---
-    logger.info(
-        "Phase 2 complete for account %s — stopping before Phase 3. "
-        "Overview written to %s", account, ov.path,
-    )
-    return [], None, 0.0, 0, 0
-
-    # --- Phase 3 (dormant): survey-doc filter + per-path download ---
-    survey_docs = _filter_survey_docs(all_docs)
-    if not survey_docs:
-        types_seen = ", ".join(sorted({d.doc_type for d in all_docs}))
-        return [], (
-            f"No survey-relevant documents found for {address} "
-            f"(account {account}). Document types on record: {types_seen}"
-        ), 0.0, 0, 0
-    ov.set_section("survey_documents", [d.to_dict() for d in survey_docs])
-
-    logger.info(
-        "Survey documents to download: %s",
-        ", ".join(f"{d.reception}({d.doc_type})" for d in survey_docs),
-    )
-
-    # --- Phase 3: download documents from recorder ---
+    # --- Phase 3: route by Decision Matrix outcome ---
     s = get_settings()
-    saved, cost, in_tok, out_tok = await _download_documents(
-        address, survey_docs, doc_filter, dest,
+    phase_section: str
+    if decision["path"] == "direct":
+        targets = _select_phase_3a_targets(decision, all_docs)
+        phase_section = "phase_3a"
+        if not targets:
+            return [], (
+                f"Phase 3A target selection found no SURV or vesting deed for {account}."
+            ), 0.0, 0, 0
+        logger.info(
+            "Phase 3A targets: %s",
+            ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
+        )
+    elif decision["path"] == "alternate_partial":
+        targets = await _select_phase_3b_targets(
+            decision, all_docs, parcel,
+            username=s.weld_recorder_username,
+            password=s.weld_recorder_password,
+        )
+        phase_section = "phase_3b"
+        if not targets:
+            logger.info(
+                "Phase 3B produced no download targets — stopping. Overview at %s",
+                ov.path,
+            )
+            ov.set_section(phase_section, {"targets": [], "results": []})
+            return [], None, 0.0, 0, 0
+        logger.info(
+            "Phase 3B targets: %s",
+            ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
+        )
+    else:
+        logger.info(
+            "Phase 3 path %r is not yet implemented — stopping. Overview at %s",
+            decision["path"], ov.path,
+        )
+        return [], None, 0.0, 0, 0
+
+    ov.set_section(phase_section, {
+        "targets": [
+            {"role": role, "reception": doc.reception, "doc_type": doc.doc_type, "url": doc.url}
+            for role, doc in targets
+        ],
+        "results": [],  # filled in after download
+    })
+
+    results, cost, in_tok, out_tok = await _download_documents(
+        address, targets, doc_filter, dest,
         username=s.weld_recorder_username,
         password=s.weld_recorder_password,
     )
 
-    # Annotate each survey doc with its download status.
-    saved_by_reception: dict[str, str] = {}
-    for path in saved:
-        # Filenames are reception_<id>{_page}.<ext>; pull the reception id.
-        m = re.match(r"reception_(\d+)", path.name)
-        if m:
-            saved_by_reception.setdefault(m.group(1), str(path))
-    for d in survey_docs:
-        status = "downloaded" if d.reception in saved_by_reception else "failed"
-        ov.update_list_item(
-            "survey_documents", "reception", d.reception,
-            {"download_status": status, "downloaded_to": saved_by_reception.get(d.reception, "")},
-        )
+    # Record per-target results in overview.json. A target with zero files
+    # captured is "failed"; non-zero is "downloaded".
+    results_section: list[dict] = []
+    saved_paths: list[Path] = []
+    for role, doc, paths in results:
+        results_section.append({
+            "role": role,
+            "reception": doc.reception,
+            "doc_type": doc.doc_type,
+            "status": "downloaded" if paths else "failed",
+            "files": [str(p) for p in paths],
+        })
+        saved_paths.extend(paths)
+    ov.merge_section(phase_section, {"results": results_section})
 
-    if not saved:
+    if not saved_paths:
         return [], (
-            f"Found {len(survey_docs)} document(s) for {address} but could not download them. "
-            f"Reception numbers: {', '.join(d.reception for d in survey_docs)}"
+            f"Phase 3 targeted {len(targets)} document(s) for {account} but captured none. "
+            f"Receptions: {', '.join(doc.reception for _, doc in targets)}. "
+            f"If you see 'must be a registered user' in logs, set WELD_RECORDER_USERNAME / "
+            f"WELD_RECORDER_PASSWORD in .env."
         ), cost, in_tok, out_tok
 
-    return saved, None, cost, in_tok, out_tok
+    return saved_paths, None, cost, in_tok, out_tok

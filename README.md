@@ -240,8 +240,21 @@ read it before modifying scraper logic. Key points:
   - **`alternate_empty`** (SOP C) — empty + `No documents found.` text → owner-name search in 3C.
   - **`unroutable`** — 0 rows without the empty-state message → UI error (per
     tie-breaker rule #3); retry the run.
-- **Phase 3** (Document Download — not yet implemented): retrieves PDFs from
-  `recording.weld.gov` per the routed path.
+- **Phase 3A** (Direct Extraction — implemented): runs when `path == "direct"`.
+  Picks the most-recent SURV row as the ALTA + the most-recent WD/SWD/QCD/GEN
+  as the vesting deed, then downloads each as a single complete PDF via Tyler's
+  `#printCustom` endpoint. Files land at `tmp/{county}/{account}/{role}_{reception}.pdf`.
+  Requires `WELD_RECORDER_USERNAME` / `WELD_RECORDER_PASSWORD` in `.env`. Step
+  3A.5 (Schedule B-2 exception walk) is not yet implemented.
+- **Phase 3B** (Alternative Research 1 — implemented): runs when
+  `path == "alternate_partial"` (rows present but missing survey or deed).
+  Downloads the most-recent vesting deed (if any), then drives the Advanced
+  Search at `/web/search/DOCSEARCH524S12` with the parcel's S/T/R (and
+  Subdivision name if known), filters results to easement / ROW types, and
+  downloads each. Step 3B.3 (Exhibit A cross-reference harvest) is not
+  implemented — would require OCR since Tyler PDFs are scanned images.
+- **Phase 3C** (Alternative Research 2 — not yet implemented): would run for
+  `alternate_empty` (empty Document History + "No documents found." text).
 
 Document type codes (`SURV`, `WD`, `SWD`, `QCD`, `EASE`, `ROW`, etc.) and the
 Decision Matrix routing are defined in the SOP and mirrored in
