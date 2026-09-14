@@ -60,24 +60,30 @@ no benefit.
 - **Cognito for auth**, enforced at the API Gateway JWT authorizer — the API compute is
   never publicly reachable without a valid token.
 - **DynamoDB + S3 only** — no relational DB. Jobs table is single-key (`jobId`).
+- **7-day expiry, kept in sync between `JobsTable` and `documents/`.** `JobsTable` has
+  TTL enabled on `expiresAt` (set by `create_job()` at `createdAt + 7 days` — see
+  [`packages/survey_shared/AGENTS.md`](../../packages/survey_shared/AGENTS.md)); the
+  `StorageBucket`'s `documents/` prefix has its own 7-day `ExpirationInDays` lifecycle
+  rule. The two aren't transactionally linked — they're just set to the same duration —
+  so a repeated search after a week re-downloads from the county site rather than
+  serving (or referencing) an expired document. If you change one, change the other.
 - **Job cancellation needs `ecs:StopTask` on the API Lambda's role.** `DELETE
   /api/jobs/{id}` marks the job CANCELLED in DynamoDB, then stops the job's Fargate task
   via its `taskArn` (captured by the dispatcher at `RunTask` time and written back to the
   job record) — without this permission the DynamoDB status flips but the scrape keeps
   running in the background.
 - **One `StorageBucket`, split by prefix, not by resource.** `documents/{state}/{county}/
-  {identifier}/` is the durable, per-property archive of every document actually
-  downloaded from a county site (see
-  [`packages/survey_shared/AGENTS.md`](../../packages/survey_shared/AGENTS.md));
+  {identifier}/` is the per-property archive of documents downloaded from a county site
+  (see [`packages/survey_shared/AGENTS.md`](../../packages/survey_shared/AGENTS.md));
   `scratch/maps/{jobId}.png` is ephemeral per-job output (map screenshots). The bucket's
-  `LifecycleConfiguration` has a single rule **scoped with `Prefix: scratch/`** (90-day
-  expiry + intelligent tiering) — S3 lifecycle rules support prefix filters, so one
-  bucket can carry both a durable and an expiring namespace without a second bucket
-  resource. `TaskRole` gets `s3:PutObject` on the whole bucket (worker writes to both
-  prefixes); `ApiFunctionRole` gets `s3:GetObject`/`ListBucket` (API presigns downloads
-  from both). If a future write needs different retention than these two prefixes, give
-  it its own prefix and its own scoped lifecycle rule rather than reaching for a new
-  bucket.
+  `LifecycleConfiguration` has two `Prefix`-scoped rules — S3 lifecycle rules support
+  prefix filters, so one bucket can carry multiple differently-aging namespaces without
+  a second bucket resource: `scratch/` expires after 90 days (+ intelligent tiering),
+  `documents/` after 7 days (kept in sync with `JobsTable`'s TTL, see above). `TaskRole`
+  gets `s3:PutObject` on the whole bucket (worker writes to both prefixes);
+  `ApiFunctionRole` gets `s3:GetObject`/`ListBucket` (API presigns downloads from both).
+  If a future write needs different retention than these two prefixes, give it its own
+  prefix and its own scoped lifecycle rule rather than reaching for a new bucket.
 
 ## Deploy flow
 
@@ -106,8 +112,13 @@ make build-push TAG=$(git rev-parse --short HEAD)
 make deploy backend ARGS="--param ApiImageTag=<sha> --param WorkerImageTag=<sha>"
 ```
 
-After the first frontend deploy, add the CloudFront URL to the backend stack's
-`CallbackUrls`/`LogoutUrls` params (Cognito redirect allow-list) and redeploy backend.
+`CallbackUrls`/`LogoutUrls` (the Cognito redirect allow-list) need no manual param —
+`deploy.py`'s `_auto_params()` looks up the frontend stack's `CloudFrontUrl` output
+itself and passes it for the `backend` stack automatically. Before the frontend stack
+exists (first-ever deploy, before `make deploy frontend`), there's nothing to look up,
+so the template's `http://localhost:5173/` default applies until it does. An explicit
+`--param CallbackUrls=...`/`LogoutUrls=...` still wins over the auto-detected value if
+you ever need to override it.
 
 ## Gotchas
 
