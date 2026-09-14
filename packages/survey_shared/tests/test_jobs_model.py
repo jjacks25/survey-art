@@ -43,6 +43,12 @@ class TestToItem:
         item = _job(metadata={"owner": "Jane Doe"}).to_item()
         assert item["metadata"] == {"owner": "Jane Doe"}
 
+    def test_omits_expires_at_when_unset(self):
+        assert "expiresAt" not in _job().to_item()
+
+    def test_includes_expires_at_when_set(self):
+        assert _job(expires_at=200).to_item()["expiresAt"] == 200
+
 
 class TestFromItem:
     def test_round_trip(self):

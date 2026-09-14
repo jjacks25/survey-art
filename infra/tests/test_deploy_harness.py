@@ -97,14 +97,46 @@ class TestStackOutputs:
 
 
 class TestLoadParams:
-    def test_always_sets_project_name(self):
-        params = deploy.load_params("nonexistent-stack", {}, "my-project")
+    def test_always_sets_project_name(self, cfn):
+        params = deploy.load_params(cfn, "nonexistent-stack", {}, "my-project")
         assert {"ParameterKey": "ProjectName", "ParameterValue": "my-project"} in params
 
-    def test_overrides_win(self):
-        params = deploy.load_params("nonexistent-stack", {"ApiImageTag": "sha123"}, "p")
+    def test_overrides_win(self, cfn):
+        params = deploy.load_params(cfn, "backend", {"ApiImageTag": "sha123"}, "p")
         as_dict = {p["ParameterKey"]: p["ParameterValue"] for p in params}
         assert as_dict["ApiImageTag"] == "sha123"
+
+    def test_backend_has_no_auto_urls_when_frontend_stack_absent(self, cfn):
+        params = deploy.load_params(cfn, "backend", {}, "p")
+        as_dict = {p["ParameterKey"]: p["ParameterValue"] for p in params}
+        assert "CallbackUrls" not in as_dict
+
+    def test_backend_auto_detects_callback_urls_from_frontend_stack(self, cfn):
+        template = json.dumps(
+            {
+                "Resources": {
+                    "B": {"Type": "AWS::S3::Bucket"},
+                },
+                "Outputs": {"CloudFrontUrl": {"Value": "https://d123.cloudfront.net"}},
+            }
+        )
+        deploy.deploy_stack(cfn, "p-frontend", template, [])
+        params = deploy.load_params(cfn, "backend", {}, "p")
+        as_dict = {p["ParameterKey"]: p["ParameterValue"] for p in params}
+        assert as_dict["CallbackUrls"] == "https://d123.cloudfront.net/"
+        assert as_dict["LogoutUrls"] == "https://d123.cloudfront.net/"
+
+    def test_explicit_override_wins_over_auto_detected_callback_urls(self, cfn):
+        template = json.dumps(
+            {
+                "Resources": {"B": {"Type": "AWS::S3::Bucket"}},
+                "Outputs": {"CloudFrontUrl": {"Value": "https://d123.cloudfront.net"}},
+            }
+        )
+        deploy.deploy_stack(cfn, "p-frontend", template, [])
+        params = deploy.load_params(cfn, "backend", {"CallbackUrls": "http://localhost:5173/"}, "p")
+        as_dict = {p["ParameterKey"]: p["ParameterValue"] for p in params}
+        assert as_dict["CallbackUrls"] == "http://localhost:5173/"
 
 
 class TestRenderTemplate:

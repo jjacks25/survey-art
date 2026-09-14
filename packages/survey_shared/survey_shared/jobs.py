@@ -27,6 +27,7 @@ CANCELLED = "CANCELLED"
 TERMINAL = {COMPLETED, FAILED, CANCELLED}
 
 PRESIGN_TTL_SECONDS = 3600
+JOB_TTL_SECONDS = 7 * 24 * 60 * 60  # kept in sync with the documents/ S3 lifecycle rule
 
 
 class Job(BaseModel):
@@ -40,6 +41,7 @@ class Job(BaseModel):
     status: str
     created_at: int = Field(alias="createdAt")
     updated_at: int = Field(alias="updatedAt")
+    expires_at: int | None = Field(default=None, alias="expiresAt")
     error: str | None = None
     file_count: int = Field(default=0, alias="fileCount")
     task_arn: str | None = Field(default=None, alias="taskArn")
@@ -70,6 +72,7 @@ def create_job(job_id: str, address: str, county: str) -> Job:
         status=PENDING,
         created_at=now,
         updated_at=now,
+        expires_at=now + JOB_TTL_SECONDS,
     )
     _table().put_item(Item=job.to_item())
     return job

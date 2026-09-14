@@ -282,9 +282,35 @@ def upload_template(s3, bucket: str, project: str, filename: str) -> str:
     return f"https://s3.{region}.amazonaws.com/{bucket}/{key}"
 
 
-def load_params(name: str, overrides: dict[str, str], project: str) -> list[dict]:
-    """Merge params/{name}.json (if present) with CLI overrides; always set ProjectName."""
+def _auto_params(cfn, project: str, name: str) -> dict[str, str]:
+    """Values `deploy.py` can look up itself from other stacks' outputs, so the
+    operator never has to pass them by hand. Currently just backend's Cognito
+    redirect allow-list: once the frontend stack exists, its CloudFront URL is
+    the right CallbackUrls/LogoutUrls value, full stop — there's no other
+    correct answer to compute, so hand-typing it on every backend redeploy
+    (see git history around the redirect_mismatch incident) is pure toil.
+    Returns {} when the frontend stack doesn't exist yet (first-ever deploy),
+    which leaves the template's localhost default in place until it does."""
+    if name != "backend":
+        return {}
+    try:
+        fe = stack_outputs(cfn, f"{project}-frontend")
+    except ClientError:
+        return {}
+    cf_url = fe.get("CloudFrontUrl")
+    if not cf_url:
+        return {}
+    return {"CallbackUrls": f"{cf_url}/", "LogoutUrls": f"{cf_url}/"}
+
+
+def load_params(
+    cfn, name: str, overrides: dict[str, str], project: str
+) -> list[dict]:
+    """Merge auto-detected values, params/{name}.json (if present), and CLI overrides
+    — in that precedence order, so autodetection never fights an explicit choice.
+    ProjectName is always set."""
     params: dict[str, str] = {"ProjectName": project}
+    params.update(_auto_params(cfn, project, name))
     param_file = PARAMS_DIR / f"{name}.json"
     if param_file.is_file():
         params.update(json.loads(param_file.read_text()))
@@ -320,7 +346,7 @@ def deploy_one(
     change_set_type = "CREATE" if status in (None, REVIEW_STATUS) else "UPDATE"
 
     template_url = upload_template(s3, bucket, project, filename)
-    params = load_params(name, overrides, project)
+    params = load_params(cfn, name, overrides, project)
     cs_name = f"{name}-{int(time.time())}"
 
     logger.info("[%s] creating %s change set", stack_name, change_set_type)

@@ -23,6 +23,14 @@ Code + PKCE against the Cognito user pool). The access token is attached as a Be
 header by `src/api.ts`; API Gateway's JWT authorizer validates it. When `authDisabled`,
 the app renders directly with no token.
 
+**Sign-out doesn't use `auth.signoutRedirect()`.** Cognito's hosted-UI `/logout`
+endpoint predates OIDC RP-initiated logout and only understands its own `client_id` +
+`logout_uri` query params — not the standard `id_token_hint`/`post_logout_redirect_uri`
+pair that `signoutRedirect()` sends, which lands on Cognito's "Client does not exist"
+error page instead of signing out. `App.tsx`'s `onLogout` instead calls `auth.removeUser()`
+(clears the local session) then navigates to `cognitoLogoutUrl()` (`src/config.ts`), which
+builds the Cognito-specific URL by hand.
+
 ## UI components
 
 Before building or changing any UI, check the **Mantine docs** for an existing

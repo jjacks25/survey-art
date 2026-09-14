@@ -33,6 +33,13 @@ Single-key DynamoDB table (`jobId`). Status: `PENDING` → `RUNNING` → `COMPLE
   set once at COMPLETED. `list_result_files()` needs this to know where to list from —
   a job with no `doc_prefix` (not yet complete, or failed before upload) has no listable
   files.
+- `expires_at: int | None` — DynamoDB TTL attribute (`expiresAt`), set by `create_job()`
+  to `created_at + JOB_TTL_SECONDS` (7 days), kept in sync with the `documents/` S3
+  lifecycle rule (see [`infra/AGENTS.md`](../../infra/AGENTS.md)) — a job record and the
+  documents it points at age out together. Optional/`None` on records written before
+  this field existed, and omitted from `to_item()` when unset (`exclude_none`) rather
+  than written as `null`, so those older items still round-trip through `from_item()`
+  without validation errors; they just never expire.
 
 `list_jobs()` (a single `scan()`, sorted client-side by `created_at`) backs the frontend's
 history drawer. Fine at this table's size/access pattern (small team, "show recent jobs");
@@ -68,14 +75,15 @@ but 404s/DNS-fails from the host browser.
 
 There's a single S3 bucket (`STORAGE_BUCKET`) for everything the app writes, divided into
 two namespaces that get different retention — not two separate bucket resources, since
-S3 lifecycle rules support a `Prefix` filter and one rule scoped to `scratch/` does the
-job:
+S3 lifecycle rules support a `Prefix` filter and each namespace gets its own scoped rule:
 
-- `scratch/` — ephemeral per-job artifacts. The bucket's lifecycle rule (90-day
-  expiry + intelligent tiering) is scoped to this prefix.
-- `documents/` — the durable, per-property archive of every document actually
-  downloaded from a county site. No expiration — outside the lifecycle rule's prefix
-  filter entirely.
+- `scratch/` — ephemeral per-job artifacts. The bucket's lifecycle rule expires these
+  after 90 days (+ intelligent tiering).
+- `documents/` — the per-property archive of documents downloaded from a county site.
+  Expires after 7 days, kept in sync with `JobsTable`'s TTL (see `expires_at` above and
+  [`infra/AGENTS.md`](../../infra/AGENTS.md)) — a repeated search past that window
+  re-downloads from the county site rather than reusing (or a job record referencing)
+  an expired copy.
 
 `DOCUMENTS_PREFIX = "documents"` and `SCRATCH_PREFIX = "scratch"` in `jobs.py` are the
 only places that need to know this split.

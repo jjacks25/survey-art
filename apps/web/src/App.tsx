@@ -26,7 +26,7 @@ import {
   Divider,
 } from "@mantine/core";
 
-import { AppConfig } from "./config";
+import { AppConfig, cognitoLogoutUrl } from "./config";
 import { ApiClient, FileEntry, Job, JobSummary } from "./api";
 
 const TERMINAL = new Set(["COMPLETED", "FAILED"]);
@@ -714,7 +714,9 @@ function AuthedApp({ config }: { config: AppConfig }) {
     <Dashboard
       config={config}
       token={auth.user?.access_token}
-      onLogout={() => auth.signoutRedirect()}
+      onLogout={() => auth.removeUser().then(() => {
+        window.location.href = cognitoLogoutUrl(config.cognito);
+      })}
     />
   );
 }
