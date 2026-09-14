@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECR repositories for survey-art. Split out from network.yaml so that stack
+  stays purely networking — these are a separate versioned resource with their
+  own lifecycle (image scanning, tag mutability) and no relationship to the VPC.
+  Deployed before backend (which references an image tag at create time) and
+  before `make build-push`, but after bootstrap since it uses TemplateURL.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: survey-art
+
+Resources:
+  ApiRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/api'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+
+  WorkerRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/worker'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+
+Outputs:
+  ApiRepoUri:
+    Value: !GetAtt ApiRepo.RepositoryUri
+    Export:
+      Name: !Sub '${ProjectName}-ApiRepoUri'
+  WorkerRepoUri:
+    Value: !GetAtt WorkerRepo.RepositoryUri
+    Export:
+      Name: !Sub '${ProjectName}-WorkerRepoUri'

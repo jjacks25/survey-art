@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bootstrap stack for survey-art. Creates the one thing every later stack
+  needs before it can use TemplateURL + change sets: an S3 bucket to host the
+  CloudFormation templates. Deployed once via TemplateBody, since no bucket exists
+  yet to host it as TemplateURL; every later stack deploys via TemplateURL against
+  the bucket this stack creates. Deploys run from your local machine using your own
+  AWS credentials (e.g. `aws sso login`) — no separate deploy role or CI identity is
+  provisioned. (ECR repos live in network.yaml, not here — see that template.)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: survey-art
+    Description: Prefix used for resource names and cross-stack exports.
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Deployment environment; selects the EnvironmentConfig mapping below.
+
+Mappings:
+  # Per-environment knobs. Bucket names are global, so the resource name appends
+  # account + region to BucketBaseName. Only dev exists today; prod is here so
+  # adding it is a parameter change, not a template change.
+  EnvironmentConfig:
+    dev:
+      BucketBaseName: survey-art-dev-cfn-templates
+      TemplateRetentionDays: 7
+    prod:
+      BucketBaseName: survey-art-prod-cfn-templates
+      TemplateRetentionDays: 7
+
+Resources:
+  TemplateBucket:
+    Type: AWS::S3::Bucket
+    # Templates are disposable (7-day expiry); nothing here is worth retaining.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub
+        - '${Base}-${AWS::AccountId}-${AWS::Region}'
+        - Base: !FindInMap [EnvironmentConfig, !Ref Environment, BucketBaseName]
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-templates
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
+            ExpirationInDays: !FindInMap [EnvironmentConfig, !Ref Environment, TemplateRetentionDays]
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !FindInMap [EnvironmentConfig, !Ref Environment, TemplateRetentionDays]
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: clean-delete-markers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+
+  TemplateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TemplateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt TemplateBucket.Arn
+              - !Sub '${TemplateBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+Outputs:
+  TemplateBucketName:
+    Value: !Ref TemplateBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TemplateBucket'
+  TemplateBucketArn:
+    Value: !GetAtt TemplateBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-TemplateBucketArn'

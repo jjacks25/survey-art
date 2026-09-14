@@ -1,0 +1,85 @@
+# Local stack: the whole app running in containers against LocalStack (no real AWS).
+#   make up    - start everything
+#   make down  - stop and remove
+#   make logs  - tail logs
+#
+# The api and worker are the SAME images that run in AWS (Lambda / Fargate); here
+# they point at LocalStack via AWS_ENDPOINT_URL. Cognito is not in LocalStack
+# community, so the SPA runs with auth disabled (public/config.json) and the API
+# sits behind no authorizer locally.
+services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,sqs,dynamodb,secretsmanager
+      DEBUG: "0"
+    volumes:
+      - ./infra/localstack/init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "awslocal dynamodb list-tables && awslocal sqs list-queues"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_PUBLIC_ENDPOINT_URL: http://localhost:4566
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      JOBS_TABLE: survey-art-jobs
+      STORAGE_BUCKET: survey-art-storage
+      JOB_QUEUE_URL: http://localstack:4566/000000000000/survey-art-jobs
+      CORS_ORIGINS: http://localhost:5173
+      ENVIRONMENT: ${ENVIRONMENT:-dev}
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_PUBLIC_ENDPOINT_URL: http://localhost:4566
+      AWS_REGION: us-west-2
+      # No fake keys here (unlike the api): the worker calls real Bedrock to read
+      # survey PDFs, so it uses your host AWS profile — mounted read-only below.
+      # LocalStack ignores credentials, so the same ones serve S3/SQS/DynamoDB.
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      JOBS_TABLE: survey-art-jobs
+      STORAGE_BUCKET: survey-art-storage
+      JOB_QUEUE_URL: http://localstack:4566/000000000000/survey-art-jobs
+      ENVIRONMENT: ${ENVIRONMENT:-dev}
+      MODEL: ${MODEL:-}
+      APPLICATION_MODE: ${APPLICATION_MODE:-}
+      WELD_RECORDER_USERNAME: ${WELD_RECORDER_USERNAME:-}
+      WELD_RECORDER_PASSWORD: ${WELD_RECORDER_PASSWORD:-}
+      CO_DENVER_USERNAME: ${CO_DENVER_USERNAME:-}
+      CO_DENVER_PASSWORD: ${CO_DENVER_PASSWORD:-}
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./apps/web/src:/app/src
+      - ./apps/web/public:/app/public
+    depends_on:
+      - api
