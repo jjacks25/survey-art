@@ -1,0 +1,48 @@
+# Virtual workspace root — this repo is a monorepo of independently-deployed
+# packages (apps/worker, apps/api, packages/survey_shared), each with its own
+# pyproject.toml and dependency set. Nothing is installed *from* this file; it
+# only wires up the workspace and the shared dev tooling / quality config.
+[tool.uv.workspace]
+members = ["packages/*", "apps/api", "apps/worker"]
+
+[tool.uv.sources]
+survey-art = { workspace = true }
+survey-api = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27.0",
+    "moto[cloudformation,dynamodb,s3,secretsmanager,sqs]>=5.0.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "survey-art",
+    "survey-api",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["apps/worker", "apps/api", "packages/survey_shared", "infra"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# API response models intentionally use camelCase field names to match the JSON contract.
+"apps/api/app/schemas.py" = ["N815"]
+
+[tool.pytest.ini_options]
+testpaths = ["apps/worker/tests", "apps/api/tests", "packages/survey_shared/tests", "infra/tests"]
+pythonpath = ["apps/worker", "apps/api"]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["apps/worker/survey_art", "apps/api/app"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "def __repr__"]

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "survey-shared"
+version = "0.1.0"
+description = "Shared job-state (DynamoDB) and result-storage (S3) helpers for the API and worker."
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.43.31",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["survey_shared"]
