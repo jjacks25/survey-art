@@ -73,4 +73,21 @@ export class ApiClient {
   cancelJob(jobId: string) {
     return this.request<void>(`/api/jobs/${jobId}`, { method: "DELETE" });
   }
+
+  /** Upload a KMZ for account/parcel extraction. No Content-Type header —
+   * the browser sets the multipart boundary itself when given a FormData body. */
+  async identifyKmz(file: File) {
+    const token = this.getToken();
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const form = new FormData();
+    form.append("file", file);
+    const resp = await fetch(`${this.apiBase}/api/kmz/identify`, {
+      method: "POST",
+      headers,
+      body: form,
+    });
+    if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
+    return (await resp.json()) as { identifier: string | null };
+  }
 }

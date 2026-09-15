@@ -16,12 +16,13 @@ import os
 import uuid
 
 from botocore.exceptions import ClientError
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from survey_shared import aws, jobs
 from survey_shared.config import get_shared_settings
 
+from . import kmz
 from .schemas import (
     CreateJobRequest,
     CreateJobResponse,
@@ -29,7 +30,10 @@ from .schemas import (
     JobListResponse,
     JobResponse,
     JobSummary,
+    KmzIdentifyResponse,
 )
+
+_MAX_KMZ_BYTES = 10 * 1024 * 1024
 
 app = FastAPI(title="Survey Art API", version="0.1.0")
 
@@ -61,6 +65,14 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
         ),
     )
     return CreateJobResponse(jobId=job_id, status=jobs.PENDING)
+
+
+@app.post("/api/kmz/identify", response_model=KmzIdentifyResponse)
+async def identify_kmz(file: UploadFile) -> KmzIdentifyResponse:
+    data = await file.read(_MAX_KMZ_BYTES + 1)
+    if len(data) > _MAX_KMZ_BYTES:
+        raise HTTPException(status_code=413, detail="KMZ file too large (10MB max)")
+    return KmzIdentifyResponse(identifier=kmz.extract_identifier(data))
 
 
 @app.get("/api/jobs", response_model=JobListResponse)

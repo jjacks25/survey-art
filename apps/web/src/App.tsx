@@ -24,6 +24,7 @@ import {
   UnstyledButton,
   Alert,
   Divider,
+  FileInput,
 } from "@mantine/core";
 
 import { AppConfig, cognitoLogoutUrl } from "./config";
@@ -289,6 +290,10 @@ function Dashboard({
   const [address, setAddress] = useState("");
   const [account, setAccount] = useState("");
   const [county, setCounty] = useState<string | null>(COUNTIES[0]?.value ?? null);
+  const [kmzFile, setKmzFile] = useState<File | null>(null);
+  const [kmzAccount, setKmzAccount] = useState("");
+  const [kmzParsing, setKmzParsing] = useState(false);
+  const [kmzError, setKmzError] = useState<string | null>(null);
   const [job, setJob] = useState<Job | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [previewFile, setPreviewFile] = useState<FileEntry | null>(null);
@@ -298,7 +303,12 @@ function Dashboard({
   const [historyLoading, setHistoryLoading] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const canSubmit = mode === "address" ? !!address.trim() : !!account.trim() && !!county;
+  const canSubmit =
+    mode === "address"
+      ? !!address.trim()
+      : mode === "kmz"
+        ? !!kmzAccount.trim() && !!county
+        : !!account.trim() && !!county;
   const searching = submitting || (!!job && !TERMINAL.has(job.status));
 
   // One entry per property: keep only the most-recent search for each doc
@@ -398,6 +408,30 @@ function Dashboard({
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
+  /** A KMZ export carries the county's own account/parcel number in its
+   * ExtendedData — extracting it routes through the exact same Account/Parcel #
+   * lookup as manual entry, so this only ever populates `kmzAccount` for the
+   * user to review, it never submits on its own. */
+  async function handleKmzFile(file: File | null) {
+    setKmzFile(file);
+    setKmzAccount("");
+    setKmzError(null);
+    if (!file) return;
+    setKmzParsing(true);
+    try {
+      const { identifier } = await api.identifyKmz(file);
+      if (identifier) {
+        setKmzAccount(identifier);
+      } else {
+        setKmzError("Couldn't find an account/parcel number in this KMZ.");
+      }
+    } catch (e) {
+      setKmzError(String(e));
+    } finally {
+      setKmzParsing(false);
+    }
+  }
+
   async function submit() {
     if (!canSubmit) return;
     setError(null);
@@ -407,7 +441,7 @@ function Dashboard({
       const { jobId } =
         mode === "address"
           ? await api.createJob(address.trim())
-          : await api.createJob(account.trim(), county!);
+          : await api.createJob((mode === "kmz" ? kmzAccount : account).trim(), county!);
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = setInterval(() => poll(jobId), 1500);
       await poll(jobId);
@@ -541,6 +575,7 @@ function Dashboard({
           <Tabs.List>
             <Tabs.Tab value="account">Account / Parcel #</Tabs.Tab>
             <Tabs.Tab value="address">Address</Tabs.Tab>
+            <Tabs.Tab value="kmz">KMZ</Tabs.Tab>
           </Tabs.List>
 
           <Tabs.Panel value="account" pt="sm">
@@ -570,6 +605,42 @@ function Dashboard({
               onChange={(e) => setAddress(e.currentTarget.value)}
               onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
             />
+          </Tabs.Panel>
+
+          <Tabs.Panel value="kmz" pt="sm">
+            <Stack gap="sm">
+              <Select
+                label="County"
+                placeholder="Select a county"
+                data={COUNTIES}
+                value={county}
+                onChange={setCounty}
+              />
+              <FileInput
+                label="Parcel KMZ"
+                description="A KMZ exported from the county GIS site for a single parcel"
+                placeholder="Upload a .kmz file"
+                accept=".kmz"
+                value={kmzFile}
+                onChange={handleKmzFile}
+                clearable
+              />
+              {kmzParsing && (
+                <Group gap="xs">
+                  <Loader size="xs" />
+                  <Text size="sm" c="dimmed">Reading KMZ...</Text>
+                </Group>
+              )}
+              {kmzError && <Alert color="red">{kmzError}</Alert>}
+              {kmzAccount && (
+                <TextInput
+                  label="Account / parcel number found"
+                  value={kmzAccount}
+                  onChange={(e) => setKmzAccount(e.currentTarget.value)}
+                  onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
+                />
+              )}
+            </Stack>
           </Tabs.Panel>
         </Tabs>
 
