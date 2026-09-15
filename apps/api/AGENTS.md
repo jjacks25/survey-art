@@ -33,6 +33,13 @@ scraper or a browser, so it stays small and fits scale-to-zero Lambda.
   returns an empty list if the job has no `doc_prefix` yet (not completed, or failed
   before any upload).
 - `GET /api/health` → liveness.
+- `POST /api/kmz/identify` (multipart `file`) → `{identifier}`, the account/parcel
+  number found in a county-exported KMZ, or `null` if none was found. Stateless —
+  doesn't create a job; the frontend's KMZ tab feeds the result straight into the
+  same `POST /api/jobs` call the Account/Parcel # tab uses. See `app/kmz.py`: it opens
+  the KMZ's `.kml` entry (`defusedxml`, not stdlib `xml.etree` — the KML is untrusted
+  user upload) and reads the account/parcel number out of each Placemark's
+  `ExtendedData`, falling back to the Placemark `<name>`. 10MB upload cap.
 
 ## Auth
 

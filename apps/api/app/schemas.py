@@ -15,6 +15,10 @@ class CreateJobResponse(BaseModel):
     status: str
 
 
+class KmzIdentifyResponse(BaseModel):
+    identifier: str | None
+
+
 class JobResponse(BaseModel):
     jobId: str
     address: str
