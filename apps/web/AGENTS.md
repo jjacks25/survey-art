@@ -52,8 +52,16 @@ covers the case.
 
 The `mode` tab defaults to `"account"` and is listed before `"address"` — most users
 of this tool already have the parcel/account number in hand (that's the whole point of
-the county SOPs), so it's the faster path. If you add a third search mode, put it after
-these two rather than reordering existing tabs out from under muscle memory.
+the county SOPs), so it's the faster path. If you add a search mode, put it after
+these two rather than reordering existing tabs out from under muscle memory — the
+`"kmz"` tab follows this rule.
+
+**The `"kmz"` mode doesn't add a new submission path** — it uploads to
+`POST /api/kmz/identify` (see [`apps/api/AGENTS.md`](../api/AGENTS.md)) purely to
+populate `kmzAccount`, which the user can review/edit before `submit()` sends it
+through the exact same `api.createJob(identifier, county)` call as the Account/Parcel #
+tab. If you add another upload-derived input, follow this pattern (extract → editable
+text field → same submit path) rather than growing a parallel job-creation branch.
 
 ## Search history: permanent left-hand panel
 
