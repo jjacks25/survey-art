@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from survey_shared.jobs import LogEntry
+
 
 class CreateJobRequest(BaseModel):
     address: str = Field(..., min_length=3, max_length=500)
@@ -28,7 +30,7 @@ class JobResponse(BaseModel):
     updatedAt: int
     fileCount: int
     error: str | None = None
-    logs: list[str] = []
+    logs: list[LogEntry] = []
     metadata: dict | None = None
     location: dict | None = None
     docPrefix: str | None = None

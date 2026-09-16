@@ -30,7 +30,17 @@ so the frontend's Logs tab can show live progress. Two things follow from that:
    a narration line; add a new `narration.info(...)` alongside it instead. See the
    narration calls already threaded through `scrapers/weld_county.py` for the pattern
    and tone to match (state what's happening/what was found/decided, in plain language,
-   not internal jargon like "decision matrix" or "Path 3C").
+   never internal jargon — no code identifiers, doc-phase labels, or query parameters a
+   surveyor didn't type themselves).
+3. **The two streams aren't just conceptually separate — they're tagged.**
+   `_DynamoLogHandler.emit()` in `worker.py` writes each record as a `LogEntry`
+   (`survey_shared.jobs.LogEntry`) with `kind="milestone"` for `survey_art.narration`
+   records and `kind="detail"` for everything else. The frontend's Logs tab renders
+   `milestone` entries as the primary step-by-step progress view and folds `detail`
+   entries into a "show technical log" toggle — so a `logger.info(...)` you add to a
+   scraper is *still safe to leave verbose/technical*, since it won't clutter the
+   non-technical view by default. It's still visible on request, though, so keep it
+   truthful and free of anything sensitive.
 
 ## Why log streaming uses `QueueHandler`/`QueueListener`, not a plain handler
 
@@ -76,6 +86,14 @@ perform blocking I/O directly in `emit()`.
   `county` param, which may be unset when auto-detected); the identifier falls back
   through resolved address → input → account → legal description → section/township/
   range. Called *before* `jobs.upload_documents()`, since the prefix has to exist first.
+- `_archive_full_log(job_id)` — called from `run_job()`'s `finally` block, after
+  `log_handler.close()` has blocked until the `QueueListener` flushes every queued
+  record to DynamoDB, so it reads the job back (`jobs.get_job()`) rather than tracking
+  entries locally and always sees the complete log for the run. Uploads a header
+  (address/county/status/error) plus every `LogEntry`, both kinds, via
+  `jobs.upload_job_log()` (see
+  [`packages/survey_shared/AGENTS.md`](../../../packages/survey_shared/AGENTS.md)).
+  Never raises — a failed archive upload must not fail a job that's already finished.
 
 ## Metadata: cleaned sections vs. `raw_report_fields`
 
@@ -95,21 +113,33 @@ section (see `RAW_SECTION_KEYS` in `apps/web/src/App.tsx`) — it's for complete
 use, not the curated view a surveyor reads. If you add a new grouped section or rename a
 field, only touch the grouped path — `raw_report_fields` should stay a verbatim dump.
 
-## `extracted_ids` — what the ALTA points at
+## `extracted_ids` — cross-reference expansion, not just the ALTA
 
-SOP Step 3A.5. After the ALTA downloads, `id_extraction.extract_document_ids()` reads it
-for the records it cites and the scraper writes them to `overview.json` as
-`extracted_ids` — a list of `{id, id_type, context, raw}` rows, which the frontend
-renders as a table for free (see `MetadataValue` in
-[`apps/web/AGENTS.md`](../../../apps/web/AGENTS.md)).
+`_expand_cross_references()` in `scrapers/weld_county.py` reads **every** document the
+scraper downloads — not only the ALTA — for the other documents it cites
+(`id_extraction.extract_document_ids()`), fetches those too, and repeats on the newly
+downloaded ones until nothing new turns up. Two sets keep this from doing wasted work:
+`known_receptions` (already downloaded or queued this run — never fetched twice) and an
+internal `extracted` set (already read for citations — never sent through
+`extract_document_ids()`, and its Bedrock fallback, twice, even if two different
+documents both cite it). Real recorder data is a finite graph, so this terminates on its
+own; `_MAX_CROSS_REFERENCE_DOCS` is just a cost/runtime backstop for a pathological case.
+
+Every ID found — from any document, not just the ALTA — lands in `overview.json` as
+`extracted_ids`, one flat list of `{id, id_type, context, raw, source_reception,
+source_doc_type}` rows (the last two say which downloaded document cited it), written
+once per document processed so a crash mid-walk still leaves everything found so far.
+The frontend renders it as a table for free (see `MetadataValue` in
+[`apps/web/AGENTS.md`](../../../apps/web/AGENTS.md)) — it only reads the array shape, so
+adding `source_reception`/`source_doc_type` columns didn't require a frontend change.
 
 Keep **every** ID in that section, not just the fetchable ones. Only
 `id_type == "reception_number"` becomes a download (the recorder's integration URL takes
 nothing else), but a book/page or an unparseable reference is still something a surveyor
-needs to chase by hand, so `_select_phase_3a_exception_targets()` filters the *download
+needs to chase by hand, so `_select_schedule_b2_exception_targets()` filters the *download
 targets*, never the stored metadata. `APPLICATION_MODE=demo` (`_DEMO_EXCEPTION_LIMIT`)
-truncates those targets for the same reason — a demo shouldn't wait out ~90 downloads,
-but it should still show the surveyor everything the ALTA cites.
+truncates those targets on each document processed for the same reason — a demo shouldn't
+wait out ~90 downloads, but it should still show the surveyor everything cited.
 
 `extract_document_ids()` also never raises — it enriches a document that already
 downloaded, so a Bedrock outage must leave the run otherwise intact.

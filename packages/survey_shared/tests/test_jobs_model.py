@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from survey_shared.jobs import COMPLETED, PENDING, Job
+from survey_shared.jobs import COMPLETED, PENDING, Job, LogEntry
 
 
 def _job(**overrides) -> Job:
@@ -71,3 +71,22 @@ class TestFromItem:
         job = Job.from_item(item)
         assert job.created_at == 111
         assert job.file_count == 5
+
+    def test_legacy_plain_string_logs_still_load(self):
+        # Job records written before `kind` existed store bare strings, not
+        # {"message", "kind"} dicts — an old, still-live record must not 500.
+        item = _job().to_item()
+        item["logs"] = ["Starting your search...", "Advanced Search: 3 row(s)"]
+        job = Job.from_item(item)
+        assert job.logs == [
+            LogEntry(message="Starting your search..."),
+            LogEntry(message="Advanced Search: 3 row(s)"),
+        ]
+        assert all(entry.kind == "detail" for entry in job.logs)
+
+
+class TestLogEntry:
+    def test_round_trips_milestone_kind(self):
+        item = _job(logs=[{"message": "Found the property.", "kind": "milestone"}]).to_item()
+        restored = Job.from_item(item)
+        assert restored.logs == [LogEntry(message="Found the property.", kind="milestone")]
