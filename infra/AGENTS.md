@@ -67,6 +67,14 @@ no benefit.
   rule. The two aren't transactionally linked — they're just set to the same duration —
   so a repeated search after a week re-downloads from the county site rather than
   serving (or referencing) an expired document. If you change one, change the other.
+- **Every compute log group is declared explicitly with `RetentionInDays: 30`**
+  (`WorkerLogGroup`, `ApiFunctionLogGroup`, `DispatcherFunctionLogGroup`). Lambda/ECS
+  auto-create a log group on first write with *no* retention cap if one doesn't already
+  exist under the expected name (`/aws/lambda/{FunctionName}` / `/ecs/{family}`), so
+  logs otherwise accumulate forever. If you add a new Lambda or ECS task here, declare
+  its log group up front — don't let it get auto-created first, since CloudFormation
+  can't later "adopt" a log group that already exists without deleting it or a stack
+  **import** (`aws cloudformation create-change-set --change-set-type IMPORT`).
 - **Job cancellation needs `ecs:StopTask` on the API Lambda's role.** `DELETE
   /api/jobs/{id}` marks the job CANCELLED in DynamoDB, then stops the job's Fargate task
   via its `taskArn` (captured by the dispatcher at `RunTask` time and written back to the
@@ -75,15 +83,19 @@ no benefit.
 - **One `StorageBucket`, split by prefix, not by resource.** `documents/{state}/{county}/
   {identifier}/` is the per-property archive of documents downloaded from a county site
   (see [`packages/survey_shared/AGENTS.md`](../../packages/survey_shared/AGENTS.md));
-  `scratch/maps/{jobId}.png` is ephemeral per-job output (map screenshots). The bucket's
-  `LifecycleConfiguration` has two `Prefix`-scoped rules — S3 lifecycle rules support
-  prefix filters, so one bucket can carry multiple differently-aging namespaces without
-  a second bucket resource: `scratch/` expires after 90 days (+ intelligent tiering),
-  `documents/` after 7 days (kept in sync with `JobsTable`'s TTL, see above). `TaskRole`
-  gets `s3:PutObject` on the whole bucket (worker writes to both prefixes);
-  `ApiFunctionRole` gets `s3:GetObject`/`ListBucket` (API presigns downloads from both).
-  If a future write needs different retention than these two prefixes, give it its own
-  prefix and its own scoped lifecycle rule rather than reaching for a new bucket.
+  `scratch/maps/{jobId}.png` is ephemeral per-job output (map screenshots);
+  `property-search-logs/{jobId}.log` is one complete text log per job
+  (`jobs.upload_job_log()`, same doc). The bucket's `LifecycleConfiguration` has three
+  `Prefix`-scoped rules — S3 lifecycle rules support prefix filters, so one bucket can
+  carry multiple differently-aging namespaces without a second bucket resource:
+  `scratch/` expires after 90 days (+ intelligent tiering), `documents/` after 7 days
+  (kept in sync with `JobsTable`'s TTL, see above), `property-search-logs/` after 30
+  days — deliberately longer than `JobsTable`'s 7-day TTL, so a run's exact log outlives
+  the job record it came from. `TaskRole` gets `s3:PutObject` on the whole bucket
+  (worker writes to all three prefixes); `ApiFunctionRole` gets `s3:GetObject`/
+  `ListBucket` (API presigns downloads from `documents/`). If a future write needs
+  different retention than these three prefixes, give it its own prefix and its own
+  scoped lifecycle rule rather than reaching for a new bucket.
 
 ## Deploy flow
 

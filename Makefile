@@ -44,6 +44,10 @@ up: ## Local | Build and start the full local stack (web, api, worker, localstac
 down: ## Local | Stop and remove the local stack (and volumes)
 	docker compose down -v
 
+restart: ## Local | Rebuild and restart the full local stack (down + up)
+	$(MAKE) down
+	$(MAKE) up
+
 logs: ## Local | Tail logs from the local stack
 	docker compose logs -f
 

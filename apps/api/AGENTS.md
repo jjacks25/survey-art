@@ -57,16 +57,19 @@ disabled.
 - IAM scope (backend stack): DynamoDB RW on the jobs table, `sqs:SendMessage`,
   `s3:GetObject`/list on the storage bucket (for presigning — see below), and
   `ecs:StopTask` (for `DELETE /api/jobs/{id}`) — nothing more.
-- **One `STORAGE_BUCKET`, two prefixes, two different jobs.** `scratch/`
-  (`jobs.upload_map_image()`) holds ephemeral per-job artifacts (map screenshots) and is
-  the only prefix the bucket's 90-day expiry lifecycle rule applies to (S3 lifecycle
-  rules support a `Prefix` filter, so one bucket carries both namespaces). `documents/`
+- **One `STORAGE_BUCKET`, three prefixes, three different jobs.** `scratch/`
+  (`jobs.upload_map_image()`) holds ephemeral per-job artifacts (map screenshots) and
+  expires after 90 days (S3 lifecycle rules support a `Prefix` filter, so one bucket
+  carries all three namespaces). `documents/`
   (`jobs.upload_documents()` / `list_result_files()`) is the durable archive of every
   document actually downloaded from a county site, keyed by
   `documents/{state}/{county}/{identifier}/{filename}` (see
   [`packages/survey_shared/AGENTS.md`](../../packages/survey_shared/AGENTS.md) and
   `worker.py`'s `_doc_prefix()`) — no expiry, since these are the actual survey records,
-  not scratch output. Don't conflate the two prefixes when adding a new S3 write.
+  not scratch output. `property-search-logs/` (`jobs.upload_job_log()`) is one complete
+  text log per job, keyed by jobId, expiring after 30 days — deliberately longer than
+  `JobsTable`'s 7-day TTL, so a run's exact log outlives the job record itself. Don't
+  conflate the three prefixes when adding a new S3 write.
 - **Presigned URLs, LocalStack vs. AWS.** `jobs.list_result_files()` rewrites each
   presigned S3 URL's host via `_make_browser_reachable()` before returning it, driven by
   `AWS_PUBLIC_ENDPOINT_URL`. This only matters locally: LocalStack signs URLs with the

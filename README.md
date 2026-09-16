@@ -132,9 +132,9 @@ the worker talks to real AWS for that one client and to LocalStack for everythin
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `MODEL` | Yes for non-Weld counties | — | Bedrock model ID or cross-region inference profile ID (e.g. `us.anthropic.claude-haiku-4-5-20251001-v1:0`) |
-| `ID_EXTRACTION_MODEL` | No | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock model that reads a scanned ALTA for the record IDs it cites (Weld Step 3A.5) |
+| `ID_EXTRACTION_MODEL` | No | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock model that reads a scanned ALTA for the record IDs it cites (Weld Schedule B-2 exception walk) |
 | `AWS_REGION` | No | `us-west-2` | Bedrock region |
-| `APPLICATION_MODE` | No | `regular` | `demo` caps the Step 3A.5 exception downloads at 5 so a walkthrough finishes in minutes |
+| `APPLICATION_MODE` | No | `regular` | `demo` caps the Schedule B-2 exception downloads at 5 so a walkthrough finishes in minutes |
 | `WELD_RECORDER_USERNAME` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `WELD_RECORDER_PASSWORD` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `CO_DENVER_USERNAME` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
@@ -142,9 +142,9 @@ the worker talks to real AWS for that one client and to LocalStack for everythin
 | `WELD_HEADED` | No | `0` | Set to `1` to show the Playwright browser window |
 
 **Weld's navigation uses no LLM.** Phases 1, 2, and 3 are pure HTTP + Playwright with
-hard-coded selectors. The one exception is Step 3A.5, which reads the downloaded ALTA
-for the documents it cites — free when the PDF has a text layer, and Bedrock otherwise
-(see [Reading the ALTA](#reading-the-alta-step-3a5)). The Denver / Jefferson / Arapahoe
+hard-coded selectors. The one exception is the Schedule B-2 exception walk, which reads
+the downloaded ALTA for the documents it cites — free when the PDF has a text layer, and
+Bedrock otherwise (see [Reading the ALTA](#reading-the-alta-schedule-b-2)). The Denver / Jefferson / Arapahoe
 scrapers go through Bedrock throughout (`llm.py`). Auth is IAM only (the Fargate task
 role in prod, or your local `aws sso login`/profile credentials via boto3's default
 chain), so no API key belongs in `.env`.
@@ -197,8 +197,7 @@ record updated after each phase. A crash mid-pipeline still leaves a valid file.
   ],
   "decision_matrix": {
     "path": "direct",
-    "sop_letter": "A",
-    "reasoning": ["Condition A matched: ...", "Most recent SURV: ...", "→ Route to Phase 3A."],
+    "reasoning": ["Direct extraction matched: ...", "Most recent SURV: ...", "→ Route to direct extraction."],
     "vesting_deed_present": true,
     "survey_present": true,
     "empty_state_message_present": false,
@@ -224,7 +223,7 @@ The schema is open: downstream consumers can read `Overview` via the
 
 | County | State | Scraper key | Approach | Status |
 |---|---|---|---|---|
-| Weld | CO | `CO_weld` | Pure HTTP + Playwright (no LLM) | Paths A + B working (needs registered recorder account); Path C, GLO, road ROW not yet automated |
+| Weld | CO | `CO_weld` | Pure HTTP + Playwright (no LLM) | Direct extraction, partial-history, and owner-name search all working (needs registered recorder account); GLO and road ROW not yet automated |
 | Denver | CO | `CO_denver` | browser-use + LLM | Works; requires `CO_DENVER_USERNAME/PASSWORD` |
 | Jefferson | CO | `CO_jefferson` | Hybrid REST API + browser-use | Works (no auth) |
 | Arapahoe | CO | `CO_arapahoe` | browser-use + LLM | Proof-of-concept |
@@ -237,51 +236,64 @@ The Weld scraper implements the procedure documented in
 **[docs/weld_county_sop.md](docs/weld_county_sop.md)**. That doc is the source of truth —
 read it before modifying scraper logic. Key points:
 
-- **Phase 1** (parcel discovery): SOP Steps 1.1–1.5 yield an Identify Results panel
+- **Parcel discovery**: SOP Steps 1.1–1.5 yield an Identify Results panel
   with Owner / Account / Parcel / Address / Subdivision / S-T-R. Steps 1.6 + 1.7 capture
   all Property Report accordion sections (server-rendered) and a screenshot of the Map
   iframe (`tmp/.../map.png`).
-- **Phase 2** (Decision Matrix): evaluates Conditions A/B/C against the Document History
-  to choose a routing path. Result lands in `overview.json` as `meta.sop_path` plus a
-  `decision_matrix` section with human-readable reasoning. Each path has a descriptive
-  label (used in code) and a SOP letter (kept for cross-reference with the surveyor doc):
-  - **`direct`** (SOP A) — both vesting deed AND SURV row → direct extraction in Phase 3A.
-  - **`alternate_partial`** (SOP B) — rows present, missing survey or deed → S/T/R Advanced Search in 3B.
-  - **`alternate_empty`** (SOP C) — empty + `No documents found.` text → owner-name search in 3C.
+- **Decision Matrix**: evaluates Document History against three conditions to choose a
+  research route. Result lands in `overview.json` as `meta.sop_path` plus a
+  `decision_matrix` section with human-readable reasoning:
+  - **`direct`** — both vesting deed AND SURV row present → direct extraction.
+  - **`alternate_partial`** — rows present, missing survey or deed → partial-history search.
+  - **`alternate_empty`** — empty + `No documents found.` text → owner-name search.
   - **`unroutable`** — 0 rows without the empty-state message → UI error (per
     tie-breaker rule #3); retry the run.
-- **Phase 3A** (Direct Extraction — implemented): runs when `path == "direct"`.
+- **Direct extraction** (implemented): runs when `path == "direct"`.
   Picks the most-recent SURV row as the ALTA + the most-recent WD/SWD/QCD/GEN
   as the vesting deed, then downloads each as a single complete PDF via Tyler's
   `#printCustom` endpoint. Files land at `tmp/{county}/{account}/{role}_{reception}.pdf`.
   Requires `WELD_RECORDER_USERNAME` / `WELD_RECORDER_PASSWORD` in `.env`.
-  Step 3A.5 (Schedule B-2 exception walk — implemented) then reads that ALTA for
-  the documents it cites and downloads each as `exception_{reception}.pdf`; see
-  [Reading the ALTA](#reading-the-alta-step-3a5).
-- **Phase 3B** (Alternative Research 1 — implemented): runs when
+  The cross-reference walk (implemented — see below) then reads every downloaded
+  document, starting with the ALTA, for the documents it cites and downloads each
+  as `exception_{reception}.pdf`; see [Reading the ALTA](#reading-the-alta-schedule-b-2).
+  The S/T/R easement/ROW Advanced Search below also runs unconditionally after
+  direct extraction — an ALTA's Schedule B-2 only lists what its surveyor happened
+  to cite, not necessarily everything else recorded against the section.
+- **Partial-history search** (implemented): runs when
   `path == "alternate_partial"` (rows present but missing survey or deed).
   Downloads the most-recent vesting deed (if any), then drives the Advanced
   Search at `/web/search/DOCSEARCH524S12` with the parcel's S/T/R (and
   Subdivision name if known), filters results to easement / ROW types, and
-  downloads each. Step 3B.3 (Exhibit A cross-reference harvest) is not
-  implemented — would require OCR since Tyler PDFs are scanned images.
-- **Phase 3C** (Alternative Research 2 — not yet implemented): would run for
-  `alternate_empty` (empty Document History + "No documents found." text).
-- **Phase 4** (GLO original survey of record) and **Phase 5** (county + state road
-  right-of-way) — not yet implemented. Both run independently of which research path
-  fired; see [docs/weld_county_sop.md](docs/weld_county_sop.md#phase-4--glo-original-survey-of-record).
+  downloads each. Cross-reference harvesting from the vesting deed's Exhibit A
+  is not implemented — would require OCR since Tyler PDFs are scanned images.
+- **Owner-name search** (implemented): runs when `path == "alternate_empty"`
+  (empty Document History + "No documents found." text). Searches the
+  Advanced Search form's "Search Name as Grantor or Grantee" field for the
+  owner's most recent vesting deed and any affidavits, then runs the same
+  S/T/R Advanced Search filtered to subdivision-exemption types, the
+  easement/ROW types above, and finally a SURVEY/ALTA fallback search.
+- **Full section/township/range document scan** (implemented): runs unconditionally
+  after every route above (and after the cross-reference walk), via an unfiltered
+  `_run_advanced_search()` on the same S/T/R — no doc-type filter this time — so
+  anything else recorded against the section that neither the property's own history
+  nor cross-reference harvesting surfaced still gets downloaded. Deduplicated against
+  the whole run's `known_receptions`; results land in `overview.json` under
+  `section_township_range_search`, separate from the route's own results section.
+- **GLO original survey of record** and **county + state road right-of-way** — not yet
+  implemented. Both would run independently of which research route fired; see
+  [docs/weld_county_sop.md](docs/weld_county_sop.md#phase-4--glo-original-survey-of-record).
 
 Document type codes (`SURV`, `WD`, `SWD`, `QCD`, `EASE`, `ROW`, etc.) and the
 Decision Matrix routing are defined in the SOP and mirrored in
 [scrapers/weld_county.py](apps/worker/survey_art/scrapers/weld_county.py).
 
-### Reading the ALTA (Step 3A.5)
+### Reading the ALTA (Schedule B-2)
 
 An ALTA's Schedule B-2 lists every easement, right-of-way and prior deed burdening
 the parcel, each with a reception number — documents that do *not* appear in the
 parcel's own Document History, so nothing earlier in the pipeline can find them.
-[`id_extraction.py`](apps/worker/survey_art/id_extraction.py) reads them off the survey and
-feeds them back into the same downloader, cheapest path first:
+[`id_extraction.py`](apps/worker/survey_art/id_extraction.py) reads a document off disk
+and returns the IDs it cites, cheapest path first:
 
 1. **Text layer** — `pypdf` plus a labelled regex (`RECORDING NO: 1766550`,
    `BOOK 999 AT PAGE 426`). Free and exact, but only born-digital PDFs have one.
@@ -309,10 +321,20 @@ commercial ALTA to take 10-20 minutes rather than one. Set `APPLICATION_MODE=dem
 to stop after the first 10 — enough to show the step working without the wait.
 
 Every ID found is written to `overview.json` under `extracted_ids` (and so shows up
-in the UI's Property Metadata tab) with its type and context, demo mode included —
+in the UI's Property Metadata tab) with its type, context, and which downloaded
+document cited it (`source_reception`/`source_doc_type`), demo mode included —
 the cap applies to downloading, never to what gets recorded. Only reception numbers
 are auto-downloaded — the recorder's document URL takes nothing else — so book/page
 and other formats are recorded for the surveyor to pull by hand.
+
+**Not just the ALTA.** `_expand_cross_references()` (`scrapers/weld_county.py`) runs
+this same extraction on *every* document the scraper downloads, for every routing
+path, then fetches whatever new documents turn up and reads those too — recursively,
+until nothing new is found. A `known_receptions` set (never re-download the same
+reception) and an internal `extracted` set (never re-run extraction on the same
+document, even if two other documents both cite it) keep this from doing wasted work
+or looping on a citation cycle; `_MAX_CROSS_REFERENCE_DOCS` is a cost/runtime backstop
+on top of that, not something normal runs should ever hit.
 
 > **Bedrock model access:** Anthropic models on Bedrock need the *Anthropic use case
 > details* form submitted once per account (Bedrock console → Model access). Until
@@ -363,24 +385,29 @@ Map capture
    ▼ → tmp/.../map.png  +  overview.json: map.image_path
 Decision Matrix (_decision_matrix()) — branches on Document History
    │
-   ├── Path A (direct): SURV row + vesting deed both present
+   ├── direct: SURV row + vesting deed both present
    │      Playwright downloads both via recording.weld.gov, then reads the ALTA's
-   │      Schedule B-2 (id_extraction.py) and fetches every referenced exception too
-   │      ▼ → tmp/.../{role}_{reception}.pdf  +  overview.json: phase_3a, extracted_ids
+   │      Schedule B-2 (id_extraction.py) and fetches every referenced exception too,
+   │      then also runs the S/T/R easement/ROW Advanced Search below
+   │      ▼ → tmp/.../{role}_{reception}.pdf  +  overview.json: direct_extraction,
+   │            extracted_ids, easement_and_row_search
    │
-   ├── Path B (alternate_partial): rows present, missing the deed and/or survey
+   ├── alternate_partial: rows present, missing the deed and/or survey
    │      downloads the vesting deed (if any), then drives recorder Advanced Search
    │      by S/T/R (+ subdivision) filtered to easement/ROW document types
-   │      ▼ → tmp/.../{role}_{reception}.pdf  +  overview.json: phase_3b
+   │      ▼ → tmp/.../{role}_{reception}.pdf  +  overview.json: partial_history_search
    │
-   └── Path C (alternate_empty): no rows, "No documents found." — not yet automated;
-          the scraper logs the path and stops
+   └── alternate_empty: no rows, "No documents found."
+          searches by owner name for the vesting deed, then the same S/T/R
+          Advanced Search filtered to subdivision-exemption, easement/ROW, and
+          finally a SURVEY/ALTA fallback
+          ▼ → tmp/.../{role}_{reception}.pdf  +  overview.json: owner_name_search
 ```
 
 All document downloads inject a `disclaimerAccepted=true` cookie (bypasses the
 reCAPTCHA-gated disclaimer button) and require an authenticated session — see
 [`docs/weld_county_sop.md`](docs/weld_county_sop.md) for the full decision tree and
-what's not yet automated (Path C, GLO survey-of-record, road ROW).
+what's not yet automated (GLO survey-of-record, road ROW).
 
 For Denver / Jefferson / Arapahoe the architecture differs — see each scraper file
 under `apps/worker/survey_art/scrapers/`.

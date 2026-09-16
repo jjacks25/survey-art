@@ -44,9 +44,40 @@ covers the case.
 ## Files
 
 - `src/main.tsx` — loads config, mounts with/without the Cognito provider.
-- `src/App.tsx` — sign-in gate + the dashboard (address form, status polling, results tabs).
+- `src/App.tsx` — sign-in gate + `react-router-dom` route table (see "Two pages" below).
+- `src/Layout.tsx` — the shared shell: search-history sidebar + page header, wraps every
+  route via `<Outlet>`.
+- `src/SearchPage.tsx` — the `/` route: the address/account/KMZ form. Submitting only
+  creates the job and navigates away.
+- `src/ResultsPage.tsx` — the `/jobs/:jobId` route: status polling + the four result tabs.
+- `src/MetadataView.tsx` — `MetadataView`/`PropertyMap`, the Property Metadata and Map
+  tab renderers (pulled out since both `ResultsPage` needs them and they're sizeable).
+- `src/utils.ts` — small formatting helpers shared across pages (`statusColor`,
+  `fileIcon`, `formatWhen`, etc.) — nothing here is React.
 - `src/api.ts` — typed API client (Bearer token when present).
 - `src/config.ts` — runtime config loader.
+
+## Two pages, not one: search vs. results
+
+Originally the whole app was one component that stayed on-screen through form entry,
+polling, and results — confusing once a search was running, since the form was still
+sitting there. It's now two routes under a shared `Layout`:
+
+- **`/`** (`SearchPage`) — just the form. `submit()` calls `api.createJob()` then
+  `navigate(/jobs/{jobId})`; it holds no job/polling state at all.
+- **`/jobs/:jobId`** (`ResultsPage`) — status badge, Cancel button, and the four tabs.
+  Polling is keyed off the route's `jobId` param in a `useEffect([jobId])`, so navigating
+  between two different job URLs (via the history panel, or a "New Search" round-trip)
+  correctly restarts polling for the new id rather than reusing stale interval state.
+
+`Layout` builds the single `ApiClient` (memoized on `config`/`token`) and hands it down
+as `{ api, loadHistory }` via `useOutletContext<LayoutContext>()` — pages read the context
+instead of each constructing their own client. Both routes share the history sidebar,
+so a user can start a search, get redirected to its results page, click "New Search" to
+go back to `/`, submit a second property, and land on that job's own `/jobs/:jobId2` —
+the first job keeps running and polling resumes for it instantly if the user clicks back
+into it from the sidebar, since the job itself runs server-side and isn't tied to any
+page staying mounted.
 
 ## Search mode: Account/Parcel # is the default
 
@@ -84,20 +115,30 @@ consistently for the same property across searches (see
 [`apps/worker/survey_art/AGENTS.md`](../worker/survey_art/AGENTS.md)) — a key that isn't stable
 per-property will silently stop deduping.
 
-Clicking an entry calls `selectJob(jobId)`, which reuses the exact same `poll()`/
-`pollRef` machinery as a fresh `submit()` — an in-progress job picked from history keeps
-live-updating exactly like one just submitted, and a completed one immediately shows its
-files via `poll()`'s own COMPLETED branch. The list itself is a lightweight `JobSummary`
-(no `logs`/`metadata`) — safe to fetch on every refresh.
+Clicking an entry navigates to `/jobs/{jobId}`; `ResultsPage`'s `useEffect([jobId])`
+starts polling from scratch for whatever id the route now holds, so an in-progress job
+picked from history keeps live-updating exactly like one just submitted, and a completed
+one immediately shows its files via `poll()`'s own COMPLETED branch. The list itself is
+a lightweight `JobSummary` (no `logs`/`metadata`) — safe to fetch on every refresh.
 
 ## Job results: four tabs
 
-Once a job exists, `App.tsx` polls `GET /api/jobs/{id}` every **1.5s** (this is the
-whole "real-time" mechanism — there's no websocket/SSE; see
+Once on `/jobs/:jobId`, `ResultsPage` polls `GET /api/jobs/{id}` every **1.5s** (this is
+the whole "real-time" mechanism — there's no websocket/SSE; see
 [`docs/architecture.md`](../../docs/architecture.md#job-lifecycle) for why) and renders
 four `Tabs.Panel`s from the response:
 
-- **Logs** — `job.logs` (a running `string[]`) in a `<Code block>`. Guard
+- **Logs** — `job.logs` is a running `LogEntry[]` (`{message, kind}` — see
+  `survey_shared.jobs.LogEntry`), not a flat string array. `milestones` (a `useMemo`)
+  filters to `kind === "milestone"` and renders as a `Timeline` — a clean step-by-step
+  view for a non-technical surveyor, with a spinning bullet on the last step while the
+  job is non-terminal. The timeline itself grows unbounded down the page (the page
+  scrolls, not the tab) — this only reads well because `ResultsPage` now has a whole
+  page to itself; don't reintroduce a capped-height scroll container here without
+  revisiting that. The full interleaved feed (milestones + `"detail"` diagnostics)
+  stays available verbatim in a `<Code block>` behind a `Spoiler` ("Show technical
+  log"), still capped at `maxHeight`/`overflowY: "auto"` since it's meant to be
+  glanced at, not read top to bottom. Guard
   `!job.logs || job.logs.length === 0` before rendering — an omitted/undefined `logs`
   field previously caused a full white-screen crash (`job.logs.length` on `undefined`)
   when a stale container returned an old schema; keep the guard even though the schema
@@ -120,7 +161,7 @@ four `Tabs.Panel`s from the response:
 - **Property Metadata** — `MetadataView` renders `job.metadata` (the scraper's
   `overview.json`, opaque/per-county — see
   [`apps/worker/survey_art/AGENTS.md`](../worker/survey_art/AGENTS.md)) as nested tables.
-  Notable helpers, all in `App.tsx`:
+  Notable helpers, all in `MetadataView.tsx`:
   - `titleCase(key)` — snake_case → Title Case, with an `ACRONYMS` set (`url`, `id`,
     `sop`, `pdf`) that fully-uppercases those words instead of just capitalizing them.
   - `groupRelatedEntries(entries)` / `RELATED_FIELD_GROUPS` — reorders object entries so
@@ -150,9 +191,10 @@ four `Tabs.Panel`s from the response:
 
 ## Cancelling a job
 
-The search button becomes a cancel action while a job is non-terminal; it calls
-`api.cancelJob(jobId)` (`DELETE /api/jobs/{id}`), which stops the underlying Fargate
-task server-side — not just a client-side "give up on polling."
+`ResultsPage` shows a Cancel button next to the status badge while the job is
+non-terminal; it calls `api.cancelJob(jobId)` (`DELETE /api/jobs/{id}`), which stops the
+underlying Fargate task server-side — not just a client-side "give up on polling" — then
+navigates back to `/`.
 
 ## Build / deploy
 

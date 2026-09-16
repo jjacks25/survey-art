@@ -44,6 +44,12 @@ class _DynamoLogHandler(logging.Handler):
     Only ever called from the QueueListener's background thread (see
     `_job_log_handler` below) — never directly from the scraper — so this
     blocking network call can't stall the asyncio event loop the scraper runs on.
+
+    Records from the `survey_art.narration` logger are tagged `kind="milestone"`
+    — the plain-English progress steps a non-technical surveyor should see by
+    default — everything else (the scraper's own detailed `logger.*` calls) is
+    `kind="detail"`, folded away in the frontend's Logs tab unless expanded.
+    See `survey_shared.jobs.LogEntry`.
     """
 
     def __init__(self, job_id: str) -> None:
@@ -53,7 +59,8 @@ class _DynamoLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            jobs.append_log(self.job_id, self.format(record))
+            kind = "milestone" if record.name == narration.name else "detail"
+            jobs.append_log(self.job_id, self.format(record), kind=kind)
         except Exception:  # noqa: BLE001 — logging must never break the job
             pass
 
@@ -146,6 +153,33 @@ def _doc_prefix(tmp: Path, saved: list[Path], input_address: str, metadata: dict
     return f"{state}/{county_name}/{_slug(identifier)}"
 
 
+def _archive_full_log(job_id: str) -> None:
+    """Best-effort archive of this job's complete log to S3 (`jobs.upload_job_log()`).
+
+    Reads the job back from DynamoDB rather than tracking entries locally —
+    `log_handler.close()` (called by the caller just before this) blocks
+    until the QueueListener has flushed every queued record, so by the time
+    this runs the DynamoDB record already holds the complete log. Never
+    raises: archiving must not fail a job that's already finished.
+    """
+    try:
+        job = jobs.get_job(job_id)
+        if not job or not job.logs:
+            return
+        header = (
+            f"Job: {job.job_id}\n"
+            f"Address: {job.address}\n"
+            f"County: {job.county}\n"
+            f"Status: {job.status}\n"
+            + ("Error: " + job.error + "\n" if job.error else "")
+            + "-" * 40
+        )
+        body = "\n".join(f"[{entry.kind}] {entry.message}" for entry in job.logs)
+        jobs.upload_job_log(job_id, f"{header}\n{body}\n")
+    except Exception:  # noqa: BLE001 — archiving must never break the job
+        logger.warning("Failed to archive full log for job %s", job_id, exc_info=True)
+
+
 def _upload_map_image(job_id: str, metadata: dict | None) -> None:
     """If the scraper captured a property map screenshot (e.g. Weld's parcel
     boundary map — county sites usually block iframe embedding, so a live embed
@@ -205,6 +239,7 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     finally:
         scraper_logger.removeHandler(log_handler)
         log_handler.close()
+        _archive_full_log(job_id)
 
 
 async def _run_once() -> int:

@@ -45,7 +45,7 @@ Conditions:
 
 Resources:
   # ---------------- Data ----------------
-  # One bucket, two prefixes, kept apart by lifecycle scope rather than by
+  # One bucket, three prefixes, kept apart by lifecycle scope rather than by
   # separate resources:
   #   scratch/     - ephemeral per-job artifacts (map screenshots). 90-day
   #                  expiry via the Filter-scoped rule below.
@@ -54,6 +54,11 @@ Resources:
   #                  _doc_prefix()). 7-day expiry, kept in sync with
   #                  JobsTable's TTL below - a repeated search re-downloads
   #                  rather than serving stale documents past a week.
+  #   property-search-logs/ - one full-run text log per job (see
+  #                  jobs.upload_job_log()), keyed by jobId. 30-day expiry —
+  #                  deliberately longer than JobsTable's 7-day TTL, so a
+  #                  run's exact log survives long enough to debug an issue
+  #                  reported after the job record itself has aged out.
   StorageBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -85,6 +90,14 @@ Resources:
             Status: Enabled
             Prefix: documents/
             ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: property-search-logs-expiry
+            Status: Enabled
+            Prefix: property-search-logs/
+            ExpirationInDays: 30
             NoncurrentVersionExpiration:
               NoncurrentDays: 1
             AbortIncompleteMultipartUpload:
@@ -237,7 +250,11 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                # Scan backs GET /api/jobs (jobs.list_jobs()) — the search history
+                # sidebar. Missing this 500s that endpoint with AccessDeniedException
+                # while job creation (PutItem) keeps working, which is confusing to
+                # debug from the frontend alone; check CloudWatch first next time.
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Scan]
                 Resource: !GetAtt JobsTable.Arn
               - Effect: Allow
                 Action: sqs:SendMessage
@@ -333,6 +350,16 @@ Resources:
             - {Name: CO_DENVER_USERNAME, ValueFrom: !Sub '${AppSecret}:CO_DENVER_USERNAME::'}
             - {Name: CO_DENVER_PASSWORD, ValueFrom: !Sub '${AppSecret}:CO_DENVER_PASSWORD::'}
 
+  # Lambda auto-creates /aws/lambda/{FunctionName} on first invoke with no
+  # retention cap (logs kept forever) unless a log group of that exact name
+  # already exists — declare it here so cost doesn't grow unbounded, same as
+  # WorkerLogGroup above.
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-api'
+      RetentionInDays: 30
+
   ApiFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -351,6 +378,12 @@ Resources:
           CLUSTER_ARN: !GetAtt EcsCluster.Arn
           CORS_ORIGINS: '*'
           ENVIRONMENT: !Ref Environment
+
+  DispatcherFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-dispatcher'
+      RetentionInDays: 30
 
   DispatcherFunction:
     Type: AWS::Lambda::Function

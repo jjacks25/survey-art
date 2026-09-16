@@ -2,6 +2,13 @@
 // access token is attached as a Bearer header (API Gateway's JWT authorizer
 // validates it); locally (authDisabled) no token is sent.
 
+// "milestone" = a plain-English progress step for a non-technical surveyor;
+// "detail" = a verbose developer diagnostic. See survey_shared.jobs.LogEntry.
+export interface LogEntry {
+  message: string;
+  kind: "milestone" | "detail";
+}
+
 export interface Job {
   jobId: string;
   address: string;
@@ -11,7 +18,7 @@ export interface Job {
   updatedAt: number;
   fileCount: number;
   error?: string | null;
-  logs: string[];
+  logs: LogEntry[];
   metadata?: Record<string, unknown> | null;
   location?: { lat: number; lon: number } | null;
 }
