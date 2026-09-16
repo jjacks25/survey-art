@@ -17,10 +17,14 @@ dependency-light (no browser/scraper deps) so the API's Lambda image stays lean.
 Single-key DynamoDB table (`jobId`). Status: `PENDING` → `RUNNING` → `COMPLETED` |
 `FAILED` | `CANCELLED`. Fields worth knowing about beyond the obvious:
 
-- `logs: list[str]` — appended to incrementally by the worker via `append_log()` as it
-  scrapes, so the frontend's Logs tab can show live progress. See
-  [`apps/worker/survey_art/AGENTS.md`](../../apps/worker/survey_art/AGENTS.md) for how these lines get
-  produced without blocking the scraper.
+- `logs: list[LogEntry]` — appended to incrementally by the worker via `append_log()` as
+  it scrapes, so the frontend's Logs tab can show live progress. Each `LogEntry` carries
+  a `kind` (`"milestone"` = plain-English progress step, `"detail"` = developer
+  diagnostic) so the frontend can show a clean step list by default with the raw feed
+  available on demand — see [`apps/worker/survey_art/AGENTS.md`](../../apps/worker/survey_art/AGENTS.md)
+  for how these get produced without blocking the scraper. `Job._coerce_legacy_logs()`
+  wraps any pre-existing plain-string log entries (job records written before `kind`
+  existed) as `"detail"` on the way in, so an old record still loads.
 - `metadata: dict | None` — the scraper's `overview.json`, stored verbatim (see the same
   doc) once the job completes. Opaque to this package — just round-tripped.
 - `location: dict | None` — `{"lat": Decimal, "lon": Decimal}` for the frontend's Map
@@ -74,8 +78,9 @@ but 404s/DNS-fails from the host browser.
 ## One `STORAGE_BUCKET`, split by prefix
 
 There's a single S3 bucket (`STORAGE_BUCKET`) for everything the app writes, divided into
-two namespaces that get different retention — not two separate bucket resources, since
-S3 lifecycle rules support a `Prefix` filter and each namespace gets its own scoped rule:
+three namespaces that get different retention — not three separate bucket resources,
+since S3 lifecycle rules support a `Prefix` filter and each namespace gets its own scoped
+rule:
 
 - `scratch/` — ephemeral per-job artifacts. The bucket's lifecycle rule expires these
   after 90 days (+ intelligent tiering).
@@ -84,15 +89,31 @@ S3 lifecycle rules support a `Prefix` filter and each namespace gets its own sco
   [`infra/AGENTS.md`](../../infra/AGENTS.md)) — a repeated search past that window
   re-downloads from the county site rather than reusing (or a job record referencing)
   an expired copy.
+- `property-search-logs/` — one complete text log per job (`upload_job_log()`, below).
+  Expires after 30 days — deliberately *longer* than `JobsTable`'s 7-day TTL, so a run's
+  exact log outlives the DynamoDB job record it came from, useful for debugging an issue
+  reported after the fact.
 
-`DOCUMENTS_PREFIX = "documents"` and `SCRATCH_PREFIX = "scratch"` in `jobs.py` are the
-only places that need to know this split.
+`DOCUMENTS_PREFIX = "documents"`, `SCRATCH_PREFIX = "scratch"`, and `LOGS_PREFIX =
+"property-search-logs"` in `jobs.py` are the only places that need to know this split.
 
 ## `upload_map_image()`
 
 Uploads a scraper-captured map screenshot to `scratch/maps/{jobId}.png` — ephemeral,
 outside any job's document prefix, so it never gets picked up as a spurious "document"
 in the Results tab and ages out with the rest of `scratch/`.
+
+## `upload_job_log()`
+
+Archives a job's complete log (every `LogEntry`, both `"milestone"` and `"detail"` — see
+above) as one plain-text file at `property-search-logs/{jobId}.log`. `worker.py`'s
+`run_job()` calls this from its `finally` block, after `log_handler.close()` has blocked
+until the `QueueListener` flushes every queued record to DynamoDB — so it reads the job
+back (`jobs.get_job()`) rather than tracking entries locally, and by the time it runs the
+DynamoDB record already holds the complete log for the whole run, success or failure.
+Never raises: a failed archive upload must not fail (or re-fail) a job that already
+finished. Works locally unchanged — `aws.client("s3")` is LocalStack-aware, same as every
+other S3 write in this file.
 
 ## `upload_documents()` / `list_result_files()` — the documents archive
 

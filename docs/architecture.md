@@ -93,6 +93,7 @@ sequenceDiagram
     W-->>DB: append_log() throughout, plain-English narration
     W->>S3: upload documents + map screenshot (if captured)
     W->>DB: status COMPLETED (fileCount, metadata, location)
+    W->>S3: upload full log text (property-search-logs/{jobId}.log)
     loop poll every 1.5s
         U->>A: GET /api/jobs/{id}
         A->>DB: read status, logs, metadata, location
@@ -111,17 +112,25 @@ sequenceDiagram
 ```
 
 **Live progress, not push.** "Real-time" logs are implemented as tightened polling
-(1.5s) plus a running `logs: list[str]` field on the job record — not a websocket or
-SSE stream. The worker appends one line per milestone via `append_log()`; the API just
-returns whatever's accumulated so far on each poll. A true push channel is a possible
-future upgrade if 1.5s polling ever feels laggy.
+(1.5s) plus a running `logs: list[LogEntry]` field on the job record — not a websocket
+or SSE stream. The worker appends one entry per log line via `append_log()`; the API
+just returns whatever's accumulated so far on each poll. A true push channel is a
+possible future upgrade if 1.5s polling ever feels laggy.
 
-**Two log streams, one job record.** The worker's Python logger hierarchy has
-`survey_art.*` (existing detailed dev/SOP diagnostics — untouched) and a child logger
-`survey_art.narration` (new, curated, plain-English milestones like "Reading the
-county's property report page..."). Both propagate to the same streaming handler
-attached to `survey_art`, so both land in `logs`, interleaved by time — the narration
-lines are simply additive, not a replacement for the diagnostic ones.
+**Two log streams, one job record, one archive.** The worker's Python logger hierarchy
+has `survey_art.*` (detailed dev diagnostics) and a child logger `survey_art.narration`
+(curated, plain-English milestones like "Reading the county's property report
+page..."). Both propagate to the same streaming handler attached to `survey_art`, so
+both land in `logs`, interleaved by time — the narration lines are simply additive, not
+a replacement for the diagnostic ones. Each `LogEntry` is tagged `kind: "milestone"`
+(narration) or `"detail"` (everything else), which is purely a frontend rendering hint:
+the SPA's Logs tab shows milestones as a clean step-by-step timeline by default, with
+the full interleaved feed available behind a "show technical log" toggle — see
+[`apps/worker/survey_art/AGENTS.md`](../apps/worker/survey_art/AGENTS.md). Once the job
+reaches a terminal status, the worker also archives the complete log (every entry,
+either kind) as one plain-text file at `property-search-logs/{jobId}.log` (30-day
+retention, deliberately longer than the job record's own 7-day TTL) so the exact log of
+a run survives long enough to debug an issue reported after the fact.
 
 **Why logging can't call DynamoDB directly.** An early version of the log-streaming
 handler called `jobs.append_log()` (a blocking network round-trip) synchronously inside
@@ -165,7 +174,14 @@ flowchart LR
 ```
 
 `make up` starts all four containers; the worker runs a SQS poll loop (standing in
-for the dispatcher Lambda + ECS RunTask that exist only in AWS).
+for the dispatcher Lambda + ECS RunTask that exist only in AWS). Only `web`'s Vite dev
+server hot-reloads from its mounted `src/` — `api` and `worker` bake their code into the
+image at build time, so a long-running container keeps serving whatever code it was
+built with even after you pull or edit new changes. Run `make restart` (`down` + `up
+--build`) after changing `api`/`worker` code, or a stale container can silently diverge
+from the checked-out source (the symptom is usually a Pydantic schema mismatch on a
+still-running old container, surfacing to the browser as `TypeError: Failed to fetch`
+rather than a normal HTTP error, since the crash happens before CORS headers attach).
 
 ## Repository layout
 

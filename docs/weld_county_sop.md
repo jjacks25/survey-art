@@ -10,9 +10,12 @@ the distinction matters, an **Implementation** callout explains what the code ac
 
 The procedure has three research paths (A/B/C) that branch on what a parcel's Document
 History contains, plus two supplemental phases (GLO original survey, road right-of-way) that
-run independently of which path was taken. Today the scraper implements **Path A and Path
-B**; Path C and both supplemental phases are documented here as the roadmap — see
-[What's not yet automated](#whats-not-yet-automated).
+run independently of which path was taken. Today the scraper implements **all three paths**.
+The S/T/R easement/ROW Advanced Search (Phase 3B's core search) is not exclusive to Path
+B — it runs unconditionally alongside whichever path fires, since a recorded ALTA's
+Schedule B-2 only lists what its surveyor happened to cite, not necessarily everything else
+recorded against the section. The two supplemental phases (GLO, road ROW) are documented
+here as the roadmap — see [What's not yet automated](#whats-not-yet-automated).
 
 ---
 
@@ -44,22 +47,25 @@ flowchart TD
 
     PathA --> ALTA["Download ALTA + vesting deed"]
     ALTA --> Sched["Read Schedule B-2 →\nfetch every referenced exception"]
+    ALTA --> Adv["S/T/R Advanced Search for easements/ROW\n(always runs, not just Path B)"]
 
-    PathB --> Adv["Download vesting deed (if any) +\nAdvanced Search for easements/ROW"]
+    PathB --> Adv2["Download vesting deed (if any) +\nAdvanced Search for easements/ROW"]
 
-    PathC -.not yet automated.-> Own["Owner search → exemption packet → ROW"]
+    PathC --> Own["Owner search → vesting deed →\nexemption packet → ROW → ALTA fallback"]
 
     Sched -.optional, not yet automated.-> P4["Phase 4: GLO original survey of record"]
     Adv -.optional, not yet automated.-> P4
+    Adv2 -.optional, not yet automated.-> P4
     Own -.optional, not yet automated.-> P4
     Sched -.optional, not yet automated.-> P5["Phase 5: County + state road ROW"]
     Adv -.optional, not yet automated.-> P5
+    Adv2 -.optional, not yet automated.-> P5
     Own -.optional, not yet automated.-> P5
 
     classDef implemented fill:#1a5,stroke:#333,color:#fff
     classDef pending fill:#999,stroke:#333,color:#fff
-    class PathA,ALTA,Sched,PathB,Adv implemented
-    class PathC,Own,Retry,P4,P5 pending
+    class PathA,ALTA,Sched,Adv,PathB,Adv2,PathC,Own implemented
+    class Retry,P4,P5 pending
 ```
 
 Green = implemented today. Grey = documented, not yet automated.
@@ -159,7 +165,7 @@ Then read the ALTA's **Schedule B-2** for every reception number it cites — th
 easements, ROW grants, and prior deeds burdening the parcel that don't appear in the
 parcel's own Document History — and fetch each one too.
 
-> **Implementation.** Wired as `_select_phase_3a_targets()` + `_download_documents()`,
+> **Implementation.** Wired as `_select_direct_extraction_targets()` + `_download_documents()`,
 > gated on `decision_matrix.path == "direct"`. Files land at
 > `tmp/{county}/{account}/{role}_{reception}.pdf` (or `_p{n}.pdf` per page for multi-page
 > docs).
@@ -178,14 +184,24 @@ parcel's own Document History — and fetch each one too.
 > silently fails every fetch after it (see the retry-loop comment in `_download_documents()`).
 >
 > **The Schedule B-2 exception walk is implemented** by
-> [`id_extraction.py`](../apps/worker/survey_art/id_extraction.py) (`extract_document_ids()`,
-> called "Step 3A.5" elsewhere in this codebase — you'll see that name in `README.md` and
-> code comments). Tyler's ALTAs are scanned images with no text layer, so extraction falls
-> through to Bedrock, which reads each sheet as overlapping tiles. Every ID found — fetchable
-> or not — lands in `overview.json` under `extracted_ids`; each `reception_number` is then
-> fetched through the same integration URL the ALTA itself came from. `APPLICATION_MODE=demo`
-> caps how many get *downloaded* (not recorded) so a demo doesn't wait out a ~90-document
-> ALTA. See [`README.md`](../README.md#reading-the-alta-step-3a5) for measured accuracy.
+> [`id_extraction.py`](../apps/worker/survey_art/id_extraction.py) (`extract_document_ids()`)
+> and turned into download targets by `_select_schedule_b2_exception_targets()`. Tyler's
+> ALTAs are scanned images with no text layer, so extraction falls through to Bedrock, which
+> reads each sheet as overlapping tiles. Every ID found — fetchable or not — lands in
+> `overview.json` under `extracted_ids`; each `reception_number` is then fetched through the
+> same integration URL the ALTA itself came from. `APPLICATION_MODE=demo` caps how many get
+> *downloaded* (not recorded) so a demo doesn't wait out a ~90-document ALTA. See
+> [`README.md`](../README.md#reading-the-alta-schedule-b-2) for measured accuracy.
+>
+> **This isn't ALTA-only.** `_expand_cross_references()` in `scrapers/weld_county.py` runs
+> this same extraction over *every* document the scraper downloads, for every routing path
+> — an easement or vesting deed can cite its own prior documents just as easily as an ALTA
+> can. It fetches newly-cited documents and reads those too, recursively, until nothing new
+> turns up. Two sets keep this bounded and non-redundant: `known_receptions` (never
+> downloads the same reception twice) and an internal `extracted` set (never runs
+> `extract_document_ids()` — and its Bedrock fallback — on the same document twice, even if
+> two different documents both cite it). `_MAX_CROSS_REFERENCE_DOCS` is a cost/runtime
+> backstop, not a correctness requirement — the underlying document graph is finite.
 
 ---
 
@@ -209,7 +225,7 @@ Legal — Subdivision** instead of raw S/T/R, and de-duplicate against the first
 reception number. If a client-supplied ALTA already exists locally, reconcile its Schedule
 B-2 against what Advanced Search turned up rather than treating it as missing.
 
-> **Implementation.** Wired as `_select_phase_3b_targets()` + `_run_advanced_search()`,
+> **Implementation.** Wired as `_select_partial_history_targets()` + `_run_advanced_search()`,
 > gated on `decision_matrix.path == "alternate_partial"`. Two passes:
 >
 > 1. Most-recent vesting deed (if Document History has one) — downloaded the same way Path A
@@ -224,8 +240,14 @@ B-2 against what Advanced Search turned up rather than treating it as missing.
 >    `Platted Legal → Subdivision`, deduplicated against the S/T/R pass by reception number.
 >
 > The Document Types field above is an autocomplete widget that's awkward to drive
-> headlessly, so we post-filter result rows in Python (`_PHASE_3B_DOC_TYPES`) instead: any row
-> whose Type contains `EASEMENT`, `RIGHT OF WAY`, `R/W`, or `ROW` is kept.
+> headlessly, so we post-filter result rows in Python (`_EASEMENT_ROW_DOC_TYPES`) instead:
+> any row whose Type contains `EASEMENT`, `RIGHT OF WAY`, `R/W`, or `ROW` is kept.
+>
+> **This S/T/R easement/ROW scan is not exclusive to Path B.** It's factored out as
+> `_easement_row_search()` and also runs unconditionally when direct extraction fires — see
+> `scrape()`'s supplemental block after the Schedule B-2 exception walk. An ALTA's Schedule
+> B-2 only lists what its surveyor happened to cite, not necessarily everything else recorded
+> against the section, so the SOP treats this research as required regardless of routing.
 >
 > **Not implemented:** cross-reference harvesting from the vesting deed's legal description
 > (the "Excluding those portions conveyed in Deed recorded …" clauses that cite prior
@@ -236,8 +258,6 @@ B-2 against what Advanced Search turned up rather than treating it as missing.
 ---
 
 ## Path C — Owner-name search + exemption packet
-
-*Not yet automated — documented here as the target behavior.*
 
 Typical for large legacy agricultural parcels recorded against the parent owner across
 multiple sections rather than per-account, so Document History for this specific account is
@@ -250,9 +270,46 @@ one filtered to subdivision-exemption document types, one to the same easement/R
 list Path B uses. If a last-ditch survey-type search still finds nothing, the exemption
 packet itself becomes the de facto survey of record.
 
-Today the scraper simply stops when it hits this branch (`decision_matrix.path ==
-"alternate_empty"`), logging that the path isn't implemented — see the `else` branch in
-`scrape()`.
+> **Implementation.** Wired as `_select_owner_name_search_targets()`, gated on
+> `decision_matrix.path == "alternate_empty"`. Runs against the same authenticated Advanced
+> Search session as Path B (`_recorder_search_session()`), in order:
+>
+> 1. **Owner-name search** — `_run_advanced_search(page, search_name=owner)`
+>    fills `#field_BothNamesID` ("Search Name as Grantor or Grantee") on the same Advanced
+>    Search form Path B uses; there's no separate Basic Search page to drive. The most recent
+>    row matching a vesting-deed label (`WARRANTY DEED` / `SPECIAL WARRANTY DEED` /
+>    `QUIT CLAIM DEED` / `GENERAL WARRANTY DEED`) becomes the `vesting_deed` target; any
+>    `AFFIDAVIT` rows are downloaded too, per the SOP's Exhibit A note.
+> 2. **Subdivision Exemption search** — S/T/R only, post-filtered in Python
+>    (`_matches_exemption_filter`) against `SUBDIVISION EXEMPTION`, `EXEMPTION`,
+>    `MINOR SUBDIVISION`, `AMENDED EXEMPTION`.
+> 3. **Easement/ROW scan** — the same `_easement_row_search()` Path B uses.
+> 4. **ALTA fallback search** — S/T/R only, post-filtered for a `SURVEY`/`ALTA`
+>    doc type not already targeted. If nothing matches, logs
+>    "No recorded ALTA was found — the exemption packet is the survey of record."
+>
+> **Not implemented:** the Exhibit A cross-reference harvest (extra S/T/R values
+> cited in a quit-claim deed) — same reason Path B skips it: Tyler PDFs are scanned images
+> with no text layer. The search universe falls back to the parcel's own Identify Results
+> S/T/R instead of whatever the deed's Exhibit A would add.
+
+---
+
+## Full section/township/range document scan
+
+After whichever research route above finishes (and after cross-reference expansion), the
+scraper runs one more unfiltered Advanced Search — same S/T/R fields as the easement/ROW
+scan, but **no doc-type post-filter** — to catch anything else recorded against this
+parcel's section that neither Document History nor cross-reference harvesting turned up.
+Anything found and not already downloaded this run gets pulled too.
+
+> **Implementation.** `_section_township_range_search()`, called unconditionally at the end
+> of `scrape()` regardless of routing path. Deduplicates against the run's whole
+> `known_receptions` set (already includes everything from direct extraction, the
+> easement/ROW scan, and cross-reference expansion), so nothing already on disk is
+> re-downloaded. Results land in `overview.json` under `section_township_range_search`,
+> separate from the route's own results section, so a surveyor can see at a glance which
+> documents were targeted directly versus turned up by this broader sweep.
 
 ---
 
@@ -384,17 +441,14 @@ integration would search GLO Township 5N Range 67W and Weld's road-ROW sources a
 
 ## What's not yet automated
 
-1. **Path C** (owner-name search + exemption packet) — the scraper stops as soon as
-   `decision_matrix.path == "alternate_empty"`; no owner-name search or subdivision-exemption
-   Advanced Search is driven.
-2. **Phase 4** (GLO survey of record) — no `glorecords.blm.gov` integration exists.
-3. **Phase 5** (road right-of-way) — no BOCC Laserfiche or CDOT OTIS integration exists.
-4. **Exhibit A cross-reference parsing** (Path B) — prior-deed reception numbers cited inside
-   a vesting deed's legal description aren't extracted; would need OCR or a vision LLM since
-   Tyler PDFs are scanned images.
-5. **Output naming/folder structure** — today's files are `{role}_{reception}.pdf` under a
+1. **Phase 4** (GLO survey of record) — no `glorecords.blm.gov` integration exists.
+2. **Phase 5** (road right-of-way) — no BOCC Laserfiche or CDOT OTIS integration exists.
+3. **Exhibit A cross-reference parsing** (Paths B and C) — prior-deed reception numbers or
+   extra S/T/R values cited inside a vesting/quit-claim deed's legal description aren't
+   extracted; would need OCR or a vision LLM since Tyler PDFs are scanned images.
+4. **Output naming/folder structure** — today's files are `{role}_{reception}.pdf` under a
    flat `tmp/{county}/{account}/`. The `Client → Project → Instruments → [Document Type]`
    hierarchy is a UI/export concern, not something the scraper itself builds.
-6. **Anonymous vs. authenticated recorder access** — see the URL Reference note above.
+5. **Anonymous vs. authenticated recorder access** — see the URL Reference note above.
 
 These are the natural next slices for extending Weld coverage.
