@@ -11,10 +11,11 @@ from __future__ import annotations
 import mimetypes
 import time
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from botocore.exceptions import ClientError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from survey_shared import aws
 from survey_shared.config import get_shared_settings
@@ -28,6 +29,22 @@ TERMINAL = {COMPLETED, FAILED, CANCELLED}
 
 PRESIGN_TTL_SECONDS = 3600
 JOB_TTL_SECONDS = 7 * 24 * 60 * 60  # kept in sync with the documents/ S3 lifecycle rule
+
+
+class LogEntry(BaseModel):
+    """One line of a job's running log.
+
+    `kind` distinguishes plain-English milestones ("milestone" — the
+    `survey_art.narration` logger, see
+    [`apps/worker/survey_art/AGENTS.md`](../../apps/worker/survey_art/AGENTS.md))
+    from verbose developer diagnostics ("detail" — every other logger), so the
+    frontend's Logs tab can show a clean step-by-step progress list by default
+    with the raw feed available on demand instead of one undifferentiated wall
+    of text.
+    """
+
+    message: str
+    kind: Literal["milestone", "detail"] = "detail"
 
 
 class Job(BaseModel):
@@ -45,10 +62,20 @@ class Job(BaseModel):
     error: str | None = None
     file_count: int = Field(default=0, alias="fileCount")
     task_arn: str | None = Field(default=None, alias="taskArn")
-    logs: list[str] = Field(default_factory=list)
+    logs: list[LogEntry] = Field(default_factory=list)
     metadata: dict | None = None
     location: dict | None = None
     doc_prefix: str | None = Field(default=None, alias="docPrefix")
+
+    @field_validator("logs", mode="before")
+    @classmethod
+    def _coerce_legacy_logs(cls, v):
+        # Job records written before `logs` carried a `kind` are plain strings
+        # (DynamoDB items don't migrate themselves) — wrap them as "detail" so
+        # an old, still-live job record keeps loading instead of 500ing.
+        if not v:
+            return v
+        return [{"message": item} if isinstance(item, str) else item for item in v]
 
     def to_item(self) -> dict:
         # Alias keys for DynamoDB; drop error when unset rather than storing null.
@@ -140,14 +167,19 @@ def update_status(
             raise
 
 
-def append_log(job_id: str, line: str) -> None:
-    """Append one line to the job's running log (best-effort, non-fatal on error)."""
+def append_log(
+    job_id: str, message: str, *, kind: Literal["milestone", "detail"] = "detail"
+) -> None:
+    """Append one entry to the job's running log (best-effort, non-fatal on error).
+
+    See `LogEntry` for what `kind` means to the frontend.
+    """
     try:
         _table().update_item(
             Key={"jobId": job_id},
             UpdateExpression="SET #l = list_append(if_not_exists(#l, :empty), :line)",
             ExpressionAttributeNames={"#l": "logs"},
-            ExpressionAttributeValues={":line": [line], ":empty": []},
+            ExpressionAttributeValues={":line": [{"message": message, "kind": kind}], ":empty": []},
         )
     except ClientError:
         pass
@@ -194,6 +226,23 @@ def cancel_job(job_id: str, *, _attempts: int = 3) -> Job | None:
 
 DOCUMENTS_PREFIX = "documents"
 SCRATCH_PREFIX = "scratch"
+LOGS_PREFIX = "property-search-logs"
+
+
+def upload_job_log(job_id: str, text: str) -> str:
+    """Archive a job's complete log as a plain-text file at
+    ``property-search-logs/{job_id}.log``.
+
+    Kept for 30 days (the bucket's ``property-search-logs/`` lifecycle rule) — deliberately
+    longer than a job record's own 7-day DynamoDB TTL (`Job.expires_at`), so
+    the exact log of a run survives long enough to debug an issue reported
+    after the job record itself has aged out. Returns the S3 key.
+    """
+    s3 = aws.client("s3")
+    bucket = aws.storage_bucket()
+    key = f"{LOGS_PREFIX}/{job_id}.log"
+    s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType="text/plain")
+    return key
 
 
 def upload_documents(prefix: str, files: list[Path]) -> int:

@@ -51,6 +51,22 @@ def test_list_jobs_sorts_most_recent_first(client):
     assert job_ids.index("newer") < job_ids.index("older")
 
 
+def test_get_job_returns_kind_tagged_logs(client):
+    from survey_shared import jobs
+
+    created = client.post("/api/jobs", json={"address": "123 Main St, Greeley, CO 80631"})
+    job_id = created.json()["jobId"]
+    jobs.append_log(job_id, "Starting your search...", kind="milestone")
+    jobs.append_log(job_id, "Phase 1: routing account lookup", kind="detail")
+
+    fetched = client.get(f"/api/jobs/{job_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["logs"] == [
+        {"message": "Starting your search...", "kind": "milestone"},
+        {"message": "Phase 1: routing account lookup", "kind": "detail"},
+    ]
+
+
 def test_get_job_not_found(client):
     resp = client.get("/api/jobs/does-not-exist")
     assert resp.status_code == 404
