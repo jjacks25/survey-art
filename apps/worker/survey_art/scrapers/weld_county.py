@@ -16,11 +16,19 @@ Workflow
      History table (reception number, date, type, grantor, grantee) — the "Decision
      Frame" that `_decision_matrix()` routes on.
 
-3. Decision Matrix (`_decision_matrix()`)
-   - Path A (`direct`): both a vesting deed and a SURV row present.
-   - Path B (`alternate_partial`): rows present, missing the deed, the survey, or both.
-   - Path C (`alternate_empty`): empty + literal "No documents found." — NOT
-     implemented; the scraper stops and reports the path as unhandled.
+3. Decision Matrix (`_decision_matrix()`) — routes on Document History contents:
+   - `direct`: both a vesting deed and a SURV row present →
+     `_select_direct_extraction_targets()`.
+   - `alternate_partial`: rows present, missing the deed, the survey, or both →
+     `_select_partial_history_targets()`.
+   - `alternate_empty`: empty + literal "No documents found." →
+     `_select_owner_name_search_targets()`.
+
+   The S/T/R easement/ROW Advanced Search (`_easement_row_search()`) is not
+   exclusive to the partial-history route — it runs unconditionally alongside
+   whichever route fires, since a recorded ALTA's Schedule B-2 only lists what
+   its surveyor happened to cite, not necessarily everything else recorded
+   against the section.
 
 4. Recorder Document Download (recording.weld.gov)
    - Documents live at recording.weld.gov/web/web/integration/document/{id}.
@@ -28,8 +36,9 @@ Workflow
      `disclaimerAccepted=true` cookie directly instead of solving it.
    - Requires WELD_RECORDER_USERNAME/PASSWORD — anonymous viewing returns a
      "must be a registered user" stub.
-   - Path A additionally reads the downloaded ALTA's Schedule B-2 for exception/
-     easement reception numbers (`id_extraction.py`) and fetches those too.
+   - Every downloaded document — not just the ALTA — is read for the other
+     documents it cites (`id_extraction.py`, `_expand_cross_references()`),
+     which fetches those too and repeats until nothing new turns up.
 
 Key Notes
 ---------
@@ -47,6 +56,7 @@ import functools
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -169,7 +179,7 @@ class ParcelInfo:
     """Identify Results panel fields, per SOP Phase 1 Step 1.5.
 
     Persisted to the run log because Owner, Account, Parcel, and S-T-R drive
-    branching searches in Phases 3B and 3C.
+    the partial-history and owner-name search routes.
 
     `township` and `range_` are stored in SOP form ("5N", "67W") — not the
     raw numeric form returned by the property report ("05", "67").
@@ -434,7 +444,7 @@ async def _get_parcel_info_browser(
         try:
             # SOP Step 1.3 — go straight to the map (skipping 1.1/1.2 in this
             # iteration; we can chain the tile clicks later if needed).
-            logger.info("SOP 1.3: opening Property Portal map")
+            logger.info("Opening Property Portal map")
             await page.goto(_PROPERTY_PORTAL_MAP, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_load_state("networkidle", timeout=20_000)
 
@@ -467,20 +477,20 @@ async def _browser_run_search(
     if query_type in ("account", "parcel"):
         # Portal has Account # / Parcel # buttons. Use the matching one.
         button_label = "Account #" if query_type == "account" else "Parcel #"
-        logger.info("SOP 1.4: clicking %r search", button_label)
+        logger.info("Clicking %r search", button_label)
         await page.get_by_role("button", name=re.compile(button_label, re.I)).first.click()
         await page.locator("input:visible").first.fill(query)
         await page.keyboard.press("Enter")
         return
     if query_type == "address":
-        logger.info("SOP 1.4 Priority 1: Address search for %r", query)
+        logger.info("Address search for %r", query)
         await page.get_by_role("button", name=re.compile(r"^Address$", re.I)).first.click()
         await page.locator("input:visible").first.fill(query.split(",")[0].strip())
         await page.keyboard.press("Enter")
         return
     if str_input:
         section, township, range_ = (p.strip() for p in str_input.split(",", 2))
-        logger.info("SOP 1.4 Priority 3: S-T-R search %s/%s/%s", section, township, range_)
+        logger.info("Section/Township/Range search %s/%s/%s", section, township, range_)
         await page.get_by_role("button", name=re.compile(r"S-?T-?R", re.I)).first.click()
         inputs = page.locator("input:visible")
         await inputs.nth(0).fill(section)
@@ -490,7 +500,7 @@ async def _browser_run_search(
         return
     if owner_input or query_type == "owner":
         owner = owner_input or query
-        logger.info("SOP 1.4 Priority 4: Owner search for %r", owner)
+        logger.info("Owner search for %r", owner)
         await page.get_by_role("button", name=re.compile(r"^Owner$", re.I)).first.click()
         await page.locator("input:visible").first.fill(owner)
         await page.keyboard.press("Enter")
@@ -764,12 +774,12 @@ def _filter_survey_docs(records: list[_DocRecord]) -> list[_DocRecord]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Decision Matrix (SOP Phase 2)
+# Decision Matrix — routes a parcel to a research strategy based on what its
+# Document History contains (see docs/weld_county_sop.md for the full spec).
 # ---------------------------------------------------------------------------
 
 # Vesting deeds per the SOP doc-type cheat sheet. These are the "conveyance"
-# rows that establish chain of title. SOP Path 3A.4 / 3B.2 use {WD, SWD, GEN}
-# and {SWD, WD, QCD, GEN} respectively; the non-money variants (WDN, SWDN,
+# rows that establish chain of title. The non-money variants (WDN, SWDN,
 # QCN, QCDN) appear in real data and count for routing purposes.
 _VESTING_DEED_TYPES = {"WD", "WDN", "SWD", "SWDN", "QCD", "QCN", "QCDN", "GEN"}
 
@@ -784,19 +794,35 @@ _SURVEY_ROW_TYPES = {"SURV"}
 _NO_DOCS_MESSAGE = "No documents found."
 
 
+def _date_sort_key(date_str: str) -> tuple[int, int, int]:
+    """Parse a leading MM/DD/YYYY or MM-DD-YYYY date for chronological sort.
+
+    Document History rows use 'MM-DD-YYYY'; Advanced Search result rows use
+    'MM/DD/YYYY HH:MM AM/PM' — only the date prefix matters for "most
+    recent" comparisons, and lexicographic sort doesn't work for either.
+    """
+    m = re.match(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", date_str or "")
+    if not m:
+        return (0, 0, 0)
+    mm, dd, yyyy = m.groups()
+    return (int(yyyy), int(mm), int(dd))
+
+
 def _decision_matrix(records: list[_DocRecord], html: str) -> dict:
-    """SOP Phase 2 — evaluate Conditions A/B/C against the Decision Frame.
+    """Evaluate Document History against the Decision Matrix's three conditions.
 
     Apply IF/THEN/ELSE in order; stop at first match. Tie-breakers:
-      - If both A and B technically match, prefer A (Path 3B is reachable
-        as a fallback when 3A fails — SOP Step 3A.4).
-      - Never route to C unless the literal 'No documents found.' string
-        is present. A blank section without that text is a UI error.
+      - If the direct-extraction and partial-history conditions both
+        technically match, prefer direct extraction (partial history is
+        reachable as a fallback when direct extraction fails).
+      - Never route to owner-name search unless the literal
+        'No documents found.' string is present. A blank section without
+        that text is a UI error.
 
     Returns a dict shaped for direct serialization to overview.json:
 
         {
-          "path": "A" | "B" | "C" | "UNROUTABLE",
+          "path": "direct" | "alternate_partial" | "alternate_empty" | "unroutable",
           "reasoning": ["..."],
           "vesting_deed_present": bool,
           "survey_present": bool,
@@ -812,17 +838,10 @@ def _decision_matrix(records: list[_DocRecord], html: str) -> dict:
     surveys = [r for r in records if r.doc_type in _SURVEY_ROW_TYPES]
     no_docs = _NO_DOCS_MESSAGE in html
 
-    # Most-recent helpers — rec_date is MM-DD-YYYY; lexicographic max doesn't
-    # work, so parse the year/month/day.
-    def _date_key(r: _DocRecord) -> tuple:
-        try:
-            m, d, y = r.rec_date.split("-")
-            return (int(y), int(m), int(d))
-        except (ValueError, AttributeError):
-            return (0, 0, 0)
-
-    most_recent_survey = max(surveys, key=_date_key) if surveys else None
-    most_recent_vesting = max(vesting, key=_date_key) if vesting else None
+    most_recent_survey = max(surveys, key=lambda r: _date_sort_key(r.rec_date)) if surveys else None
+    most_recent_vesting = (
+        max(vesting, key=lambda r: _date_sort_key(r.rec_date)) if vesting else None
+    )
 
     base = {
         "vesting_deed_present": bool(vesting),
@@ -835,57 +854,55 @@ def _decision_matrix(records: list[_DocRecord], html: str) -> dict:
         "most_recent_vesting_deed": most_recent_vesting.to_dict() if most_recent_vesting else None,
     }
 
-    # Condition A — both a vesting deed AND at least one SURV row.
+    # Direct extraction — both a vesting deed AND at least one SURV row.
     if vesting and surveys:
         reasoning = [
-            f"Condition A matched: {len(records)} row(s) including "
+            f"Direct extraction matched: {len(records)} row(s) including "
             f"{len(vesting)} vesting deed(s) [{', '.join(sorted({v.doc_type for v in vesting}))}] "
             f"and {len(surveys)} SURV row(s).",
             f"Most recent SURV: reception {most_recent_survey.reception} "
             f"({most_recent_survey.rec_date}). Expected to correspond to a recorded ALTA.",
             f"Most recent vesting deed: reception {most_recent_vesting.reception} "
             f"({most_recent_vesting.doc_type}, {most_recent_vesting.rec_date}).",
-            "→ Route to Phase 3A (Happy Path).",
+            "→ Route to direct extraction (download the ALTA + vesting deed directly).",
         ]
-        return {"path": "direct", "sop_letter": "A", "reasoning": reasoning, **base}
+        return {"path": "direct", "reasoning": reasoning, **base}
 
-    # Condition B — rows present, but missing either survey or vesting deed.
+    # Partial history — rows present, but missing either survey or vesting deed.
     if records and (bool(vesting) ^ bool(surveys) or (not vesting and not surveys)):
         missing = "vesting deed" if surveys else "SURV row"
         if not vesting and not surveys:
             missing = "vesting deed AND SURV row"
         reasoning = [
-            f"Condition B matched: {len(records)} row(s) present but no {missing}.",
+            f"Partial history matched: {len(records)} row(s) present but no {missing}.",
             f"Doc types on record: {', '.join(sorted({r.doc_type for r in records}))}.",
-            "→ Route to Phase 3B (Alternative Research Path 1 — "
-            "S/T/R Advanced Search for easements/ROW).",
+            "→ Route to partial history search "
+            "(S/T/R Advanced Search for easements/ROW, plus any vesting deed on file).",
         ]
-        return {"path": "alternate_partial", "sop_letter": "B", "reasoning": reasoning, **base}
+        return {"path": "alternate_partial", "reasoning": reasoning, **base}
 
-    # Condition C — empty AND the literal "No documents found." text is shown.
+    # Empty history — AND the literal "No documents found." text is shown.
     if not records and no_docs:
         reasoning = [
-            "Condition C matched: Document History is empty AND "
+            "Empty history matched: Document History is empty AND "
             f"'{_NO_DOCS_MESSAGE}' is present below the section header.",
-            "→ Route to Phase 3C (Alternative Research Path 2 — "
-            "owner-name search + S/T/R-driven exemption packet).",
+            "→ Route to owner-name search (owner-name search + S/T/R-driven exemption packet).",
         ]
-        return {"path": "alternate_empty", "sop_letter": "C", "reasoning": reasoning, **base}
+        return {"path": "alternate_empty", "reasoning": reasoning, **base}
 
-    # Tie-breaker #3: 0 rows + no message → UI error, not Path C.
+    # Tie-breaker: 0 rows + no message → UI error, not empty history.
     if not records and not no_docs:
         reasoning = [
             "UNROUTABLE: Document History returned 0 rows but the literal "
             f"'{_NO_DOCS_MESSAGE}' string was NOT present in the response.",
-            "Per SOP tie-breaker rule #3, this is treated as a UI / rendering "
-            "error rather than Condition C. Retry the run before routing.",
+            "This is treated as a UI / rendering error rather than empty "
+            "history. Retry the run before routing.",
         ]
-        return {"path": "unroutable", "sop_letter": None, "reasoning": reasoning, **base}
+        return {"path": "unroutable", "reasoning": reasoning, **base}
 
     # Defensive fallthrough — shouldn't happen given the conditions above.
     return {
         "path": "unroutable",
-        "sop_letter": None,
         "reasoning": [
             "UNROUTABLE: no Decision Matrix condition matched. "
             "This indicates a logic bug — investigate."
@@ -914,8 +931,8 @@ _DOC_EXTENSIONS = (".tif", ".tiff", ".pdf", ".jpg", ".jpeg", ".png")
 _DOC_FETCH_ATTEMPTS = 4
 _DOC_FETCH_PAUSE_S = 2.0
 
-# APPLICATION_MODE=demo: how many of the ALTA's referenced documents to actually
-# fetch (Step 3A.5). Enough to show the feature working without the ~30 minutes a
+# APPLICATION_MODE=demo: how many of the ALTA's Schedule B-2 referenced documents
+# to actually fetch. Enough to show the feature working without the ~30 minutes a
 # full ~90-document ALTA takes.
 _DEMO_EXCEPTION_LIMIT = 10
 
@@ -1053,8 +1070,8 @@ async def _download_documents(
         # serves the complete multi-page document. We open the viewer just
         # long enough to read that href, then fetch it directly.
         #
-        # Pace and retry. Step 3A.5 turned this loop from "2 documents" into "one
-        # per Schedule B-2 exception" — ~90 for a commercial ALTA — and occasionally
+        # Pace and retry. The Schedule B-2 exception walk turned this loop from
+        # "2 documents" into "one per exception" — ~90 for a commercial ALTA — and occasionally
         # the site serves a viewer page with no `#printCustom` button. That never
         # means the document is missing; the same reception fetches cleanly moments
         # later. So every non-success retries after a growing pause, re-asserting
@@ -1107,8 +1124,7 @@ async def _download_documents(
                     body = await resp.body() if resp.status == 200 else b""
                     if resp.status != 200:
                         logger.warning(
-                            "Print endpoint returned HTTP %s for %s reception %s "
-                            "(attempt %d/%d)",
+                            "Print endpoint returned HTTP %s for %s reception %s (attempt %d/%d)",
                             resp.status,
                             role,
                             doc.reception,
@@ -1157,19 +1173,20 @@ async def _download_documents(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3A — Direct Extraction (Happy Path)
+# Direct Extraction — ALTA + vesting deed already on file (decision path "direct")
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Phase 3B — Alternative Research Path 1 (S/T/R Advanced Search)
+# Partial History Search — S/T/R Advanced Search for easements/ROW, plus
+# whatever vesting deed is on file (decision path "alternate_partial")
 # ---------------------------------------------------------------------------
 
-# SOP Step 3B.5 — Document Types multiselect filter list for the Advanced
-# Search. Every variant of EASEMENT / RIGHT OF WAY the SOP enumerates. The
-# Self Service Web search UI is an autocomplete input that's awkward to drive
-# headlessly, so we let the Advanced Search return ALL rows matching the S/T/R
-# and post-filter on the Type column rendered in each result row.
-_PHASE_3B_DOC_TYPES = {
+# Document Types multiselect filter list for the Advanced Search. Every
+# variant of EASEMENT / RIGHT OF WAY the SOP enumerates. The Self Service Web
+# search UI is an autocomplete input that's awkward to drive headlessly, so
+# we let the Advanced Search return ALL rows matching the S/T/R and
+# post-filter on the Type column rendered in each result row.
+_EASEMENT_ROW_DOC_TYPES = {
     "EASEMENT",
     "EASEMENT & RIGHT OF WAY",
     "EASEMENT DEED",
@@ -1193,7 +1210,7 @@ _ADVANCED_SEARCH_URL = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
 def _matches_easement_filter(doc_type_label: str) -> bool:
     """Loose match: a doc type passes if any easement keyword appears in it."""
     upper = doc_type_label.upper().strip()
-    if upper in _PHASE_3B_DOC_TYPES:
+    if upper in _EASEMENT_ROW_DOC_TYPES:
         return True
     # The label may carry extra punctuation/spacing; match the canonical
     # tokens conservatively.
@@ -1207,8 +1224,9 @@ async def _run_advanced_search(
     township: str = "",
     range_: str = "",
     subdivision: str = "",
+    search_name: str = "",
 ) -> list[dict]:
-    """SOP Step 3B.4–3B.5 — drive the Advanced Search UI and return rows.
+    """Drive the recorder's Advanced Search UI and return the result rows.
 
     The Self Service Web's direct HTTP POST to `/web/searchPost/...` returns
     only metadata; the actual results render only when the search is driven
@@ -1217,8 +1235,12 @@ async def _run_advanced_search(
         {"reception": str, "doc_type": str, "rec_date": str, "doc_id": str}
 
     where `doc_id` is Tyler's internal DOC ID (e.g. 'DOC808S1754'). Note this
-    returns ALL rows matching the legal-description criteria — caller should
-    post-filter by `doc_type`.
+    returns ALL rows matching the search criteria — caller should post-filter
+    by `doc_type`.
+
+    `search_name` fills 'Search Name as Grantor or Grantee' (the owner-name
+    search) — it's a field on this same Advanced Search form
+    (`#field_BothNamesID`), not a separate Basic Search page.
     """
     await page.goto(_ADVANCED_SEARCH_URL, wait_until="networkidle", timeout=30_000)
     # The form opens with a "Continue session?" dialog if any user state exists.
@@ -1228,17 +1250,19 @@ async def _run_advanced_search(
     except Exception:
         pass
 
-    # Fill the relevant legal-description fields. Empty strings are ignored.
+    # Fill the relevant fields. Empty strings are ignored.
     if section:
         await page.fill("#field_PLSSLegalID_DOT_Section", section)
     if township:
-        # SOP Step 3B.5: Township should be entered as the numeric portion
-        # only (e.g. "5", not "5N"). Strip any trailing N/S direction.
+        # Township should be entered as the numeric portion only (e.g. "5",
+        # not "5N"). Strip any trailing N/S direction.
         await page.fill("#field_PLSSLegalID_DOT_Township", township.rstrip("NnSs"))
     if range_:
         await page.fill("#field_PLSSLegalID_DOT_Range", range_.rstrip("EeWw"))
     if subdivision:
         await page.fill("#field_PlattedLegalID_DOT_Subdivision", subdivision)
+    if search_name:
+        await page.fill("#field_BothNamesID", search_name)
 
     await page.click("#searchButton")
     await page.wait_for_load_state("networkidle", timeout=30_000)
@@ -1262,27 +1286,195 @@ async def _run_advanced_search(
         }"""
     )
     logger.info(
-        "Advanced Search (S=%s T=%s R=%s Sub=%s): %d row(s)",
+        "Advanced Search (S=%s T=%s R=%s Sub=%s Name=%s): %d row(s)",
         section,
         township,
         range_,
         subdivision,
+        search_name,
         len(rows),
     )
     return rows
 
 
-def _select_phase_3a_targets(
+@asynccontextmanager
+async def _recorder_search_session(username: str, password: str):
+    """Open an authenticated Playwright page for driving Advanced Search.
+
+    Shared by the partial-history search, the owner-name search, and the
+    always-on easement/ROW scan — Advanced Search returns no rows for
+    anonymous sessions. Yields `None` (instead of raising) when credentials
+    are missing or login fails, so callers can treat "no session" as "skip
+    this research route" without crashing the run.
+    """
+    import os
+
+    from playwright.async_api import async_playwright
+
+    if not (username and password):
+        logger.warning(
+            "Advanced Search: WELD_RECORDER_USERNAME/PASSWORD not set — "
+            "skipping (Advanced Search needs an authenticated session)."
+        )
+        yield None
+        return
+
+    headed = os.environ.get("WELD_HEADED", "").lower() in ("1", "true", "yes")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=not headed,
+            args=["--disable-blink-features=AutomationControlled"],
+            slow_mo=400 if headed else 0,
+        )
+        ctx = await browser.new_context(user_agent=_HTTP_HEADERS["User-Agent"])
+        await ctx.add_cookies([_DISCLAIMER_COOKIE])
+        try:
+            resp = await ctx.request.post(
+                _RECORDER_LOGIN_URL,
+                form={"field_UserId": username, "field_Password": password},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+            payload = json.loads(await resp.text())
+            if not payload.get("success"):
+                logger.error("Advanced Search login failed: %s", payload.get("message", "(no msg)"))
+                await browser.close()
+                yield None
+                return
+        except Exception as exc:
+            logger.warning("Advanced Search login error: %s", exc)
+            await browser.close()
+            yield None
+            return
+
+        page = await ctx.new_page()
+        try:
+            yield page
+        finally:
+            await browser.close()
+
+
+async def _easement_row_search(
+    page,
+    parcel: ParcelInfo,
+    seen_receptions: set[str],
+) -> list[tuple[str, _DocRecord]]:
+    """S/T/R (+ subdivision) Advanced Search for easements and rights-of-way.
+
+    Shared by the partial-history search and the owner-name search, and run
+    unconditionally alongside direct extraction too (see `scrape()`) — the
+    SOP treats this research as required regardless of whether Document
+    History already yielded an ALTA. Mutates `seen_receptions` in place as
+    it selects targets.
+    """
+    targets: list[tuple[str, _DocRecord]] = []
+    if not (parcel.section and parcel.township and parcel.range_):
+        logger.warning(
+            "Easement/ROW search: parcel S/T/R is incomplete (%s/%s/%s) — skipping.",
+            parcel.section,
+            parcel.township,
+            parcel.range_,
+        )
+        return targets
+
+    section = parcel.section.lstrip("0") or parcel.section
+    township = parcel.township  # _run_advanced_search strips N/S
+    range_ = parcel.range_  # and E/W respectively
+
+    rows = await _run_advanced_search(page, section=section, township=township, range_=range_)
+    # If a Subdivision is on file, repeat with Platted Legal.
+    if parcel.subdivision:
+        sub_rows = await _run_advanced_search(page, subdivision=parcel.subdivision)
+        # Deduplicate by reception across the two searches.
+        by_reception_in_results = {r["reception"]: r for r in rows}
+        for r in sub_rows:
+            by_reception_in_results.setdefault(r["reception"], r)
+        rows = list(by_reception_in_results.values())
+
+    for r in rows:
+        reception = r["reception"]
+        if not reception or reception in seen_receptions:
+            continue
+        if not _matches_easement_filter(r["doc_type"]):
+            continue
+        seen_receptions.add(reception)
+        # Synthesize a _DocRecord pointing at the integration URL so the
+        # existing downloader can fetch it via #printCustom.
+        targets.append(
+            (
+                "easement_or_row",
+                _DocRecord(
+                    reception=reception,
+                    rec_date=r["rec_date"],
+                    doc_type=r["doc_type"],
+                    grantor="",
+                    grantee="",
+                    url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
+                ),
+            )
+        )
+    return targets
+
+
+async def _section_township_range_search(
+    page,
+    parcel: ParcelInfo,
+    seen_receptions: set[str],
+) -> list[tuple[str, _DocRecord]]:
+    """S/T/R Advanced Search for every other document recorded against this
+    parcel's section — not just easements/ROW (see `_easement_row_search`).
+
+    Run unconditionally alongside every research route (see `scrape()`), per
+    the SOP: a surveyor wants to know about anything else recorded in this
+    section, not only what the property's own Document History or ALTA
+    happened to cite. Mutates `seen_receptions` in place.
+    """
+    targets: list[tuple[str, _DocRecord]] = []
+    if not (parcel.section and parcel.township and parcel.range_):
+        logger.warning(
+            "Section/Township/Range search: parcel S/T/R is incomplete (%s/%s/%s) — skipping.",
+            parcel.section,
+            parcel.township,
+            parcel.range_,
+        )
+        return targets
+
+    section = parcel.section.lstrip("0") or parcel.section
+    rows = await _run_advanced_search(
+        page, section=section, township=parcel.township, range_=parcel.range_
+    )
+
+    for r in rows:
+        reception = r["reception"]
+        if not reception or reception in seen_receptions:
+            continue
+        seen_receptions.add(reception)
+        targets.append(
+            (
+                "section_township_range_search",
+                _DocRecord(
+                    reception=reception,
+                    rec_date=r["rec_date"],
+                    doc_type=r["doc_type"],
+                    grantor="",
+                    grantee="",
+                    url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
+                ),
+            )
+        )
+    return targets
+
+
+def _select_direct_extraction_targets(
     decision: dict, all_docs: list[_DocRecord]
 ) -> list[tuple[str, _DocRecord]]:
-    """SOP Phase 3A — pick the documents to download given a "direct" routing.
+    """Pick the documents to download for the direct-extraction route.
 
     Returns role-tagged docs in download order:
-      - ("alta", most_recent_survey)        (Step 3A.1–3A.3)
-      - ("vesting_deed", most_recent_deed)  (Step 3A.4)
+      - ("alta", most_recent_survey)
+      - ("vesting_deed", most_recent_deed)
 
-    Schedule B-2 exception references (Step 3A.5) are handled separately by
-    `_select_phase_3a_exception_targets`, once the ALTA is on disk and has been
+    Schedule B-2 exception references are handled separately by
+    `_select_schedule_b2_exception_targets`, once the ALTA is on disk and has been
     read for the IDs it cites — see `id_extraction.py`.
     """
     targets: list[tuple[str, _DocRecord]] = []
@@ -1302,22 +1494,23 @@ def _select_phase_3a_targets(
     return targets
 
 
-def _select_phase_3a_exception_targets(
+def _select_schedule_b2_exception_targets(
     extraction: IdExtraction, known_receptions: set[str]
 ) -> list[tuple[str, _DocRecord]]:
-    """SOP Step 3A.5 — turn the ALTA's referenced IDs into download targets.
+    """Turn one document's Schedule B-2-style referenced IDs into download targets.
 
     Only reception numbers become targets: the recorder's integration URL takes
-    a document number and nothing else, so the other formats an ALTA cites
+    a document number and nothing else, so the other formats a document cites
     (book/page, ordinance numbers) are recorded in overview.json's
     `extracted_ids` for the surveyor but can't be auto-fetched today.
 
-    `known_receptions` excludes documents already targeted this run (the ALTA
-    and vesting deed themselves) so they aren't re-downloaded under the
-    "exception" role if the survey happens to cite its own reception number.
+    `known_receptions` excludes documents already downloaded or queued this run
+    so they aren't re-fetched under the "exception" role if a document happens
+    to cite its own reception number, or one another document already found.
 
     Under `APPLICATION_MODE=demo` only the first `_DEMO_EXCEPTION_LIMIT` targets
-    are returned — an ALTA can cite ~90 documents, which is a ~30 minute run.
+    are returned — a single ALTA can cite ~90 documents on its own, which is a
+    ~30 minute run.
     """
     targets: list[tuple[str, _DocRecord]] = []
     seen = set(known_receptions)
@@ -1347,14 +1540,104 @@ def _select_phase_3a_exception_targets(
     return targets
 
 
-async def _select_phase_3b_targets(
+# Safety backstop for the cross-reference walk below. Real recorder data is a
+# finite graph and `extracted`/`known_receptions` already stop a document from
+# being read or fetched twice, so this only guards the pathological case (a
+# large agricultural owner's paper trail) from turning into an unbounded
+# number of Bedrock calls and downloads on one property.
+_MAX_CROSS_REFERENCE_DOCS = 150
+
+
+async def _expand_cross_references(
+    address: str,
+    doc_filter: DocumentFilter,
+    dest: Path,
+    ov,
+    initial_results: list[tuple[str, _DocRecord, list[Path]]],
+    known_receptions: set[str],
+    username: str,
+    password: str,
+) -> tuple[list[tuple[str, _DocRecord, list[Path]]], int, int]:
+    """Read every downloaded document for the other documents it cites, fetch
+    those too, and repeat until nothing new turns up.
+
+    Every document a surveyor pulls — not just the ALTA — can cite exhibits,
+    prior deeds, or "excepting" clauses that point at documents outside this
+    parcel's own Document History. `known_receptions` (mutated in place) is
+    the whole run's set of receptions already downloaded or queued, so
+    nothing is fetched twice; a separate `extracted` set tracks which
+    documents have already been read for citations, so a document two other
+    documents both cite only goes through `extract_document_ids()` (and its
+    Bedrock fallback) once. `extract_document_ids()` already tries the free
+    text-layer path before Bedrock, so this only pays for a vision call on
+    the documents that are actually scanned images.
+
+    `extracted_ids` is written to `ov` once per document processed, as a
+    single flat list (the shape the frontend already renders as a table) —
+    cheap because nothing is duplicated per property, and a crash mid-walk
+    still leaves everything found so far on disk.
+    """
+    extracted: set[str] = set()
+    extracted_ids: list[dict] = []
+    new_results: list[tuple[str, _DocRecord, list[Path]]] = []
+    queue: list[tuple[str, _DocRecord, list[Path]]] = list(initial_results)
+    discovered = 0
+    in_tok = out_tok = 0
+
+    while queue:
+        role, doc, paths = queue.pop(0)
+        if not paths or doc.reception in extracted:
+            continue
+        extracted.add(doc.reception)
+
+        # Only the first saved file: a document that came down as separate
+        # per-page images (rather than one merged PDF) only gets its first
+        # page read — the same simplification the ALTA-only walk made before.
+        extraction = extract_document_ids(paths[0])
+        in_tok += extraction.input_tokens
+        out_tok += extraction.output_tokens
+        if extraction.ids:
+            extracted_ids.extend(
+                {**row, "source_reception": doc.reception, "source_doc_type": doc.doc_type}
+                for row in extraction.to_metadata()
+            )
+            ov.set_section("extracted_ids", extracted_ids)
+
+        if discovered >= _MAX_CROSS_REFERENCE_DOCS:
+            continue  # keep draining the queue for extraction, just stop fetching more
+
+        new_targets = _select_schedule_b2_exception_targets(extraction, known_receptions)
+        if not new_targets:
+            continue
+        if discovered + len(new_targets) > _MAX_CROSS_REFERENCE_DOCS:
+            new_targets = new_targets[: _MAX_CROSS_REFERENCE_DOCS - discovered]
+            narration.info("Reached the cross-reference safety limit — stopping further lookups.")
+        discovered += len(new_targets)
+        known_receptions.update(target_doc.reception for _, target_doc in new_targets)
+
+        narration.info(
+            f"{doc.doc_type or 'A downloaded document'} references "
+            f"{len(new_targets)} other recorded document(s) — downloading them now..."
+        )
+        downloaded, _dl_cost, dl_in, dl_out = await _download_documents(
+            address, new_targets, doc_filter, dest, username=username, password=password
+        )
+        in_tok += dl_in
+        out_tok += dl_out
+        new_results.extend(downloaded)
+        queue.extend(downloaded)
+
+    return new_results, in_tok, out_tok
+
+
+async def _select_partial_history_targets(
     decision: dict,
     all_docs: list[_DocRecord],
     parcel: ParcelInfo,
     username: str = "",
     password: str = "",
 ) -> list[tuple[str, _DocRecord]]:
-    """SOP Phase 3B — pick targets for the partial-history research path.
+    """Pick targets for the partial-history route (decision path "alternate_partial").
 
     Returns role-tagged docs in download order:
       - ("vesting_deed", most_recent_vesting)   if a vesting deed is present
@@ -1363,132 +1646,181 @@ async def _select_phase_3b_targets(
                                                 (and subdivision if known)
 
     Requires authenticated session to drive the Advanced Search UI — caller
-    must supply credentials. SOP Step 3B.3 (Exhibit A cross-reference harvest)
-    is not implemented: Tyler PDFs are scanned images, so extracting cited
-    receptions would require OCR or a vision LLM. Without it we miss
-    "Excluding portions conveyed in Deed recorded ..." references that aren't
-    already discoverable via S/T/R Advanced Search.
+    must supply credentials. Cross-reference harvesting from a vesting deed's
+    legal description (the "Excluding portions conveyed in Deed recorded ..."
+    clauses that cite prior receptions) is not implemented: Tyler PDFs are
+    scanned images, so extracting cited receptions would require OCR or a
+    vision LLM. Without it we miss references that aren't already
+    discoverable via S/T/R Advanced Search.
     """
-    import os
-
-    from playwright.async_api import async_playwright
-
     targets: list[tuple[str, _DocRecord]] = []
     by_reception = {d.reception: d for d in all_docs}
 
-    # Step 3B.2 — most-recent vesting deed (if present in Document History).
+    # Most-recent vesting deed (if present in Document History).
     deed_dict = decision.get("most_recent_vesting_deed")
     if deed_dict and deed_dict.get("reception") in by_reception:
         targets.append(("vesting_deed", by_reception[deed_dict["reception"]]))
 
+    seen_receptions = {d.reception for d in all_docs}
+    async with _recorder_search_session(username, password) as page:
+        if page is None:
+            return targets
+        targets += await _easement_row_search(page, parcel, seen_receptions)
+
+    logger.info(
+        "Partial history search: selected %d target(s) (%d vesting, %d easements/ROW)",
+        len(targets),
+        sum(1 for role, _ in targets if role == "vesting_deed"),
+        sum(1 for role, _ in targets if role == "easement_or_row"),
+    )
+    return targets
+
+
+# ---------------------------------------------------------------------------
+# Owner-Name Search — owner + S/T/R driven exemption/easement/ALTA packet
+# (decision path "alternate_empty": Document History is empty)
+# ---------------------------------------------------------------------------
+
+_VESTING_DEED_LABELS = {
+    "WARRANTY DEED",
+    "SPECIAL WARRANTY DEED",
+    "QUIT CLAIM DEED",
+    "GENERAL WARRANTY DEED",
+}
+
+# Document Types filter list for the subdivision-exemption search.
+_EXEMPTION_DOC_TYPES = {
+    "SUBDIVISION EXEMPTION",
+    "EXEMPTION",
+    "MINOR SUBDIVISION",
+    "AMENDED EXEMPTION",
+}
+
+
+def _matches_vesting_deed_label(doc_type_label: str) -> bool:
+    return doc_type_label.upper().strip() in _VESTING_DEED_LABELS
+
+
+def _matches_exemption_filter(doc_type_label: str) -> bool:
+    upper = doc_type_label.upper().strip()
+    return upper in _EXEMPTION_DOC_TYPES or "EXEMPTION" in upper
+
+
+def _matches_survey_filter(doc_type_label: str) -> bool:
+    upper = doc_type_label.upper().strip()
+    return "SURVEY" in upper or "ALTA" in upper
+
+
+def _row_to_record(row: dict) -> _DocRecord:
+    reception = row["reception"]
+    return _DocRecord(
+        reception=reception,
+        rec_date=row["rec_date"],
+        doc_type=row["doc_type"],
+        grantor="",
+        grantee="",
+        url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
+    )
+
+
+async def _select_owner_name_search_targets(
+    page,
+    parcel: ParcelInfo,
+) -> list[tuple[str, _DocRecord]]:
+    """Pick targets for the owner-name route (decision path "alternate_empty").
+
+    Document History is empty for this parcel, so everything is driven off
+    Advanced Search using the owner's name and the parcel's
+    Section/Township/Range instead. `page` must come from an
+    already-authenticated `_recorder_search_session`.
+
+    Returns role-tagged docs in download order:
+      - ("vesting_deed", row)          most recent deed found via owner search
+      - ("affidavit", row)             AFFIDAVIT rows from the owner search —
+                                        the SOP flags these as typical Exhibit
+                                        A carriers for a large owner's
+                                        contiguous parcels
+      - ("subdivision_exemption", row) each SUBDIVISION EXEMPTION-family hit
+      - ("easement_or_row", row)       same S/T/R easement/ROW scan the
+                                        partial-history route uses
+      - ("alta", row)                  a SURVEY/ALTA hit, if the S/T/R search
+                                        turns one up that Document History missed
+
+    Harvesting extra Section/Township/Range values from a quit-claim deed's
+    Exhibit A is not implemented, for the same reason the partial-history
+    route skips Exhibit A cross-references: Tyler PDFs are scanned images
+    with no text layer. The search universe falls back to the parcel's own
+    Identify Results S/T/R instead.
+    """
+    targets: list[tuple[str, _DocRecord]] = []
+    seen: set[str] = set()
+
+    # Owner-name search ("Search Name as Grantor or Grantee").
+    if parcel.owner:
+        owner_rows = await _run_advanced_search(page, search_name=parcel.owner)
+        vesting_candidates = [r for r in owner_rows if _matches_vesting_deed_label(r["doc_type"])]
+        if vesting_candidates:
+            most_recent = max(vesting_candidates, key=lambda r: _date_sort_key(r["rec_date"]))
+            if most_recent["reception"]:
+                seen.add(most_recent["reception"])
+                targets.append(("vesting_deed", _row_to_record(most_recent)))
+        for row in owner_rows:
+            reception = row["reception"]
+            if reception and reception not in seen and "AFFIDAVIT" in row["doc_type"].upper():
+                seen.add(reception)
+                targets.append(("affidavit", _row_to_record(row)))
+    else:
+        logger.warning("Owner-name search: no owner name on record — skipping.")
+
     if not (parcel.section and parcel.township and parcel.range_):
         logger.warning(
-            "Phase 3B: parcel S/T/R is incomplete (%s/%s/%s) — skipping Advanced Search.",
+            "Owner-name search: parcel S/T/R is incomplete (%s/%s/%s) — skipping "
+            "exemption/easement/ALTA searches.",
             parcel.section,
             parcel.township,
             parcel.range_,
         )
         return targets
 
-    if not (username and password):
-        logger.warning(
-            "Phase 3B: WELD_RECORDER_USERNAME/PASSWORD not set — "
-            "Advanced Search needs authenticated session. Skipping easement scan."
-        )
-        return targets
+    section = parcel.section.lstrip("0") or parcel.section
+    township = parcel.township
+    range_ = parcel.range_
 
-    headed = os.environ.get("WELD_HEADED", "").lower() in ("1", "true", "yes")
-    seen_receptions: set[str] = {r for r, _ in [(d.reception, d) for d in all_docs]}
+    # Subdivision Exemption search.
+    exemption_rows = await _run_advanced_search(
+        page, section=section, township=township, range_=range_
+    )
+    for row in exemption_rows:
+        reception = row["reception"]
+        if reception and reception not in seen and _matches_exemption_filter(row["doc_type"]):
+            seen.add(reception)
+            targets.append(("subdivision_exemption", _row_to_record(row)))
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=not headed,
-            args=["--disable-blink-features=AutomationControlled"],
-            slow_mo=400 if headed else 0,
-        )
-        ctx = await browser.new_context(user_agent=_HTTP_HEADERS["User-Agent"])
-        await ctx.add_cookies(
-            [
-                {
-                    "name": "disclaimerAccepted",
-                    "value": "true",
-                    "domain": "recording.weld.gov",
-                    "path": "/",
-                }
-            ]
-        )
-        # Authenticate (Advanced Search returns no rows for anonymous sessions).
-        try:
-            resp = await ctx.request.post(
-                _RECORDER_LOGIN_URL,
-                form={"field_UserId": username, "field_Password": password},
-                headers={"X-Requested-With": "XMLHttpRequest"},
-            )
-            import json as _json
+    # Easement / ROW scan, same as the partial-history route.
+    targets += await _easement_row_search(page, parcel, seen)
 
-            payload = _json.loads(await resp.text())
-            if not payload.get("success"):
-                logger.error(
-                    "Phase 3B login failed: %s",
-                    payload.get("message", "(no msg)"),
-                )
-                await browser.close()
-                return targets
-        except Exception as exc:
-            logger.warning("Phase 3B login error: %s", exc)
-            await browser.close()
-            return targets
-
-        page = await ctx.new_page()
-        try:
-            # Step 3B.5 — S/T/R Advanced Search (numeric township + range).
-            section = parcel.section.lstrip("0") or parcel.section
-            township = parcel.township  # _run_advanced_search strips N/S
-            range_ = parcel.range_  # and E/W respectively
-            rows = await _run_advanced_search(
-                page,
-                section=section,
-                township=township,
-                range_=range_,
-            )
-            # Step 3B.7 — if a Subdivision is on file, repeat with Platted Legal.
-            if parcel.subdivision:
-                sub_rows = await _run_advanced_search(
-                    page,
-                    subdivision=parcel.subdivision,
-                )
-                # Deduplicate by reception across the two searches.
-                by_reception_in_results = {r["reception"]: r for r in rows}
-                for r in sub_rows:
-                    by_reception_in_results.setdefault(r["reception"], r)
-                rows = list(by_reception_in_results.values())
-
-            for r in rows:
-                reception = r["reception"]
-                if not reception or reception in seen_receptions:
-                    continue
-                if not _matches_easement_filter(r["doc_type"]):
-                    continue
-                seen_receptions.add(reception)
-                # Synthesize a _DocRecord pointing at the integration URL so
-                # the existing downloader can fetch it via #printCustom.
-                rec = _DocRecord(
-                    reception=reception,
-                    rec_date=r["rec_date"],
-                    doc_type=r["doc_type"],
-                    grantor="",
-                    grantee="",
-                    url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
-                )
-                targets.append(("easement_or_row", rec))
-        finally:
-            await browser.close()
+    # Last-ditch ALTA/survey search over the same S/T/R.
+    survey_rows = await _run_advanced_search(
+        page, section=section, township=township, range_=range_
+    )
+    alta_hit = next(
+        (
+            r
+            for r in survey_rows
+            if r["reception"] not in seen and _matches_survey_filter(r["doc_type"])
+        ),
+        None,
+    )
+    if alta_hit:
+        seen.add(alta_hit["reception"])
+        targets.append(("alta", _row_to_record(alta_hit)))
+    else:
+        narration.info("No recorded ALTA was found — the exemption packet is the survey of record.")
 
     logger.info(
-        "Phase 3B: selected %d target(s) (%d vesting, %d easements/ROW)",
+        "Owner-name search: selected %d target(s) (%s)",
         len(targets),
-        sum(1 for role, _ in targets if role == "vesting_deed"),
-        sum(1 for role, _ in targets if role == "easement_or_row"),
+        ", ".join(f"{role}={doc.reception}" for role, doc in targets) or "none",
     )
     return targets
 
@@ -1522,11 +1854,11 @@ async def _resolve_parcel(
     elif owner_input:
         query, query_type = owner_input, "owner"
     else:
-        logger.warning("Phase 1: no usable input (address, account, S/T/R, or owner)")
+        logger.warning("Parcel resolve: no usable input (address, account, S/T/R, or owner)")
         return None
 
     logger.info(
-        "Phase 1: routing %s lookup via %s path",
+        "Parcel resolve: routing %s lookup via %s path",
         query_type,
         "browser (SOP-strict)" if sop_strict else "HTTP",
     )
@@ -1540,7 +1872,7 @@ async def _resolve_parcel(
         )
     if query_type == "str":
         logger.warning(
-            "Phase 1: S/T/R input %r — HTTP path does not support STR queries. "
+            "Parcel resolve: S/T/R input %r — HTTP path does not support STR queries. "
             "Use --sop-strict for browser-walk STR lookup.",
             str_input,
         )
@@ -1552,7 +1884,7 @@ def _log_identify_results(info: ParcelInfo) -> None:
     """Log the Identify Results panel state per SOP Step 1.5."""
     str_ = info.section_township_range() or "(unknown)"
     logger.info(
-        "Phase 1 complete — Identify Results [%s]: "
+        "Parcel resolve complete — Identify Results [%s]: "
         "Owner=%r  Account=%s  Parcel=%s  Address=%r  Subdivision=%r  S-T-R=%s",
         info.source,
         info.owner,
@@ -1594,7 +1926,13 @@ async def scrape(
     )
     if not parcel:
         narration.info("We couldn't find this property in the Weld County system.")
-        return [], (f"Phase 1 failed: could not resolve {address} to a Weld parcel."), 0.0, 0, 0
+        return (
+            [],
+            (f"Parcel resolve failed: could not resolve {address} to a Weld parcel."),
+            0.0,
+            0,
+            0,
+        )
     _log_identify_results(parcel)
     if parcel.owner:
         narration.info(f"Found the property — account {parcel.account}, owned by {parcel.owner}.")
@@ -1656,7 +1994,7 @@ async def scrape(
 
     # --- SOP Step 1.7: Document History capture (the "Decision Frame") ---
     # Parse the document history table directly from the property report HTML.
-    # An empty result is valid — per the SOP it would route to Path 3C in Phase 2.
+    # An empty result is valid — per the SOP it routes to the owner-name search.
     all_docs = _fetch_document_history(account)
     ov.set_section("document_history", [d.to_dict() for d in all_docs])
     narration.info(f"Found {len(all_docs)} recorded document(s) on file for this property.")
@@ -1667,29 +2005,29 @@ async def scrape(
     ov.set_section("decision_matrix", decision)
     ov.merge_section("meta", {"sop_path": decision["path"]})
     logger.info(
-        "Phase 2 (Decision Matrix): Path %s — %s",
+        "Decision Matrix: route %s — %s",
         decision["path"],
         decision["reasoning"][0],
     )
 
     # --- Phase 3: route by Decision Matrix outcome ---
     s = get_settings()
-    phase_section: str
+    route_section: str
     if decision["path"] == "direct":
         narration.info("The survey and deed are on file — downloading them now...")
-        targets = _select_phase_3a_targets(decision, all_docs)
-        phase_section = "phase_3a"
+        targets = _select_direct_extraction_targets(decision, all_docs)
+        route_section = "direct_extraction"
         if not targets:
             narration.info("Couldn't find a survey or deed to download for this property.")
             return (
                 [],
-                (f"Phase 3A target selection found no SURV or vesting deed for {account}."),
+                (f"Direct extraction found no SURV or vesting deed for {account}."),
                 0.0,
                 0,
                 0,
             )
         logger.info(
-            "Phase 3A targets: %s",
+            "Direct extraction targets: %s",
             ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
         )
     elif decision["path"] == "alternate_partial":
@@ -1697,29 +2035,53 @@ async def scrape(
             "The main documents aren't directly on file — checking the Clerk & "
             "Recorder's office for related records..."
         )
-        targets = await _select_phase_3b_targets(
+        targets = await _select_partial_history_targets(
             decision,
             all_docs,
             parcel,
             username=s.weld_recorder_username,
             password=s.weld_recorder_password,
         )
-        phase_section = "phase_3b"
+        route_section = "partial_history_search"
         if not targets:
             logger.info(
-                "Phase 3B produced no download targets — stopping. Overview at %s",
+                "Partial history search produced no download targets — stopping. Overview at %s",
                 ov.path,
             )
             narration.info("No downloadable documents were found for this property.")
-            ov.set_section(phase_section, {"targets": [], "results": []})
+            ov.set_section(route_section, {"targets": [], "results": []})
             return [], None, 0.0, 0, 0
         logger.info(
-            "Phase 3B targets: %s",
+            "Partial history search targets: %s",
+            ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
+        )
+    elif decision["path"] == "alternate_empty":
+        narration.info(
+            "No documents are on file directly for this parcel — searching by "
+            "owner name and section/township/range instead..."
+        )
+        route_section = "owner_name_search"
+        async with _recorder_search_session(
+            s.weld_recorder_username, s.weld_recorder_password
+        ) as search_page:
+            targets = (
+                await _select_owner_name_search_targets(search_page, parcel) if search_page else []
+            )
+        if not targets:
+            logger.info(
+                "Owner-name search produced no download targets — stopping. Overview at %s",
+                ov.path,
+            )
+            narration.info("No downloadable documents were found for this property.")
+            ov.set_section(route_section, {"targets": [], "results": []})
+            return [], None, 0.0, 0, 0
+        logger.info(
+            "Owner-name search targets: %s",
             ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
         )
     else:
         logger.info(
-            "Phase 3 path %r is not yet implemented — stopping. Overview at %s",
+            "Decision Matrix route %r is not handled — stopping. Overview at %s",
             decision["path"],
             ov.path,
         )
@@ -1727,7 +2089,7 @@ async def scrape(
         return [], None, 0.0, 0, 0
 
     ov.set_section(
-        phase_section,
+        route_section,
         {
             "targets": [
                 {"role": role, "reception": doc.reception, "doc_type": doc.doc_type, "url": doc.url}
@@ -1746,59 +2108,164 @@ async def scrape(
         password=s.weld_recorder_password,
     )
 
-    # --- SOP Step 3A.5: read the downloaded ALTA for referenced exception/
-    # easement documents, then fetch those too. ---
-    if phase_section == "phase_3a":
-        alta_path = next(
-            (paths[0] for role, doc, paths in results if role == "alta" and paths), None
+    # --- The S/T/R easement/ROW scan also runs after direct extraction. ---
+    if route_section == "direct_extraction":
+        # Also run the S/T/R easement/ROW scan — per the SOP this research is
+        # required regardless of whether direct extraction already found the
+        # ALTA (its Schedule B-2 only lists what its surveyor happened to
+        # cite, not necessarily everything else recorded against the section).
+        narration.info(
+            "Also checking the Clerk & Recorder for easements and rights-of-way "
+            "recorded against this parcel's section..."
         )
-        if alta_path:
-            narration.info("Reading the ALTA survey for referenced easements and exceptions...")
-            extraction = extract_document_ids(alta_path)
-            in_tok += extraction.input_tokens
-            out_tok += extraction.output_tokens
-            ov.set_section("extracted_ids", extraction.to_metadata())
-
-            known_receptions = {doc.reception for _, doc in targets}
-            exception_targets = _select_phase_3a_exception_targets(extraction, known_receptions)
-            logger.info(
-                "Step 3A.5: %d id(s) from %s via %s; %d new reception(s) to fetch",
-                len(extraction.ids),
-                alta_path.name,
-                extraction.source,
-                len(exception_targets),
+        known_receptions = {doc.reception for _, doc in targets}
+        async with _recorder_search_session(
+            s.weld_recorder_username, s.weld_recorder_password
+        ) as search_page:
+            supplemental = (
+                await _easement_row_search(search_page, parcel, known_receptions)
+                if search_page
+                else []
             )
-            if exception_targets:
-                narration.info(
-                    f"The survey references {len(exception_targets)} other recorded "
-                    "document(s) — downloading them now..."
-                )
-                ex_results, _ex_cost, ex_in_tok2, ex_out_tok2 = await _download_documents(
-                    address,
-                    exception_targets,
-                    doc_filter,
-                    dest,
-                    username=s.weld_recorder_username,
-                    password=s.weld_recorder_password,
-                )
-                in_tok += ex_in_tok2
-                out_tok += ex_out_tok2
-                targets = targets + exception_targets
-                results = results + ex_results
-                ov.merge_section(
-                    phase_section,
+        if supplemental:
+            narration.info(f"Found {len(supplemental)} additional easement/ROW document(s).")
+            sup_results, _sup_cost, sup_in_tok, sup_out_tok = await _download_documents(
+                address,
+                supplemental,
+                doc_filter,
+                dest,
+                username=s.weld_recorder_username,
+                password=s.weld_recorder_password,
+            )
+            in_tok += sup_in_tok
+            out_tok += sup_out_tok
+            targets = targets + supplemental
+            results = results + sup_results
+            ov.set_section(
+                "easement_and_row_search",
+                {
+                    "targets": [
+                        {
+                            "role": role,
+                            "reception": doc.reception,
+                            "doc_type": doc.doc_type,
+                            "url": doc.url,
+                        }
+                        for role, doc in supplemental
+                    ],
+                    "results": [
+                        {
+                            "role": role,
+                            "reception": doc.reception,
+                            "doc_type": doc.doc_type,
+                            "status": "downloaded" if paths else "failed",
+                            "files": [str(p) for p in paths],
+                        }
+                        for role, doc, paths in sup_results
+                    ],
+                },
+            )
+
+    # --- Read every document downloaded so far for the other documents it
+    # cites — not just the ALTA — and fetch those too, recursively. ---
+    narration.info(
+        "Checking each downloaded document for references to other recorded documents..."
+    )
+    known_receptions = {doc.reception for _, doc in targets}
+    cross_ref_results, cr_in_tok, cr_out_tok = await _expand_cross_references(
+        address,
+        doc_filter,
+        dest,
+        ov,
+        results,
+        known_receptions,
+        username=s.weld_recorder_username,
+        password=s.weld_recorder_password,
+    )
+    in_tok += cr_in_tok
+    out_tok += cr_out_tok
+    if cross_ref_results:
+        results = results + cross_ref_results
+        targets = targets + [(role, doc) for role, doc, _ in cross_ref_results]
+        ov.set_section(
+            "cross_references",
+            {
+                "targets": [
                     {
-                        "targets": [
-                            {
-                                "role": role,
-                                "reception": doc.reception,
-                                "doc_type": doc.doc_type,
-                                "url": doc.url,
-                            }
-                            for role, doc in targets
-                        ]
-                    },
-                )
+                        "role": role,
+                        "reception": doc.reception,
+                        "doc_type": doc.doc_type,
+                        "url": doc.url,
+                    }
+                    for role, doc, _ in cross_ref_results
+                ],
+                "results": [
+                    {
+                        "role": role,
+                        "reception": doc.reception,
+                        "doc_type": doc.doc_type,
+                        "status": "downloaded" if paths else "failed",
+                        "files": [str(p) for p in paths],
+                    }
+                    for role, doc, paths in cross_ref_results
+                ],
+            },
+        )
+
+    # --- Search recording.weld.gov's Advanced Search for every other
+    # document recorded against this parcel's section, and download those
+    # too — a surveyor wants to know about anything else recorded here, not
+    # just what this property's own history happened to cite. ---
+    narration.info(
+        "Searching the Clerk & Recorder for other documents recorded in this "
+        "property's section..."
+    )
+    async with _recorder_search_session(
+        s.weld_recorder_username, s.weld_recorder_password
+    ) as search_page:
+        str_targets = (
+            await _section_township_range_search(search_page, parcel, known_receptions)
+            if search_page
+            else []
+        )
+    if str_targets:
+        narration.info(f"Found {len(str_targets)} additional document(s) in this section.")
+        str_results, _str_cost, str_in_tok, str_out_tok = await _download_documents(
+            address,
+            str_targets,
+            doc_filter,
+            dest,
+            username=s.weld_recorder_username,
+            password=s.weld_recorder_password,
+        )
+        in_tok += str_in_tok
+        out_tok += str_out_tok
+        targets = targets + str_targets
+        results = results + str_results
+        ov.set_section(
+            "section_township_range_search",
+            {
+                "targets": [
+                    {
+                        "role": role,
+                        "reception": doc.reception,
+                        "doc_type": doc.doc_type,
+                        "url": doc.url,
+                    }
+                    for role, doc in str_targets
+                ],
+                "results": [
+                    {
+                        "role": role,
+                        "reception": doc.reception,
+                        "doc_type": doc.doc_type,
+                        "status": "downloaded" if paths else "failed",
+                        "files": [str(p) for p in paths],
+                    }
+                    for role, doc, paths in str_results
+                ],
+            },
+        )
 
     # Record per-target results in overview.json. A target with zero files
     # captured is "failed"; non-zero is "downloaded".
@@ -1815,13 +2282,13 @@ async def scrape(
             }
         )
         saved_paths.extend(paths)
-    ov.merge_section(phase_section, {"results": results_section})
+    ov.merge_section(route_section, {"results": results_section})
 
     if not saved_paths:
         return (
             [],
             (
-                f"Phase 3 targeted {len(targets)} document(s) for {account} but captured none. "
+                f"Targeted {len(targets)} document(s) for {account} but captured none. "
                 f"Receptions: {', '.join(doc.reception for _, doc in targets)}. "
                 f"If you see 'must be a registered user' in logs, set WELD_RECORDER_USERNAME / "
                 f"WELD_RECORDER_PASSWORD in .env."

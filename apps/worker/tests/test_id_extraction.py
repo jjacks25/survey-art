@@ -1,4 +1,4 @@
-"""Tests for `survey_art.id_extraction` — SOP Step 3A.5 ID harvesting."""
+"""Tests for `survey_art.id_extraction` — Schedule B-2 ID harvesting."""
 
 from __future__ import annotations
 
