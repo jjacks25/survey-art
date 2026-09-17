@@ -1624,6 +1624,7 @@ async def _expand_cross_references(
                     "citations from citations."
                 )
                 hit_depth_limit = True
+                ov.set_section("limits", {"cross_reference_depth_limit": True})
             continue
 
         new_targets = _select_schedule_b2_exception_targets(extraction, known_receptions)
