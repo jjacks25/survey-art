@@ -250,10 +250,12 @@ Resources:
             Statement:
               - Effect: Allow
                 # Scan backs GET /api/jobs (jobs.list_jobs()) — the search history
-                # sidebar. Missing this 500s that endpoint with AccessDeniedException
-                # while job creation (PutItem) keeps working, which is confusing to
-                # debug from the frontend alone; check CloudWatch first next time.
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Scan]
+                # sidebar. DeleteItem backs DELETE /api/jobs/{id} once a job is
+                # terminal (jobs.delete_job()). Missing either 500s the relevant
+                # endpoint with AccessDeniedException while everything else keeps
+                # working, which is confusing to debug from the frontend alone;
+                # check CloudWatch first next time.
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Scan]
                 Resource: !GetAtt JobsTable.Arn
               - Effect: Allow
                 Action: sqs:SendMessage
