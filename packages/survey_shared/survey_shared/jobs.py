@@ -203,6 +203,8 @@ def append_log(
 
     See `LogEntry` for what `kind` means to the frontend.
     """
+    if len(message) > _MAX_LOG_MESSAGE_CHARS:
+        message = message[:_MAX_LOG_MESSAGE_CHARS] + "... [truncated]"
     try:
         _table().update_item(
             Key={"jobId": job_id},
@@ -251,6 +253,17 @@ def cancel_job(job_id: str, *, _attempts: int = 3) -> Job | None:
         job.status = CANCELLED
         return job
     return None
+
+
+def delete_job(job_id: str) -> bool:
+    """Permanently remove a job's record (status, logs, metadata) from the jobs
+    table. Leaves S3 untouched — the property's documents/log archive/map
+    screenshot age out on their own lifecycle rules (see `upload_documents()`
+    etc.) and are shared across repeated searches for the same property, so
+    deleting one job's history entry shouldn't reach into them. Returns
+    whether a record actually existed to delete."""
+    resp = _table().delete_item(Key={"jobId": job_id}, ReturnValues="ALL_OLD")
+    return "Attributes" in resp
 
 
 DOCUMENTS_PREFIX = "documents"

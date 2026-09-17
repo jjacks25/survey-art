@@ -81,6 +81,13 @@ export class ApiClient {
     return this.request<void>(`/api/jobs/${jobId}`, { method: "DELETE" });
   }
 
+  /** Same endpoint as cancelJob — the API cancels a running job or deletes its
+   * record outright depending on whether it's still non-terminal. Kept as a
+   * separate name so call sites (Cancel vs. Delete buttons) read clearly. */
+  deleteJob(jobId: string) {
+    return this.request<void>(`/api/jobs/${jobId}`, { method: "DELETE" });
+  }
+
   /** Upload a KMZ for account/parcel extraction. No Content-Type header —
    * the browser sets the multipart boundary itself when given a FormData body. */
   async identifyKmz(file: File) {
