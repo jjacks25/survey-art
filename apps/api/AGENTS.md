@@ -4,6 +4,11 @@ A thin, stateless HTTP API (`survey-api` package). It accepts an address, record
 job in DynamoDB, and enqueues it on SQS for the Fargate worker. It **never** runs the
 scraper or a browser, so it stays small and fits scale-to-zero Lambda.
 
+> Adding or changing any `aws.client(...)` call here? `ApiFunctionRole`'s IAM policy in
+> `infra/cloudformation/backend.yaml` must list the exact action, or it 500s in prod
+> only — LocalStack doesn't enforce IAM. See "IAM check" in
+> [`infra/AGENTS.md`](../../infra/AGENTS.md).
+
 ## Runtime
 
 - Packaged as a **Lambda container image** with the **AWS Lambda Web Adapter**, so the

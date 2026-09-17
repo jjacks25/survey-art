@@ -3,6 +3,32 @@
 CloudFormation IaC and the boto3 deploy harness for the AWS deployment. See
 [`docs/architecture.md`](../docs/architecture.md) for the full picture.
 
+## IAM check: do this before/with every AWS API call you add or change
+
+Every `aws.client(...)`/boto3 call the API Lambda, dispatcher Lambda, or worker task
+makes has to be matched by an explicit `Action` in its role's policy here — nothing is
+implicitly allowed. This has already bitten the project twice (worker's `ecs:StopTask`
+missing, then `ApiFunctionRole` missing `dynamodb:DeleteItem` for `DELETE
+/api/jobs/{id}` — see the "Job cancellation" and `DeleteItem` bullets below), both times
+shipping as a silent 500/AccessDeniedException in prod that local dev never caught
+(LocalStack doesn't enforce IAM).
+
+So: whenever you add or change a call to `aws.client("<service>").<operation>(...)`
+anywhere in `apps/api`, `apps/dispatcher`, `apps/worker`, or `packages/survey_shared`,
+before calling the change done —
+
+1. Grep this file (`infra/cloudformation/backend.yaml`) for the relevant role
+   (`ApiFunctionRole`, `DispatcherFunctionRole`, `TaskRole`) and confirm the exact
+   action you're calling is already listed. `dynamodb:UpdateItem` does **not** cover
+   `DeleteItem`/`Scan`/`Query` — list every action you actually call, not just "enough".
+2. If it's missing, add it to that role's policy statement in the same change, with a
+   one-line comment (see the existing `Scan`/`DeleteItem` comment) saying which
+   endpoint/code path needs it.
+3. Local dev (LocalStack) does **not** enforce IAM, so `make test`/`make up` passing is
+   *no signal* that permissions are correct — this class of bug only surfaces against
+   real AWS. If you can't verify directly, say so explicitly rather than reporting the
+   change as done; don't rely on tests as proof.
+
 ## Two-tier deploy model
 
 Deploys are **change-set driven** and run through a single Python + boto3 tool,
