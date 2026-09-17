@@ -34,6 +34,11 @@ class JobResponse(BaseModel):
     metadata: dict | None = None
     location: dict | None = None
     docPrefix: str | None = None
+    bedrockCostUsd: float | None = None
+    bedrockInputTokens: int | None = None
+    bedrockOutputTokens: int | None = None
+    fargateCostUsd: float | None = None
+    fargateSeconds: float | None = None
 
 
 class JobSummary(BaseModel):

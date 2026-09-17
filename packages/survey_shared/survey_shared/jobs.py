@@ -12,6 +12,7 @@ import json
 import logging
 import mimetypes
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -80,6 +81,15 @@ class Job(BaseModel):
     metadata_key: str | None = Field(default=None, alias="metadataKey")
     location: dict | None = None
     doc_prefix: str | None = Field(default=None, alias="docPrefix")
+    # Estimated cost breakdown for this run (see worker.py:run_job) — Bedrock is a real
+    # dollar figure from browser-use's usage accounting; Fargate is estimated from wall
+    # clock time against the task definition's known vCPU/memory and a flat on-demand
+    # rate (no AWS Cost Explorer integration — that lags 24-48h and can't back a live UI).
+    bedrock_cost_usd: float | None = Field(default=None, alias="bedrockCostUsd")
+    bedrock_input_tokens: int | None = Field(default=None, alias="bedrockInputTokens")
+    bedrock_output_tokens: int | None = Field(default=None, alias="bedrockOutputTokens")
+    fargate_cost_usd: float | None = Field(default=None, alias="fargateCostUsd")
+    fargate_seconds: float | None = Field(default=None, alias="fargateSeconds")
 
     @field_validator("logs", mode="before")
     @classmethod
@@ -150,6 +160,11 @@ def update_status(
     metadata: dict | None = None,
     location: dict | None = None,
     doc_prefix: str | None = None,
+    bedrock_cost_usd: float | None = None,
+    bedrock_input_tokens: int | None = None,
+    bedrock_output_tokens: int | None = None,
+    fargate_cost_usd: float | None = None,
+    fargate_seconds: float | None = None,
 ) -> None:
     """Set status, unless the job was already cancelled — a cancel wins over a
     worker that finishes (or fails) after the user gave up on it."""
@@ -173,6 +188,21 @@ def update_status(
     if doc_prefix is not None:
         expr.append("docPrefix = :dp")
         values[":dp"] = doc_prefix
+    if bedrock_cost_usd is not None:
+        expr.append("bedrockCostUsd = :bcu")
+        values[":bcu"] = Decimal(str(bedrock_cost_usd))
+    if bedrock_input_tokens is not None:
+        expr.append("bedrockInputTokens = :bit")
+        values[":bit"] = bedrock_input_tokens
+    if bedrock_output_tokens is not None:
+        expr.append("bedrockOutputTokens = :bot")
+        values[":bot"] = bedrock_output_tokens
+    if fargate_cost_usd is not None:
+        expr.append("fargateCostUsd = :fcu")
+        values[":fcu"] = Decimal(str(fargate_cost_usd))
+    if fargate_seconds is not None:
+        expr.append("fargateSeconds = :fs")
+        values[":fs"] = Decimal(str(fargate_seconds))
     try:
         _table().update_item(
             Key={"jobId": job_id},

@@ -73,7 +73,7 @@ def main() -> None:
     args = parser.parse_args()
     address = " ".join(args.address)
 
-    saved, err = run(
+    saved, err, _cost, _in_tok, _out_tok = run(
         address,
         tmp_dir=args.tmp,
         skip_existing=not args.no_skip_existing,

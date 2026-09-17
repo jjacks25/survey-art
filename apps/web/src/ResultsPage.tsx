@@ -15,6 +15,7 @@ import {
   SimpleGrid,
   Spoiler,
   Stack,
+  Table,
   Tabs,
   Text,
   Timeline,
@@ -77,6 +78,107 @@ function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void) {
         </Stack>
       </UnstyledButton>
     </Box>
+  );
+}
+
+/** Estimated infra cost breakdown for one run. Bedrock is a real dollar figure
+ * (browser-use's own usage accounting); Fargate is estimated from wall-clock
+ * task runtime against a flat on-demand rate — see worker.py's `_cost_fields`. */
+function RunCost({ job }: { job: Job }) {
+  if (job.bedrockCostUsd == null && job.fargateCostUsd == null) {
+    return (
+      <Text c="dimmed" size="sm">
+        Cost will appear here once the job finishes.
+      </Text>
+    );
+  }
+  const bedrock = job.bedrockCostUsd ?? 0;
+  const fargate = job.fargateCostUsd ?? 0;
+  const total = bedrock + fargate;
+  const fmt = (n: number) => `$${n.toFixed(4)}`;
+  return (
+    <Stack gap="sm">
+      <Text fw={500} size="sm">Estimated Cost</Text>
+      <Table w="auto" verticalSpacing="xs">
+        <Table.Tbody>
+          <Table.Tr>
+            <Table.Td>Bedrock / LLM</Table.Td>
+            <Table.Td>{fmt(bedrock)}</Table.Td>
+            <Table.Td c="dimmed">
+              {(job.bedrockInputTokens ?? 0).toLocaleString()} in / {(job.bedrockOutputTokens ?? 0).toLocaleString()} out tokens
+            </Table.Td>
+          </Table.Tr>
+          <Table.Tr>
+            <Table.Td>ECS / Fargate</Table.Td>
+            <Table.Td>{fmt(fargate)}</Table.Td>
+            <Table.Td c="dimmed">{(job.fargateSeconds ?? 0).toFixed(0)}s runtime</Table.Td>
+          </Table.Tr>
+          <Table.Tr>
+            <Table.Td fw={700}>Total</Table.Td>
+            <Table.Td fw={700}>{fmt(total)}</Table.Td>
+            <Table.Td />
+          </Table.Tr>
+        </Table.Tbody>
+      </Table>
+      <Text c="dimmed" size="xs">
+        Fargate cost is estimated from task runtime, not billed usage. Bedrock cost is
+        reported by the model provider's own usage accounting.
+      </Text>
+    </Stack>
+  );
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(0)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}m ${s}s`;
+}
+
+/** How long a run took, and how that scales with what it found. `fargateSeconds`
+ * (worker.py) is the task's own wall-clock time — the closest thing to "how long did
+ * the scrape actually take" we have; createdAt->updatedAt also includes any time the
+ * job sat PENDING waiting for a Fargate task to be dispatched. */
+function RunTime({ job }: { job: Job }) {
+  if (job.fargateSeconds == null) {
+    return (
+      <Text c="dimmed" size="sm">
+        Run time will appear here once the job finishes.
+      </Text>
+    );
+  }
+  const taskSeconds = job.fargateSeconds;
+  const totalSeconds = job.updatedAt - job.createdAt;
+  const queueSeconds = Math.max(0, totalSeconds - taskSeconds);
+  const fileCount = job.fileCount ?? 0;
+  return (
+    <Stack gap="sm">
+      <Text fw={500} size="sm">Run Time</Text>
+      <Table w="auto" verticalSpacing="xs">
+        <Table.Tbody>
+          <Table.Tr>
+            <Table.Td>Total time (search → done)</Table.Td>
+            <Table.Td>{formatDuration(totalSeconds)}</Table.Td>
+          </Table.Tr>
+          <Table.Tr>
+            <Table.Td>Scraper run time</Table.Td>
+            <Table.Td>{formatDuration(taskSeconds)}</Table.Td>
+          </Table.Tr>
+          {queueSeconds > 1 && (
+            <Table.Tr>
+              <Table.Td c="dimmed">Time waiting to start</Table.Td>
+              <Table.Td c="dimmed">{formatDuration(queueSeconds)}</Table.Td>
+            </Table.Tr>
+          )}
+          {fileCount > 0 && (
+            <Table.Tr>
+              <Table.Td>Average time per document</Table.Td>
+              <Table.Td>{formatDuration(taskSeconds / fileCount)}</Table.Td>
+            </Table.Tr>
+          )}
+        </Table.Tbody>
+      </Table>
+    </Stack>
   );
 }
 
@@ -244,6 +346,7 @@ export function ResultsPage() {
           <Tabs.Tab value="results">Results{files.length > 0 ? ` (${files.length})` : ""}</Tabs.Tab>
           <Tabs.Tab value="metadata">Property Metadata</Tabs.Tab>
           <Tabs.Tab value="map">Map</Tabs.Tab>
+          <Tabs.Tab value="run-details">Run Details</Tabs.Tab>
         </Tabs.List>
 
         <Tabs.Panel value="logs" pt="sm">
@@ -334,6 +437,13 @@ export function ResultsPage() {
 
         <Tabs.Panel value="map" pt="sm">
           <PropertyMap job={job} />
+        </Tabs.Panel>
+
+        <Tabs.Panel value="run-details" pt="sm">
+          <Stack gap="xl">
+            <RunCost job={job} />
+            <RunTime job={job} />
+          </Stack>
         </Tabs.Panel>
       </Tabs>
 

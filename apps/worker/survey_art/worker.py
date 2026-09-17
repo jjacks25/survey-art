@@ -25,6 +25,7 @@ import os
 import queue
 import sys
 import tempfile
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -36,6 +37,30 @@ from survey_shared.config import get_shared_settings
 
 logger = logging.getLogger(__name__)
 narration = logging.getLogger("survey_art.narration")
+
+# ponytail: flat on-demand Fargate rate (Linux/x86, us-west-2 — this deploy's default
+# region, see infra/deploy.py's DEFAULT_REGION) times wall-clock task runtime, rather
+# than a real AWS Cost Explorer/CUR integration (24-48h reporting lag, can't back a
+# live UI). Revisit with per-region pricing if this ever deploys outside us-west-2.
+_FARGATE_VCPU_HOUR_USD = 0.04048
+_FARGATE_GB_HOUR_USD = 0.004445
+_FARGATE_VCPUS = 1  # WorkerTaskDefinition: Cpu: '1024'
+_FARGATE_MEM_GB = 2  # WorkerTaskDefinition: Memory: '2048'
+
+
+def _cost_fields(start_time: float, bedrock_cost_usd: float, in_tok: int, out_tok: int) -> dict:
+    """Cost breakdown for one job run, for jobs.update_status()."""
+    elapsed = time.time() - start_time
+    fargate_cost = (elapsed / 3600) * (
+        _FARGATE_VCPUS * _FARGATE_VCPU_HOUR_USD + _FARGATE_MEM_GB * _FARGATE_GB_HOUR_USD
+    )
+    return {
+        "bedrock_cost_usd": round(bedrock_cost_usd, 4),
+        "bedrock_input_tokens": in_tok,
+        "bedrock_output_tokens": out_tok,
+        "fargate_cost_usd": round(fargate_cost, 4),
+        "fargate_seconds": round(elapsed, 1),
+    }
 
 
 class _DynamoLogHandler(logging.Handler):
@@ -205,13 +230,19 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     log_handler = _JobLogHandler(job_id)
     scraper_logger.addHandler(log_handler)
     narration.info(f"Starting your search for {address}...")
+    start_time = time.time()
     try:
         with tempfile.TemporaryDirectory(prefix=f"job-{job_id}-") as tmp:
-            saved, err = await run_async(
+            saved, err, cost, in_tok, out_tok = await run_async(
                 address, tmp_dir=Path(tmp), quiet=True, county_override=county
             )
             if err:
-                jobs.update_status(job_id, jobs.FAILED, error=err)
+                jobs.update_status(
+                    job_id,
+                    jobs.FAILED,
+                    error=err,
+                    **_cost_fields(start_time, cost, in_tok, out_tok),
+                )
                 narration.info("We hit a problem and couldn't finish this search.")
                 logger.error("Job %s FAILED: %s", job_id, err)
                 return 1
@@ -227,6 +258,7 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
                 metadata=metadata,
                 location=location,
                 doc_prefix=doc_prefix,
+                **_cost_fields(start_time, cost, in_tok, out_tok),
             )
             if (metadata or {}).get("limits", {}).get("cross_reference_depth_limit"):
                 narration.info(
@@ -239,7 +271,9 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     except Exception as exc:  # noqa: BLE001 — surface any failure to the job record
         narration.info("Something unexpected went wrong and the search had to stop.")
         logger.exception("Job %s crashed", job_id)
-        jobs.update_status(job_id, jobs.FAILED, error=str(exc))
+        jobs.update_status(
+            job_id, jobs.FAILED, error=str(exc), **_cost_fields(start_time, 0.0, 0, 0)
+        )
         return 1
     finally:
         scraper_logger.removeHandler(log_handler)

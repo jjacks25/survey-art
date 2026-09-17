@@ -42,7 +42,9 @@ async def test_run_async_dispatches_to_correct_scraper() -> None:
         patch.dict("survey_art.pipeline.COUNTY_SCRAPERS", {"CO_weld": mock_scrape}),
     ):
         mock_geocode.return_value = _geocoded("Weld")
-        saved, err = await run_async("123 Main St, Greeley, CO 80631", quiet=True)
+        saved, err, _cost, _in_tok, _out_tok = await run_async(
+            "123 Main St, Greeley, CO 80631", quiet=True
+        )
 
     mock_scrape.assert_awaited_once()
     assert err is None
@@ -52,7 +54,9 @@ async def test_run_async_dispatches_to_correct_scraper() -> None:
 async def test_run_async_unsupported_county_returns_error() -> None:
     with patch("survey_art.pipeline.address_to_county") as mock_geocode:
         mock_geocode.return_value = _geocoded("Boulder")
-        saved, err = await run_async("123 Main St, Boulder, CO 80302", quiet=True)
+        saved, err, _cost, _in_tok, _out_tok = await run_async(
+            "123 Main St, Boulder, CO 80302", quiet=True
+        )
 
     assert saved == []
     assert err is not None
@@ -62,7 +66,7 @@ async def test_run_async_unsupported_county_returns_error() -> None:
 @pytest.mark.asyncio
 async def test_run_async_geocode_failure_returns_error() -> None:
     with patch("survey_art.pipeline.address_to_county", return_value=None):
-        saved, err = await run_async("bad address", quiet=True)
+        saved, err, _cost, _in_tok, _out_tok = await run_async("bad address", quiet=True)
 
     assert saved == []
     assert "Could not resolve" in (err or "")
@@ -77,7 +81,7 @@ async def test_run_async_county_override_bypasses_geocoding() -> None:
         patch.dict("survey_art.pipeline.COUNTY_SCRAPERS", {"CO_weld": mock_scrape}),
     ):
         mock_geocode.return_value = _geocoded("Denver")  # geocode says Denver
-        saved, err = await run_async(
+        saved, err, _cost, _in_tok, _out_tok = await run_async(
             "123 Main St, Denver, CO 80202",
             quiet=True,
             county_override="CO_weld",  # but override forces Weld
