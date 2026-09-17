@@ -42,7 +42,13 @@ ENV PATH="/app/.venv/bin:$PATH"
 WORKDIR /app/apps/api
 
 # LWA / uvicorn config. PORT is where uvicorn listens and where the adapter proxies.
-ENV PORT=8000 AWS_LWA_PORT=8000 AWS_LWA_INVOKE_MODE=response_stream
+# Buffered mode (the adapter's default — no AWS_LWA_INVOKE_MODE override) is required
+# here: response streaming only works through a Lambda Function URL with
+# InvokeMode=RESPONSE_STREAM. This function is fronted by API Gateway, which always
+# does a plain buffered Invoke — API Gateway can't parse a streamed payload, so it
+# silently substitutes its own generic 500 for every request while Lambda's own logs
+# show the app responding fine. No endpoint here streams a response anyway.
+ENV PORT=8000 AWS_LWA_PORT=8000
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
