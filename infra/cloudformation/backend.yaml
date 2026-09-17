@@ -132,14 +132,15 @@ Resources:
         deadLetterTargetArn: !GetAtt JobDLQ.Arn
         maxReceiveCount: 3
 
-  # App runtime credentials (LLM key + county recorder logins). Populate the value
+  # General app config/credentials/API keys. Only the Weld recorder login is
+  # declared for now — add more keys here as they're needed. Populate values
   # out-of-band (asm-exec / console); the template only creates the container.
   AppSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub '${ProjectName}/app-credentials'
-      Description: LLM API key(s) and county recorder credentials for the scraper worker.
-      SecretString: '{"OPENROUTER_API_KEY":"","ANTHROPIC_API_KEY":"","NVIDIA_API_KEY":"","WELD_RECORDER_USERNAME":"","WELD_RECORDER_PASSWORD":"","CO_DENVER_USERNAME":"","CO_DENVER_PASSWORD":""}'
+      Name: !Sub '${ProjectName}/config'
+      Description: General config, credentials and API keys for the Survey Art app.
+      SecretString: '{"weld_recorder_username":"","weld_recorder_password":""}'
 
   # ---------------- Identity (Cognito) ----------------
   UserPool:
@@ -342,13 +343,8 @@ Resources:
             - {Name: LLM_PROVIDER, Value: !Ref LLMProvider}
             - {Name: MODEL, Value: !Ref Model}
           Secrets:
-            - {Name: OPENROUTER_API_KEY, ValueFrom: !Sub '${AppSecret}:OPENROUTER_API_KEY::'}
-            - {Name: ANTHROPIC_API_KEY, ValueFrom: !Sub '${AppSecret}:ANTHROPIC_API_KEY::'}
-            - {Name: NVIDIA_API_KEY, ValueFrom: !Sub '${AppSecret}:NVIDIA_API_KEY::'}
-            - {Name: WELD_RECORDER_USERNAME, ValueFrom: !Sub '${AppSecret}:WELD_RECORDER_USERNAME::'}
-            - {Name: WELD_RECORDER_PASSWORD, ValueFrom: !Sub '${AppSecret}:WELD_RECORDER_PASSWORD::'}
-            - {Name: CO_DENVER_USERNAME, ValueFrom: !Sub '${AppSecret}:CO_DENVER_USERNAME::'}
-            - {Name: CO_DENVER_PASSWORD, ValueFrom: !Sub '${AppSecret}:CO_DENVER_PASSWORD::'}
+            - {Name: WELD_RECORDER_USERNAME, ValueFrom: !Sub '${AppSecret}:weld_recorder_username::'}
+            - {Name: WELD_RECORDER_PASSWORD, ValueFrom: !Sub '${AppSecret}:weld_recorder_password::'}
 
   # Lambda auto-creates /aws/lambda/{FunctionName} on first invoke with no
   # retention cap (logs kept forever) unless a log group of that exact name
