@@ -137,7 +137,12 @@ you ever need to override it.
 - WAF for CloudFront must be **us-east-1 / CLOUDFRONT scope**; deploy it separately and
   pass its ARN as `WebAclArn` (blank = no WAF).
 - Secrets Manager values (`<project>/config`) are created empty — populate them
-  out-of-band (never commit secret values).
+  out-of-band (never commit secret values). The worker fetches this secret itself at
+  startup via pydantic-settings' `AWSSecretsManagerSettingsSource` (see
+  `apps/worker/survey_art/settings.py`), not via an ECS `Secrets` env injection — only
+  the secret's ARN (`APP_CONFIG_SECRET_ID`, not a secret value) is passed as a plain
+  container env var, and `TaskRole` (not `TaskExecutionRole`) holds the
+  `secretsmanager:GetSecretValue` grant.
 - The dispatcher Lambda deploys as inline `Code.ZipFile`, but its only copy of the source
   is `apps/dispatcher/handler.py` — `deploy.py`'s `render_template()` splices it into the
   `# {{ dispatcher_handler }}` marker in `backend.yaml` at upload time. Edit the `.py`

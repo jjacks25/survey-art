@@ -197,14 +197,6 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-      Policies:
-        - PolicyName: read-app-secret
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref AppSecret
 
   TaskRole:
     Type: AWS::IAM::Role
@@ -233,6 +225,12 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*'
                   - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+              - Effect: Allow
+                # settings.py fetches this itself at startup via pydantic-settings'
+                # AWSSecretsManagerSettingsSource — not ECS `Secrets` injection, hence
+                # this lives on the task role, not TaskExecutionRole.
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
 
   ApiFunctionRole:
     Type: AWS::IAM::Role
@@ -342,9 +340,9 @@ Resources:
             - {Name: ENVIRONMENT, Value: !Ref Environment}
             - {Name: LLM_PROVIDER, Value: !Ref LLMProvider}
             - {Name: MODEL, Value: !Ref Model}
-          Secrets:
-            - {Name: WELD_RECORDER_USERNAME, ValueFrom: !Sub '${AppSecret}:weld_recorder_username::'}
-            - {Name: WELD_RECORDER_PASSWORD, ValueFrom: !Sub '${AppSecret}:weld_recorder_password::'}
+            # Not a secret value itself — just tells settings.py which secret to fetch
+            # at startup. See the comment on AppSecret and apps/worker/survey_art/settings.py.
+            - {Name: APP_CONFIG_SECRET_ID, Value: !Ref AppSecret}
 
   # Lambda auto-creates /aws/lambda/{FunctionName} on first invoke with no
   # retention cap (logs kept forever) unless a log group of that exact name

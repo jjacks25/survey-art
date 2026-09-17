@@ -1,10 +1,24 @@
-"""Application settings loaded from environment variables (or .env for local dev)."""
+"""Application settings loaded from environment variables (or .env for local dev).
+
+County portal credentials come from AWS Secrets Manager, fetched directly by the app
+at startup via pydantic-settings' `AWSSecretsManagerSettingsSource` — not injected as
+container env vars by ECS. `APP_CONFIG_SECRET_ID` (a plain, non-secret env var set by
+the backend stack to the secret's ARN) tells us which secret to fetch; local dev leaves
+it unset, so the source is skipped and the plaintext `.env` defaults below apply as
+normal. See infra/AGENTS.md's Secrets Manager gotcha for the CloudFormation side.
+"""
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    AWSSecretsManagerSettingsSource,
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 
 class Settings(BaseSettings):
@@ -43,6 +57,35 @@ class Settings(BaseSettings):
     # Denver County Clerk & Recorder (Kofile Tech) login
     co_denver_username: str = ""
     co_denver_password: str = ""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Earlier sources win, so a real env var/`.env` entry still overrides the
+        # secret (handy for local testing against real creds without touching AWS).
+        sources: tuple[PydanticBaseSettingsSource, ...] = (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
+        secret_id = os.environ.get("APP_CONFIG_SECRET_ID", "")
+        if secret_id:
+            secrets_settings = AWSSecretsManagerSettingsSource(settings_cls, secret_id)
+            sources = (
+                init_settings,
+                env_settings,
+                dotenv_settings,
+                secrets_settings,
+                file_secret_settings,
+            )
+        return sources
 
 
 @lru_cache(maxsize=1)
