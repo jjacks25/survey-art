@@ -160,6 +160,17 @@ export function ResultsPage() {
     navigate("/");
   }
 
+  function deleteRun() {
+    if (!job) return;
+    if (!confirm("Delete this run? Downloaded documents are kept — only the run's history and logs are removed.")) {
+      return;
+    }
+    api.deleteJob(job.jobId).finally(() => {
+      loadHistory();
+      navigate("/");
+    });
+  }
+
   if (error) {
     return <Alert color="red" title="Error">{error}</Alert>;
   }
@@ -175,9 +186,13 @@ export function ResultsPage() {
           <Badge color={statusColor(job.status)}>{job.status}</Badge>
           {!TERMINAL.has(job.status) && <Loader size="xs" />}
         </Group>
-        {!TERMINAL.has(job.status) && (
+        {!TERMINAL.has(job.status) ? (
           <Button variant="outline" color="red" onClick={cancel}>
             Cancel
+          </Button>
+        ) : (
+          <Button variant="outline" color="red" onClick={deleteRun}>
+            Delete Run
           </Button>
         )}
       </Group>

@@ -8,6 +8,8 @@ presigned GET URLs by the API.
 
 from __future__ import annotations
 
+import json
+import logging
 import mimetypes
 import time
 from pathlib import Path
@@ -19,6 +21,13 @@ from pydantic import BaseModel, Field, field_validator
 
 from survey_shared import aws
 from survey_shared.config import get_shared_settings
+
+logger = logging.getLogger(__name__)
+
+# ponytail: a single log line pasted from a scraper (e.g. a raw HTML/JSON dump)
+# could otherwise grow the DynamoDB item without bound on its own; cap it here
+# rather than trusting every future logger.info() call to be well-behaved.
+_MAX_LOG_MESSAGE_CHARS = 4000
 
 PENDING = "PENDING"
 RUNNING = "RUNNING"
@@ -64,6 +73,11 @@ class Job(BaseModel):
     task_arn: str | None = Field(default=None, alias="taskArn")
     logs: list[LogEntry] = Field(default_factory=list)
     metadata: dict | None = None
+    # S3 key metadata was uploaded to (see upload_metadata()) — not stored
+    # inline in the item because extracted_ids can grow past DynamoDB's 400KB
+    # item cap on its own. get_job() resolves this into `metadata` for
+    # callers; from_item()/to_item() otherwise treat it as an opaque field.
+    metadata_key: str | None = Field(default=None, alias="metadataKey")
     location: dict | None = None
     doc_prefix: str | None = Field(default=None, alias="docPrefix")
 
@@ -108,7 +122,12 @@ def create_job(job_id: str, address: str, county: str) -> Job:
 def get_job(job_id: str) -> Job | None:
     resp = _table().get_item(Key={"jobId": job_id})
     item = resp.get("Item")
-    return Job.from_item(item) if item else None
+    if not item:
+        return None
+    job = Job.from_item(item)
+    if job.metadata_key:
+        job.metadata = _download_metadata(job.metadata_key)
+    return job
 
 
 def list_jobs(limit: int = 100) -> list[Job]:
@@ -145,8 +164,8 @@ def update_status(
         expr.append("fileCount = :fc")
         values[":fc"] = file_count
     if metadata is not None:
-        expr.append("metadata = :m")
-        values[":m"] = metadata
+        expr.append("metadataKey = :mk")
+        values[":mk"] = upload_metadata(job_id, metadata)
     if location is not None:
         expr.append("#l2 = :loc")
         names["#l2"] = "location"
@@ -174,6 +193,8 @@ def append_log(
 
     See `LogEntry` for what `kind` means to the frontend.
     """
+    if len(message) > _MAX_LOG_MESSAGE_CHARS:
+        message = message[:_MAX_LOG_MESSAGE_CHARS] + "... [truncated]"
     try:
         _table().update_item(
             Key={"jobId": job_id},
@@ -224,6 +245,17 @@ def cancel_job(job_id: str, *, _attempts: int = 3) -> Job | None:
     return None
 
 
+def delete_job(job_id: str) -> bool:
+    """Permanently remove a job's record (status, logs, metadata) from the jobs
+    table. Leaves S3 untouched — the property's documents/log archive/map
+    screenshot age out on their own lifecycle rules (see `upload_documents()`
+    etc.) and are shared across repeated searches for the same property, so
+    deleting one job's history entry shouldn't reach into them. Returns
+    whether a record actually existed to delete."""
+    resp = _table().delete_item(Key={"jobId": job_id}, ReturnValues="ALL_OLD")
+    return "Attributes" in resp
+
+
 DOCUMENTS_PREFIX = "documents"
 SCRATCH_PREFIX = "scratch"
 LOGS_PREFIX = "property-search-logs"
@@ -243,6 +275,39 @@ def upload_job_log(job_id: str, text: str) -> str:
     key = f"{LOGS_PREFIX}/{job_id}.log"
     s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType="text/plain")
     return key
+
+
+def upload_metadata(job_id: str, metadata: dict) -> str:
+    """Upload a job's property metadata (the scraper's ``overview.json``) to
+    ``scratch/metadata/{job_id}.json`` and return the S3 key.
+
+    Stored in S3 rather than inline on the DynamoDB item: `extracted_ids`
+    (see [`apps/worker/survey_art/AGENTS.md`](../../apps/worker/survey_art/AGENTS.md))
+    grows with how tangled a property's document chain is and can push a job
+    item past DynamoDB's 400KB cap on its own. Job-specific scratch output
+    (like the map screenshot), not a durable per-property record, so it lives
+    under `scratch/` and ages out on that 90-day lifecycle rule rather than
+    `documents/`'s.
+    """
+    s3 = aws.client("s3")
+    bucket = aws.storage_bucket()
+    key = f"{SCRATCH_PREFIX}/metadata/{job_id}.json"
+    body = json.dumps(metadata).encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    return key
+
+
+def _download_metadata(key: str) -> dict | None:
+    """Best-effort read-back of `upload_metadata()`'s object. Never raises —
+    metadata is a nice-to-have for the Property Metadata tab, not something
+    that should fail a job status lookup."""
+    try:
+        s3 = aws.client("s3")
+        obj = s3.get_object(Bucket=aws.storage_bucket(), Key=key)
+        return json.loads(obj["Body"].read())
+    except (ClientError, ValueError):
+        logger.warning("Could not load metadata from s3://%s", key)
+        return None
 
 
 def upload_documents(prefix: str, files: list[Path]) -> int:

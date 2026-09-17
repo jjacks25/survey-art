@@ -88,12 +88,14 @@ def test_cancel_pending_job(client):
     assert fetched.json()["status"] == "CANCELLED"
 
 
-def test_cancel_unknown_job_returns_409(client):
+def test_delete_unknown_job_returns_404(client):
     resp = client.delete("/api/jobs/does-not-exist")
-    assert resp.status_code == 409
+    assert resp.status_code == 404
 
 
-def test_cancel_already_completed_job_returns_409(client):
+def test_delete_completed_job_removes_record(client):
+    """DELETE on a terminal job deletes its record outright rather than
+    cancelling — there's nothing left to cancel."""
     from survey_shared import jobs
 
     created = client.post("/api/jobs", json={"address": "123 Main St, Greeley, CO 80631"})
@@ -101,7 +103,31 @@ def test_cancel_already_completed_job_returns_409(client):
     jobs.update_status(job_id, jobs.COMPLETED, file_count=0)
 
     resp = client.delete(f"/api/jobs/{job_id}")
-    assert resp.status_code == 409
+    assert resp.status_code == 204
+
+    fetched = client.get(f"/api/jobs/{job_id}")
+    assert fetched.status_code == 404
+
+
+def test_large_metadata_round_trips_via_s3(client):
+    """Regression: extracted_ids from a deep cross-reference walk can be large
+    enough to blow past DynamoDB's 400KB item cap on its own. Metadata now
+    lives in S3 (jobs.upload_metadata()) instead of inline on the item, so a
+    big payload should complete and read back intact rather than either
+    failing the job or getting silently dropped."""
+    from survey_shared import jobs
+
+    created = client.post("/api/jobs", json={"address": "123 Main St, Greeley, CO 80631"})
+    job_id = created.json()["jobId"]
+
+    big_metadata = {"extracted_ids": [{"context": "x" * 1000} for _ in range(500)]}
+    jobs.update_status(job_id, jobs.COMPLETED, file_count=3, metadata=big_metadata)
+
+    fetched = client.get(f"/api/jobs/{job_id}")
+    assert fetched.json()["status"] == "COMPLETED"
+    assert fetched.json()["fileCount"] == 3
+    assert fetched.json()["metadata"] == big_metadata
+    assert "metadataKey" not in fetched.json()
 
 
 def test_result_files_expose_inline_and_attachment_urls(client):
