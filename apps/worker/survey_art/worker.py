@@ -228,6 +228,11 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
                 location=location,
                 doc_prefix=doc_prefix,
             )
+            if (metadata or {}).get("limits", {}).get("cross_reference_depth_limit"):
+                narration.info(
+                    "Note: stopped chasing document citations after 3 hops deep — "
+                    "some more-distantly-referenced documents may not be included."
+                )
             narration.info(f"All done — found {count} document(s) for this property.")
             logger.info("Job %s COMPLETED: %s file(s) uploaded", job_id, count)
             return 0
