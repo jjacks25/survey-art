@@ -136,7 +136,7 @@ you ever need to override it.
 
 - WAF for CloudFront must be **us-east-1 / CLOUDFRONT scope**; deploy it separately and
   pass its ARN as `WebAclArn` (blank = no WAF).
-- Secrets Manager values (`<project>/app-credentials`) are created empty — populate them
+- Secrets Manager values (`<project>/config`) are created empty — populate them
   out-of-band (never commit secret values).
 - The dispatcher Lambda deploys as inline `Code.ZipFile`, but its only copy of the source
   is `apps/dispatcher/handler.py` — `deploy.py`'s `render_template()` splices it into the
