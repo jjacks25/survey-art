@@ -98,7 +98,11 @@ def get_job(job_id: str) -> JobResponse:
     job = jobs.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    return JobResponse(**job.to_item())
+    # get_job() already resolved `metadata` from S3 (see jobs.upload_metadata());
+    # metadataKey itself is an internal storage detail, not part of the API.
+    item = job.to_item()
+    item.pop("metadataKey", None)
+    return JobResponse(**item)
 
 
 @app.get("/api/jobs/{job_id}/files", response_model=FilesResponse)

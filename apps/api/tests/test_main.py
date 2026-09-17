@@ -109,24 +109,25 @@ def test_delete_completed_job_removes_record(client):
     assert fetched.status_code == 404
 
 
-def test_update_status_drops_oversized_metadata_instead_of_failing(client):
-    """Regression: a DynamoDB item over the 400KB cap (e.g. a big
-    `extracted_ids` list) previously made the whole job report FAILED with
-    the raw AWS error, even though the scrape itself succeeded and its
-    documents were already uploaded. update_status() should retry without
-    metadata and still record the real terminal status."""
+def test_large_metadata_round_trips_via_s3(client):
+    """Regression: extracted_ids from a deep cross-reference walk can be large
+    enough to blow past DynamoDB's 400KB item cap on its own. Metadata now
+    lives in S3 (jobs.upload_metadata()) instead of inline on the item, so a
+    big payload should complete and read back intact rather than either
+    failing the job or getting silently dropped."""
     from survey_shared import jobs
 
     created = client.post("/api/jobs", json={"address": "123 Main St, Greeley, CO 80631"})
     job_id = created.json()["jobId"]
 
-    oversized = {"extracted_ids": [{"context": "x" * 1000} for _ in range(500)]}
-    jobs.update_status(job_id, jobs.COMPLETED, file_count=3, metadata=oversized)
+    big_metadata = {"extracted_ids": [{"context": "x" * 1000} for _ in range(500)]}
+    jobs.update_status(job_id, jobs.COMPLETED, file_count=3, metadata=big_metadata)
 
     fetched = client.get(f"/api/jobs/{job_id}")
     assert fetched.json()["status"] == "COMPLETED"
     assert fetched.json()["fileCount"] == 3
-    assert fetched.json().get("metadata") is None
+    assert fetched.json()["metadata"] == big_metadata
+    assert "metadataKey" not in fetched.json()
 
 
 def test_result_files_expose_inline_and_attachment_urls(client):
