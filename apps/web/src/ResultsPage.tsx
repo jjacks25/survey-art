@@ -305,17 +305,22 @@ export function ResultsPage() {
   }
 
   // identify_results (Weld only, for now — see worker.py's _doc_prefix()) has the
-  // parcel number and S/T/R once the scrape resolves them; until then, fall back to
-  // whatever the user originally searched (job.address holds that regardless of mode).
+  // parcel number, resolved address, and S/T/R once the scrape resolves them.
   const identify = (job.metadata?.identify_results ?? {}) as Record<string, string>;
-  const pageTitle = identify.parcel_id || job.address;
-  const pageSubtitle = identify.section_township_range;
+  const pageTitle = job.address;
+  const subtitles = [
+    identify.parcel_id && `Parcel Number: ${identify.parcel_id}`,
+    identify.address && `Address: ${identify.address}`,
+    identify.section_township_range && `Section/Township/Range: ${identify.section_township_range}`,
+  ].filter(Boolean) as string[];
 
   return (
     <Stack gap="xs">
       <Stack gap={0}>
         <Title order={3}>{pageTitle}</Title>
-        {pageSubtitle && <Text c="dimmed" size="sm">{pageSubtitle}</Text>}
+        {subtitles.map((line) => (
+          <Text key={line} c="dimmed" size="sm">{line}</Text>
+        ))}
       </Stack>
       <Group justify="space-between" wrap="nowrap">
         <Group>
