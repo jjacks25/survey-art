@@ -93,6 +93,8 @@ export function ResultsPage() {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [previewFile, setPreviewFile] = useState<FileEntry | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Schedule B-2/cross-reference exception docs (weld_county.py writes them
@@ -163,13 +165,18 @@ export function ResultsPage() {
 
   function deleteRun() {
     if (!job) return;
-    if (!confirm("Delete this run? Downloaded documents are kept — only the run's history and logs are removed.")) {
-      return;
-    }
-    api.deleteJob(job.jobId).finally(() => {
-      loadHistory();
-      navigate("/");
-    });
+    setDeleting(true);
+    api
+      .deleteJob(job.jobId)
+      .then(() => {
+        loadHistory();
+        navigate("/");
+      })
+      .catch((e) => {
+        setDeleteModalOpen(false);
+        setError(String(e));
+      })
+      .finally(() => setDeleting(false));
   }
 
   if (error) {
@@ -203,7 +210,7 @@ export function ResultsPage() {
             Cancel
           </Button>
         ) : (
-          <Button variant="outline" color="red" onClick={deleteRun}>
+          <Button variant="outline" color="red" onClick={() => setDeleteModalOpen(true)}>
             Delete Run
           </Button>
         )}
@@ -322,6 +329,22 @@ export function ResultsPage() {
             style={{ width: "100%", height: "80vh", border: "none" }}
           />
         )}
+      </Modal>
+
+      <Modal opened={deleteModalOpen} onClose={() => setDeleteModalOpen(false)} title="Delete this run?" centered>
+        <Stack gap="md">
+          <Text size="sm">
+            Downloaded documents are kept — only this run's history and logs are removed.
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setDeleteModalOpen(false)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button color="red" onClick={deleteRun} loading={deleting}>
+              Delete Run
+            </Button>
+          </Group>
+        </Stack>
       </Modal>
     </Stack>
   );
