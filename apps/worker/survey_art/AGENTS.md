@@ -95,6 +95,59 @@ perform blocking I/O directly in `emit()`.
   [`packages/survey_shared/AGENTS.md`](../../../packages/survey_shared/AGENTS.md)).
   Never raises — a failed archive upload must not fail a job that's already finished.
 
+## Estimated cost & run time (`worker.py`, frontend's Run Details tab)
+
+Every job records a cost/runtime breakdown, written by `run_job()` via
+`jobs.update_status()` on every exit path (`COMPLETED`, `FAILED`, and the generic
+`except` — a crashed job still burned real Bedrock tokens and real Fargate seconds, so
+it still gets a number). Two independent inputs, one real and one estimated:
+
+- **Bedrock cost — a real dollar figure.** `run_async()` (`pipeline.py`) returns
+  `(saved, err, cost, in_tok, out_tok)` all the way up from whichever scraper ran —
+  every county scraper's `scrape()` sums `llm.agent_cost()` (browser-use's own
+  `agent.history.usage`, real per-call Bedrock pricing) across every LLM call it makes,
+  plus, for Weld, `id_extraction.py`'s raw `bedrock-runtime.converse()` token counts for
+  cross-reference ID extraction. This number needs no maintenance when infra changes —
+  it comes from the model provider's own usage accounting, not a local estimate.
+- **Fargate cost — an estimate, not billed usage.** There is deliberately no AWS Cost
+  Explorer/CUR integration here: tag-based cost allocation reports lag 24-48h, which
+  can't back a same-run UI. Instead, `_cost_fields()` in `worker.py` takes the task's own
+  wall-clock runtime (`time.time()` at the top of `run_job()` to the moment the job
+  reaches a terminal state) and multiplies by a **hardcoded flat on-demand rate**:
+
+  ```python
+  _FARGATE_VCPU_HOUR_USD = 0.04048   # us-west-2, Linux/x86, on-demand
+  _FARGATE_GB_HOUR_USD = 0.004445    # us-west-2, Linux/x86, on-demand
+  _FARGATE_VCPUS = 1                 # WorkerTaskDefinition: Cpu: '1024'
+  _FARGATE_MEM_GB = 2                # WorkerTaskDefinition: Memory: '2048'
+  ```
+
+  **If you change the worker's Fargate sizing or region, update these four constants to
+  match** — nothing re-derives them automatically:
+  - `WorkerTaskDefinition.Cpu`/`Memory` in `infra/cloudformation/backend.yaml` changes →
+    update `_FARGATE_VCPUS`/`_FARGATE_MEM_GB` (they're `Cpu`/1024 and `Memory`/1024).
+  - Deploying somewhere other than `us-west-2` (`infra/deploy.py`'s `DEFAULT_REGION`) →
+    look up that region's Fargate on-demand rate and update
+    `_FARGATE_VCPU_HOUR_USD`/`_FARGATE_GB_HOUR_USD` (AWS Pricing page, "Fargate", Linux/x86).
+  - Switching to Fargate Spot, ARM/Graviton, or a different launch type entirely → these
+    four constants aren't enough on their own; revisit `_cost_fields()`'s formula, not
+    just the numbers.
+
+  `Job.fargate_seconds`/`Job.fargate_cost_usd` (`packages/survey_shared/survey_shared/jobs.py`)
+  round-trip these once computed; there's no separate "recompute later" path, so a rate
+  change only affects jobs run after the deploy — historical job records keep whatever
+  rate was in effect when they ran.
+
+- **Run time.** The frontend derives everything else from three fields the job record
+  already carries — no separate timing plumbing: `fargateSeconds` (the task's own
+  wall-clock runtime, same number the Fargate estimate above is built from — the
+  closest thing to "how long the scrape actually took"), and `createdAt`/`updatedAt`
+  (set by `jobs.create_job()`/`update_status()`). `createdAt` is stamped when the API
+  creates the `PENDING` record, before the job is even dispatched to Fargate, so
+  `updatedAt - createdAt` includes SQS/dispatcher/task-start latency that
+  `fargateSeconds` doesn't — the UI shows both plus the difference as "time waiting to
+  start," and "average time per document" as `fargateSeconds / fileCount`.
+
 ## Metadata: cleaned sections vs. `raw_report_fields`
 
 `weld_county.py`'s `_group_report_fields()` sorts the property report's flat field dict

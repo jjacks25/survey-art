@@ -22,6 +22,11 @@ export interface Job {
   metadata?: Record<string, unknown> | null;
   location?: { lat: number; lon: number } | null;
   docPrefix?: string | null;
+  bedrockCostUsd?: number | null;
+  bedrockInputTokens?: number | null;
+  bedrockOutputTokens?: number | null;
+  fargateCostUsd?: number | null;
+  fargateSeconds?: number | null;
 }
 
 export interface FileEntry {

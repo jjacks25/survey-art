@@ -42,10 +42,10 @@ async def run_async(
     str_input: str = "",
     owner_input: str = "",
     sop_strict: bool = False,
-) -> tuple[list[Path], str | None]:
+) -> tuple[list[Path], str | None, float, int, int]:
     """
     Full async pipeline: geocode address -> dispatch to county scraper -> download.
-    Returns (saved_paths, error_message).
+    Returns (saved_paths, error_message, bedrock_cost_usd, input_tokens, output_tokens).
     """
     tmp = tmp_dir or Path("tmp")
     s = get_settings()
@@ -55,7 +55,7 @@ async def run_async(
     geocoded: GeocodedAddress | None = address_to_county(address)
     if not geocoded:
         if not county_override:
-            return [], "Could not resolve address to a county."
+            return [], "Could not resolve address to a county.", 0.0, 0, 0
         # county_override supplied but geocoding failed (e.g. input is a parcel/account ID).
         # Build a minimal GeocodedAddress so the scraper can run.
         _state, _county_name = (county_override.split("_", 1) + ["Unknown"])[:2]
@@ -76,7 +76,13 @@ async def run_async(
     scrape_fn = COUNTY_SCRAPERS.get(county_key)
     if not scrape_fn:
         supported = ", ".join(COUNTY_SCRAPERS)
-        return [], (f"County '{county_key}' is not yet supported. Supported counties: {supported}")
+        return (
+            [],
+            f"County '{county_key}' is not yet supported. Supported counties: {supported}",
+            0.0,
+            0,
+            0,
+        )
 
     # Weld scraper accepts SOP Phase 1 keyword args; other scrapers don't (yet).
     scrape_kwargs: dict = {}
@@ -90,13 +96,13 @@ async def run_async(
     if not quiet:
         run_cost(cost, in_tok, out_tok)
     if err:
-        return [], err
+        return [], err, cost, in_tok, out_tok
 
     if not quiet and saved:
         download_done(saved, str(tmp))
         files_table(saved, str(tmp))
 
-    return saved, None
+    return saved, None, cost, in_tok, out_tok
 
 
 def run(
@@ -110,7 +116,7 @@ def run(
     str_input: str = "",
     owner_input: str = "",
     sop_strict: bool = False,
-) -> tuple[list[Path], str | None]:
+) -> tuple[list[Path], str | None, float, int, int]:
     """Synchronous wrapper around run_async."""
     return asyncio.run(
         run_async(
