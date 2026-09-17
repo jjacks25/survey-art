@@ -38,6 +38,16 @@ Parameters:
   CognitoDomainPrefix:
     Type: String
     Default: ''
+  MfaSenderEmail:
+    Type: String
+    Default: surveyart85@gmail.com
+    Description: >
+      Cognito's own mailer can't send email-OTP MFA codes; it requires a
+      verified SES identity. This address gets an AWS::SES::EmailIdentity
+      resource, but SES verification is a manual click on the link SES emails
+      to it — the stack deploys either way, but OTP emails won't send until
+      that click happens (and, while the account is in the SES sandbox,
+      every MFA recipient must also be verified in SES).
     Description: Globally-unique Cognito hosted-UI domain prefix. Defaults to <project>-<account>.
 
 Conditions:
@@ -143,6 +153,11 @@ Resources:
       SecretString: '{"weld_recorder_username":"","weld_recorder_password":""}'
 
   # ---------------- Identity (Cognito) ----------------
+  MfaSenderIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref MfaSenderEmail
+
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -153,6 +168,10 @@ Resources:
       UsernameAttributes: [email]
       MfaConfiguration: 'ON'
       EnabledMfas: [EMAIL_OTP]
+      EmailConfiguration:
+        EmailSendingAccount: DEVELOPER
+        SourceArn: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${MfaSenderEmail}'
+        From: !Ref MfaSenderEmail
       Policies:
         PasswordPolicy:
           MinimumLength: 12
