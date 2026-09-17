@@ -151,8 +151,6 @@ Resources:
         AllowAdminCreateUserOnly: true   # invite-only; no public self sign-up
       AutoVerifiedAttributes: [email]
       UsernameAttributes: [email]
-      MfaConfiguration: 'ON'
-      EnabledMfas: [EMAIL_OTP]
       Policies:
         PasswordPolicy:
           MinimumLength: 12
