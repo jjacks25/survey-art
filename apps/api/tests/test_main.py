@@ -88,12 +88,14 @@ def test_cancel_pending_job(client):
     assert fetched.json()["status"] == "CANCELLED"
 
 
-def test_cancel_unknown_job_returns_409(client):
+def test_delete_unknown_job_returns_404(client):
     resp = client.delete("/api/jobs/does-not-exist")
-    assert resp.status_code == 409
+    assert resp.status_code == 404
 
 
-def test_cancel_already_completed_job_returns_409(client):
+def test_delete_completed_job_removes_record(client):
+    """DELETE on a terminal job deletes its record outright rather than
+    cancelling — there's nothing left to cancel."""
     from survey_shared import jobs
 
     created = client.post("/api/jobs", json={"address": "123 Main St, Greeley, CO 80631"})
@@ -101,7 +103,30 @@ def test_cancel_already_completed_job_returns_409(client):
     jobs.update_status(job_id, jobs.COMPLETED, file_count=0)
 
     resp = client.delete(f"/api/jobs/{job_id}")
-    assert resp.status_code == 409
+    assert resp.status_code == 204
+
+    fetched = client.get(f"/api/jobs/{job_id}")
+    assert fetched.status_code == 404
+
+
+def test_update_status_drops_oversized_metadata_instead_of_failing(client):
+    """Regression: a DynamoDB item over the 400KB cap (e.g. a big
+    `extracted_ids` list) previously made the whole job report FAILED with
+    the raw AWS error, even though the scrape itself succeeded and its
+    documents were already uploaded. update_status() should retry without
+    metadata and still record the real terminal status."""
+    from survey_shared import jobs
+
+    created = client.post("/api/jobs", json={"address": "123 Main St, Greeley, CO 80631"})
+    job_id = created.json()["jobId"]
+
+    oversized = {"extracted_ids": [{"context": "x" * 1000} for _ in range(500)]}
+    jobs.update_status(job_id, jobs.COMPLETED, file_count=3, metadata=oversized)
+
+    fetched = client.get(f"/api/jobs/{job_id}")
+    assert fetched.json()["status"] == "COMPLETED"
+    assert fetched.json()["fileCount"] == 3
+    assert fetched.json().get("metadata") is None
 
 
 def test_result_files_expose_inline_and_attachment_urls(client):

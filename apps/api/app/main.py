@@ -112,18 +112,25 @@ def get_files(job_id: str) -> FilesResponse:
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
-def cancel_job(job_id: str) -> None:
+def delete_job(job_id: str) -> None:
+    """Cancel a running job, or — once it's already terminal — delete its
+    record outright. One verb from the frontend's point of view (its button
+    reads "Cancel" while a job is in flight, "Delete" once it's finished); which
+    of the two happens depends on the job's own status, not the caller."""
     job = jobs.cancel_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=409, detail="job not found or already finished")
-    if job.task_arn:
-        # Local dev has no CLUSTER_ARN/ECS at all; the DB status change is what
-        # matters there — stopping the Fargate task is best-effort on top of it.
-        try:
-            aws.client("ecs").stop_task(
-                cluster=get_shared_settings().require_cluster_arn(),
-                task=job.task_arn,
-                reason="Cancelled by user",
-            )
-        except (RuntimeError, ClientError):
-            pass
+    if job is not None:
+        if job.task_arn:
+            # Local dev has no CLUSTER_ARN/ECS at all; the DB status change is
+            # what matters there — stopping the Fargate task is best-effort on
+            # top of it.
+            try:
+                aws.client("ecs").stop_task(
+                    cluster=get_shared_settings().require_cluster_arn(),
+                    task=job.task_arn,
+                    reason="Cancelled by user",
+                )
+            except (RuntimeError, ClientError):
+                pass
+        return
+    if not jobs.delete_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
