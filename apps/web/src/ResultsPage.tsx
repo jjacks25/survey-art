@@ -18,6 +18,7 @@ import {
   Tabs,
   Text,
   Timeline,
+  Title,
   Tooltip,
   UnstyledButton,
 } from "@mantine/core";
@@ -178,8 +179,19 @@ export function ResultsPage() {
     return <Center py="xl"><Loader /></Center>;
   }
 
+  // identify_results (Weld only, for now — see worker.py's _doc_prefix()) has the
+  // parcel number and S/T/R once the scrape resolves them; until then, fall back to
+  // whatever the user originally searched (job.address holds that regardless of mode).
+  const identify = (job.metadata?.identify_results ?? {}) as Record<string, string>;
+  const pageTitle = identify.parcel_id || job.address;
+  const pageSubtitle = identify.section_township_range;
+
   return (
     <Stack gap="xs">
+      <Stack gap={0}>
+        <Title order={3}>{pageTitle}</Title>
+        {pageSubtitle && <Text c="dimmed" size="sm">{pageSubtitle}</Text>}
+      </Stack>
       <Group justify="space-between" wrap="nowrap">
         <Group>
           <Text fw={500}>Status:</Text>
