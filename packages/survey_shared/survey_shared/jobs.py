@@ -256,6 +256,26 @@ def delete_job(job_id: str) -> bool:
     return "Attributes" in resp
 
 
+def property_key(job: Job) -> str:
+    """Grouping key for 'every run of the same property' — a job's docPrefix
+    once it has one, else its raw address. Mirrors the frontend's
+    propertyHistory dedup key (Layout.tsx), so a property-level delete removes
+    exactly the runs the sidebar already collapses into one entry."""
+    return job.doc_prefix or job.address
+
+
+def delete_jobs_for_property(key: str) -> int:
+    """Delete every job record sharing `property_key()` with `key` — repeated
+    searches for one property (retries, re-runs) otherwise pile up as separate
+    job records that a single-job delete only clears one at a time. Leaves S3
+    untouched, same as `delete_job()`. Returns how many records were deleted."""
+    items = _table().scan().get("Items", [])
+    matches = [j for item in items if property_key(j := Job.from_item(item)) == key]
+    for j in matches:
+        _table().delete_item(Key={"jobId": j.job_id})
+    return len(matches)
+
+
 DOCUMENTS_PREFIX = "documents"
 SCRATCH_PREFIX = "scratch"
 LOGS_PREFIX = "property-search-logs"
