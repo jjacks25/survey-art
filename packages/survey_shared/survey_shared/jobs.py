@@ -8,6 +8,7 @@ presigned GET URLs by the API.
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import time
 from pathlib import Path
@@ -19,6 +20,13 @@ from pydantic import BaseModel, Field, field_validator
 
 from survey_shared import aws
 from survey_shared.config import get_shared_settings
+
+logger = logging.getLogger(__name__)
+
+# ponytail: a single log line pasted from a scraper (e.g. a raw HTML/JSON dump)
+# could otherwise grow the DynamoDB item without bound on its own; cap it here
+# rather than trusting every future logger.info() call to be well-behaved.
+_MAX_LOG_MESSAGE_CHARS = 4000
 
 PENDING = "PENDING"
 RUNNING = "RUNNING"
@@ -163,8 +171,29 @@ def update_status(
             ExpressionAttributeValues={**values, ":cancelled": CANCELLED},
         )
     except ClientError as exc:
-        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
+        code = exc.response["Error"]["Code"]
+        if code == "ConditionalCheckFailedException":
+            return
+        # DynamoDB items are capped at 400KB. A big cross-reference walk's
+        # `extracted_ids` (see apps/worker/survey_art/AGENTS.md) can push metadata
+        # past that on its own — without this, the job's real terminal status
+        # (COMPLETED, with its documents already uploaded to S3) never gets
+        # recorded, and it shows FAILED with this AWS error as the message instead.
+        # ponytail: drop metadata and retry rather than losing the real status;
+        # upgrade path is storing metadata in S3 instead of inline if this starts
+        # tripping regularly.
+        if code == "ValidationException" and metadata is not None and "Item size" in str(exc):
+            logger.warning("Job %s: metadata too large for DynamoDB item, dropping it", job_id)
+            update_status(
+                job_id,
+                status,
+                error=error,
+                file_count=file_count,
+                location=location,
+                doc_prefix=doc_prefix,
+            )
+            return
+        raise
 
 
 def append_log(
