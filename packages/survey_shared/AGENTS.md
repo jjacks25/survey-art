@@ -4,6 +4,12 @@ A small workspace package (`survey-shared`) shared by `apps/api` and the worker
 (`apps/worker/survey_art`) — job state, S3 result storage, and AWS client/config helpers. Kept
 dependency-light (no browser/scraper deps) so the API's Lambda image stays lean.
 
+> Adding or changing any DynamoDB/S3/etc. call in `jobs.py`? This code runs under
+> **both** `ApiFunctionRole` and `TaskRole` (worker) — check both policies in
+> `infra/cloudformation/backend.yaml` list the exact action, or it 500s in prod only
+> (LocalStack doesn't enforce IAM). See "IAM check" in
+> [`infra/AGENTS.md`](../../infra/AGENTS.md).
+
 ## Files
 
 - `jobs.py` — the `Job` pydantic model + all DynamoDB/S3 operations (see below).
