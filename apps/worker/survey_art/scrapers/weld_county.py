@@ -1547,6 +1547,17 @@ def _select_schedule_b2_exception_targets(
 # number of Bedrock calls and downloads on one property.
 _MAX_CROSS_REFERENCE_DOCS = 150
 
+# How many hops from a directly-fetched document (the ALTA, the vesting deed)
+# we'll still chase citations from. Depth 1 = what the ALTA/deed itself cites
+# (the actual Schedule B-2 exceptions). Depth 2 = what *those* documents cite.
+# Beyond that, a document's own citations are no longer reliably "about this
+# property" — an easement citing a prior deed's own unrelated paper trail is
+# noise, not part of this parcel's chain — so relatedness is approximated by
+# distance rather than inspecting content (which recorder docs don't carry
+# consistently enough to judge). Already-fetched documents are still read for
+# `extracted_ids` either way; this only stops *further* downloads.
+_MAX_CROSS_REFERENCE_DEPTH = 3
+
 
 async def _expand_cross_references(
     address: str,
@@ -1580,12 +1591,13 @@ async def _expand_cross_references(
     extracted: set[str] = set()
     extracted_ids: list[dict] = []
     new_results: list[tuple[str, _DocRecord, list[Path]]] = []
-    queue: list[tuple[str, _DocRecord, list[Path]]] = list(initial_results)
+    queue: list[tuple[str, _DocRecord, list[Path], int]] = [(*r, 0) for r in initial_results]
     discovered = 0
     in_tok = out_tok = 0
+    hit_depth_limit = False
 
     while queue:
-        role, doc, paths = queue.pop(0)
+        role, doc, paths, depth = queue.pop(0)
         if not paths or doc.reception in extracted:
             continue
         extracted.add(doc.reception)
@@ -1605,6 +1617,14 @@ async def _expand_cross_references(
 
         if discovered >= _MAX_CROSS_REFERENCE_DOCS:
             continue  # keep draining the queue for extraction, just stop fetching more
+        if depth >= _MAX_CROSS_REFERENCE_DEPTH:
+            if not hit_depth_limit:
+                narration.info(
+                    "Reached the cross-reference depth limit — no longer chasing "
+                    "citations from citations."
+                )
+                hit_depth_limit = True
+            continue
 
         new_targets = _select_schedule_b2_exception_targets(extraction, known_receptions)
         if not new_targets:
@@ -1625,7 +1645,7 @@ async def _expand_cross_references(
         in_tok += dl_in
         out_tok += dl_out
         new_results.extend(downloaded)
-        queue.extend(downloaded)
+        queue.extend((*r, depth + 1) for r in downloaded)
 
     return new_results, in_tok, out_tok
 
