@@ -93,6 +93,28 @@ def test_delete_unknown_job_returns_404(client):
     assert resp.status_code == 404
 
 
+def test_delete_property_removes_every_run_for_it(client):
+    """A property-level delete clears every duplicate/retry run sharing the
+    same address, not just one jobId."""
+    from survey_shared import jobs
+
+    first = client.post("/api/jobs", json={"address": "1611986"})
+    second = client.post("/api/jobs", json={"address": "1611986"})
+    jobs.update_status(first.json()["jobId"], jobs.FAILED, error="boom")
+    jobs.update_status(second.json()["jobId"], jobs.FAILED, error="boom again")
+
+    resp = client.delete("/api/properties", params={"key": "1611986"})
+    assert resp.status_code == 204
+
+    assert client.get(f"/api/jobs/{first.json()['jobId']}").status_code == 404
+    assert client.get(f"/api/jobs/{second.json()['jobId']}").status_code == 404
+
+
+def test_delete_unknown_property_returns_404(client):
+    resp = client.delete("/api/properties", params={"key": "does-not-exist"})
+    assert resp.status_code == 404
+
+
 def test_delete_completed_job_removes_record(client):
     """DELETE on a terminal job deletes its record outright rather than
     cancelling — there's nothing left to cancel."""

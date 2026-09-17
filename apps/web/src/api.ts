@@ -21,6 +21,7 @@ export interface Job {
   logs: LogEntry[];
   metadata?: Record<string, unknown> | null;
   location?: { lat: number; lon: number } | null;
+  docPrefix?: string | null;
 }
 
 export interface FileEntry {
@@ -86,6 +87,14 @@ export class ApiClient {
    * separate name so call sites (Cancel vs. Delete buttons) read clearly. */
   deleteJob(jobId: string) {
     return this.request<void>(`/api/jobs/${jobId}`, { method: "DELETE" });
+  }
+
+  /** Deletes every run recorded for one property (a job's docPrefix, or its
+   * address if it has none yet), not just a single jobId — see
+   * `jobs.property_key()` on the API side and Layout.tsx's propertyHistory
+   * grouping, which this key must match. */
+  deleteProperty(key: string) {
+    return this.request<void>(`/api/properties?key=${encodeURIComponent(key)}`, { method: "DELETE" });
   }
 
   /** Upload a KMZ for account/parcel extraction. No Content-Type header —

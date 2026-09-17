@@ -138,3 +138,14 @@ def delete_job(job_id: str) -> None:
         return
     if not jobs.delete_job(job_id):
         raise HTTPException(status_code=404, detail="job not found")
+
+
+@app.delete("/api/properties", status_code=204)
+def delete_property(key: str) -> None:
+    """Delete every job record for the property identified by `key` — a job's
+    docPrefix, or its address when it has none yet (see `jobs.property_key()`,
+    which mirrors the frontend's propertyHistory grouping in Layout.tsx). Used
+    by the Results page's Delete button so removing a property clears every
+    duplicate/retry run for it, not just the one currently open."""
+    if jobs.delete_jobs_for_property(key) == 0:
+        raise HTTPException(status_code=404, detail="no jobs found for property")

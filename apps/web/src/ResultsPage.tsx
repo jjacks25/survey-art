@@ -95,6 +95,7 @@ export function ResultsPage() {
   const [error, setError] = useState<string | null>(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [reprocessing, setReprocessing] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Schedule B-2/cross-reference exception docs (weld_county.py writes them
@@ -166,8 +167,11 @@ export function ResultsPage() {
   function deleteRun() {
     if (!job) return;
     setDeleting(true);
+    // Delete every run recorded for this property (see api.deleteProperty),
+    // not just the one currently open — repeated searches for the same
+    // property otherwise leave duplicate history entries behind.
     api
-      .deleteJob(job.jobId)
+      .deleteProperty(job.docPrefix || job.address)
       .then(() => {
         loadHistory();
         navigate("/");
@@ -177,6 +181,18 @@ export function ResultsPage() {
         setError(String(e));
       })
       .finally(() => setDeleting(false));
+  }
+
+  function reprocess() {
+    if (!job) return;
+    setReprocessing(true);
+    api
+      .createJob(job.address, job.county)
+      .then(({ jobId }) => navigate(`/jobs/${jobId}`))
+      .catch((e) => {
+        setReprocessing(false);
+        setError(String(e));
+      });
   }
 
   if (error) {
@@ -210,9 +226,14 @@ export function ResultsPage() {
             Cancel
           </Button>
         ) : (
-          <Button variant="outline" color="red" onClick={() => setDeleteModalOpen(true)}>
-            Delete Run
-          </Button>
+          <Group gap="xs">
+            <Button variant="outline" onClick={reprocess} loading={reprocessing}>
+              Reprocess
+            </Button>
+            <Button variant="outline" color="red" onClick={() => setDeleteModalOpen(true)}>
+              Delete
+            </Button>
+          </Group>
         )}
       </Group>
       {job.error && <Alert color="red">{job.error}</Alert>}
@@ -331,17 +352,18 @@ export function ResultsPage() {
         )}
       </Modal>
 
-      <Modal opened={deleteModalOpen} onClose={() => setDeleteModalOpen(false)} title="Delete this run?" centered>
+      <Modal opened={deleteModalOpen} onClose={() => setDeleteModalOpen(false)} title="Delete this property?" centered>
         <Stack gap="md">
           <Text size="sm">
-            Downloaded documents are kept — only this run's history and logs are removed.
+            Removes every search run recorded for this property, not just this one — downloaded
+            documents are kept.
           </Text>
           <Group justify="flex-end">
             <Button variant="default" onClick={() => setDeleteModalOpen(false)} disabled={deleting}>
               Cancel
             </Button>
             <Button color="red" onClick={deleteRun} loading={deleting}>
-              Delete Run
+              Delete
             </Button>
           </Group>
         </Stack>

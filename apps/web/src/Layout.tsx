@@ -39,27 +39,57 @@ export function Layout({
   const api = useMemo(() => new ApiClient(config.apiBase, () => token), [config.apiBase, token]);
   const [history, setHistory] = useState<JobSummary[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
   const navigate = useNavigate();
   // Present only on /jobs/:jobId, undefined on the search page — used to
   // highlight the currently-open job in the sidebar.
   const { jobId } = useParams<{ jobId: string }>();
 
-  // One entry per property: keep only the most-recent search for each doc
-  // prefix (the property identifier — see worker.py's _doc_prefix()). Jobs
-  // with no doc_prefix yet (still running, or failed before upload) fall
-  // back to deduping by address instead. `history` is already most-recent-
-  // first (see jobs.list_jobs()), so the first occurrence of a key wins.
+  // Group runs by property (docPrefix, falling back to address for jobs
+  // with no docPrefix yet — still running, or failed before upload; see
+  // survey_shared.jobs.property_key(), which the API's property-level
+  // delete uses the same key for). Each group's `runs` is oldest-first for
+  // the expanded view; `latest` (the first entry, since `history` itself is
+  // most-recent-first — see jobs.list_jobs()) is what the collapsed row shows.
   const propertyHistory = useMemo(() => {
-    const seen = new Set<string>();
-    const result: JobSummary[] = [];
+    const groups = new Map<string, JobSummary[]>();
     for (const h of history) {
       const key = h.docPrefix || h.address;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      result.push(h);
+      const runs = groups.get(key);
+      if (runs) runs.push(h);
+      else groups.set(key, [h]);
     }
-    return result;
+    return Array.from(groups.entries()).map(([key, runsMostRecentFirst]) => ({
+      key,
+      latest: runsMostRecentFirst[0],
+      runs: [...runsMostRecentFirst].reverse(),
+    }));
   }, [history]);
+
+  function toggleExpanded(key: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  // Deletes one run outright (not the whole property — see ResultsPage's
+  // "Delete" button for that). `api.deleteJob` cancels a non-terminal job or
+  // deletes a terminal one's record; these are always past runs, so it's
+  // always a delete here.
+  function deleteRun(runJobId: string) {
+    setDeletingRunId(runJobId);
+    api
+      .deleteJob(runJobId)
+      .then(() => {
+        loadHistory();
+        if (jobId === runJobId) navigate("/");
+      })
+      .finally(() => setDeletingRunId(null));
+  }
 
   async function loadHistory() {
     setHistoryLoading(true);
@@ -107,33 +137,90 @@ export function Layout({
         ) : (
           <ScrollArea style={{ flex: 1 }}>
             <Stack gap={4}>
-              {propertyHistory.map((h) => (
-                <UnstyledButton
-                  key={h.docPrefix || h.jobId}
-                  onClick={() => navigate(`/jobs/${h.jobId}`)}
-                  p="xs"
-                  style={{
-                    borderRadius: 8,
-                    width: "100%",
-                    overflow: "hidden",
-                    boxSizing: "border-box",
-                    border:
-                      jobId === h.jobId
-                        ? "1px solid var(--mantine-color-blue-5)"
-                        : "1px solid transparent",
-                  }}
-                >
-                  <Stack gap={2} style={{ minWidth: 0, width: "100%" }}>
-                    <Text size="sm" fw={500} style={{ wordBreak: "break-word" }}>
-                      {h.address}
-                    </Text>
-                    <Group gap="xs">
-                      <Badge size="sm" color={statusColor(h.status)}>{h.status}</Badge>
-                      <Text size="xs" c="dimmed">{formatWhen(h.createdAt)}</Text>
+              {propertyHistory.map(({ key, latest, runs }) => {
+                const isExpanded = expanded.has(key);
+                const isOpenRun = runs.some((r) => r.jobId === jobId);
+                return (
+                  <Box key={key}>
+                    <Group gap={2} wrap="nowrap" align="stretch">
+                      <UnstyledButton
+                        onClick={() => navigate(`/jobs/${latest.jobId}`)}
+                        p="xs"
+                        style={{
+                          borderRadius: 8,
+                          flex: 1,
+                          minWidth: 0,
+                          overflow: "hidden",
+                          boxSizing: "border-box",
+                          border: isOpenRun
+                            ? "1px solid var(--mantine-color-blue-5)"
+                            : "1px solid transparent",
+                        }}
+                      >
+                        <Stack gap={2} style={{ minWidth: 0, width: "100%" }}>
+                          <Text size="sm" fw={500} style={{ wordBreak: "break-word" }}>
+                            {latest.address}
+                          </Text>
+                          <Group gap="xs">
+                            <Badge size="sm" color={statusColor(latest.status)}>{latest.status}</Badge>
+                            <Text size="xs" c="dimmed">{formatWhen(latest.createdAt)}</Text>
+                            {runs.length > 1 && (
+                              <Text size="xs" c="dimmed">({runs.length} runs)</Text>
+                            )}
+                          </Group>
+                        </Stack>
+                      </UnstyledButton>
+                      {runs.length > 1 && (
+                        <ActionIcon
+                          variant="subtle"
+                          onClick={() => toggleExpanded(key)}
+                          aria-label={isExpanded ? "Collapse runs" : "Expand runs"}
+                        >
+                          {isExpanded ? "▾" : "▸"}
+                        </ActionIcon>
+                      )}
                     </Group>
-                  </Stack>
-                </UnstyledButton>
-              ))}
+                    {isExpanded && runs.length > 1 && (
+                      <Stack gap={2} pl="md" mt={2}>
+                        {runs.map((r) => (
+                          <Group key={r.jobId} gap={2} wrap="nowrap" align="stretch">
+                            <UnstyledButton
+                              onClick={() => navigate(`/jobs/${r.jobId}`)}
+                              p="xs"
+                              style={{
+                                borderRadius: 8,
+                                flex: 1,
+                                minWidth: 0,
+                                overflow: "hidden",
+                                boxSizing: "border-box",
+                                border:
+                                  jobId === r.jobId
+                                    ? "1px solid var(--mantine-color-blue-5)"
+                                    : "1px solid transparent",
+                              }}
+                            >
+                              <Group gap="xs">
+                                <Badge size="sm" color={statusColor(r.status)}>{r.status}</Badge>
+                                <Text size="xs" c="dimmed">{formatWhen(r.createdAt)}</Text>
+                              </Group>
+                            </UnstyledButton>
+                            <ActionIcon
+                              variant="subtle"
+                              color="red"
+                              size="sm"
+                              loading={deletingRunId === r.jobId}
+                              onClick={() => deleteRun(r.jobId)}
+                              aria-label="Delete this run"
+                            >
+                              ×
+                            </ActionIcon>
+                          </Group>
+                        ))}
+                      </Stack>
+                    )}
+                  </Box>
+                );
+              })}
             </Stack>
           </ScrollArea>
         )}
