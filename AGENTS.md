@@ -87,6 +87,7 @@ pipeline.py         Dispatches to county-specific scraper via COUNTY_SCRAPERS di
 | `overview.py` | Incremental `overview.json` writer (per-phase, crash-safe) |
 | `id_extraction.py` | Reads a survey PDF for the record IDs it cites — text layer if there is one, else Bedrock over tiled page images |
 | `worker.py` | AWS job entrypoint (Fargate one-shot or local SQS poll) |
+| `costs.py` | All-in per-run cost estimate (one line per AWS service) for the Run Details tab |
 | `console.py` | Rich terminal UI helpers |
 | `types.py` | Shared dataclasses (`DocumentLink`) |
 

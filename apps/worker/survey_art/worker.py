@@ -26,9 +26,11 @@ import queue
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 
+from survey_art import costs
 from survey_art.download import _slug
 from survey_art.geocode import address_to_county
 from survey_art.id_extraction import make_thumbnail
@@ -81,20 +83,52 @@ def _bedrock_token_cost(model: str, in_tok: int, out_tok: int) -> float:
     return 0.0
 
 
-def _cost_fields(start_time: float, bedrock_cost_usd: float, in_tok: int, out_tok: int) -> dict:
-    """Cost breakdown for one job run, for jobs.update_status()."""
+def _cost_fields(
+    start_time: float,
+    bedrock_cost_usd: float,
+    in_tok: int,
+    out_tok: int,
+    *,
+    saved: list[Path] | None = None,
+    log_volume: tuple[int, int] = (0, 0),
+) -> dict:
+    """Cost breakdown for one job run, for jobs.update_status().
+
+    `costs` is the full per-service itemisation (see costs.py). The four scalar
+    fields alongside it are the two biggest lines repeated, kept because job
+    records written before `costs` existed still carry them and DynamoDB items
+    don't migrate themselves.
+
+    `log_volume` is read before the log handler has finished draining its queue,
+    so it misses the handful of lines this call itself is about to emit — an
+    estimate whose two consumers (DynamoDB write units, CloudWatch ingestion)
+    together come to a fraction of a cent, so it isn't worth restructuring the
+    job's exit paths to get exact.
+    """
     if not bedrock_cost_usd and (in_tok or out_tok):
         bedrock_cost_usd = _bedrock_token_cost(get_settings().id_extraction_model, in_tok, out_tok)
     elapsed = time.time() - start_time
     fargate_cost = (elapsed / 3600) * (
         _FARGATE_VCPUS * _FARGATE_VCPU_HOUR_USD + _FARGATE_MEM_GB * _FARGATE_GB_HOUR_USD
     )
+    files = [p for p in (saved or []) if p.is_file()]
+    log_appends, log_bytes = log_volume
     return {
         "bedrock_cost_usd": round(bedrock_cost_usd, 4),
         "bedrock_input_tokens": in_tok,
         "bedrock_output_tokens": out_tok,
         "fargate_cost_usd": round(fargate_cost, 4),
         "fargate_seconds": round(elapsed, 1),
+        "costs": costs.estimate(
+            elapsed_s=elapsed,
+            bedrock_usd=bedrock_cost_usd,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            document_bytes=sum(p.stat().st_size for p in files),
+            document_count=len(files),
+            log_appends=log_appends,
+            log_bytes=log_bytes,
+        ),
     }
 
 
@@ -116,11 +150,19 @@ class _DynamoLogHandler(logging.Handler):
         super().__init__(level=logging.INFO)
         self.job_id = job_id
         self.setFormatter(logging.Formatter("%(message)s"))
+        # How much log this run actually wrote — the DynamoDB and CloudWatch lines
+        # of the cost breakdown are both driven by it (see costs.py). Only ever
+        # touched from the single QueueListener thread that calls emit().
+        self.appends = 0
+        self.bytes = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             kind = "milestone" if record.name == narration.name else "detail"
-            jobs.append_log(self.job_id, self.format(record), kind=kind)
+            message = self.format(record)
+            self.appends += 1
+            self.bytes += len(message.encode())
+            jobs.append_log(self.job_id, message, kind=kind)
         except Exception:  # noqa: BLE001 — logging must never break the job
             pass
 
@@ -139,10 +181,17 @@ class _JobLogHandler(logging.handlers.QueueHandler):
         self._queue: queue.Queue = queue.Queue()
         super().__init__(self._queue)
         self.setLevel(logging.INFO)
+        self._sink = _DynamoLogHandler(job_id)
         self._listener = logging.handlers.QueueListener(
-            self._queue, _DynamoLogHandler(job_id), respect_handler_level=True
+            self._queue, self._sink, respect_handler_level=True
         )
         self._listener.start()
+
+    @property
+    def volume(self) -> tuple[int, int]:
+        """`(appends, bytes)` written so far. Only meaningful after `close()`,
+        which blocks until the listener has drained the queue."""
+        return self._sink.appends, self._sink.bytes
 
     def close(self) -> None:
         self._listener.stop()
@@ -182,21 +231,29 @@ def _resolve_location(address: str, metadata: dict | None) -> dict | None:
     return None
 
 
+# Thumbnail rendering is local CPU work on a 1-vCPU Fargate task, so this is
+# about overlapping decode with I/O rather than about parallel compute.
+_TAIL_WORKERS = 8
+
+
 def _make_thumbnails(saved: list[Path]) -> dict[str, bytes]:
     """First-page JPEG thumbnails for every saved PDF, keyed by filename — the
     same key `upload_thumbnails()`/`list_result_files()` join back to each
     document by. Skips non-PDFs and anything `make_thumbnail()` can't render
     (e.g. a vector PDF with no embedded page image) rather than failing the
     job over a missing thumbnail; those cards just fall back to the frontend's
-    iframe preview."""
-    thumbnails: dict[str, bytes] = {}
-    for path in saved:
-        if path.suffix.lower() != ".pdf":
-            continue
-        jpeg_bytes = make_thumbnail(path)
-        if jpeg_bytes is not None:
-            thumbnails[path.name] = jpeg_bytes
-    return thumbnails
+    iframe preview.
+
+    Rendered in a thread pool: a property can bring back ~90 documents, and each
+    thumbnail decodes a full-page scan raster, so doing them one at a time added
+    minutes to the end of a job. Pillow releases the GIL for decode/resize, so
+    threads are enough — no process pool needed."""
+    pdfs = [p for p in saved if p.suffix.lower() == ".pdf"]
+    if not pdfs:
+        return {}
+    with ThreadPoolExecutor(max_workers=_TAIL_WORKERS) as pool:
+        rendered = pool.map(make_thumbnail, pdfs)
+        return {p.name: jpeg for p, jpeg in zip(pdfs, rendered, strict=True) if jpeg is not None}
 
 
 def _doc_prefix(tmp: Path, saved: list[Path], input_address: str, metadata: dict | None) -> str:
@@ -293,7 +350,10 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
                     job_id,
                     jobs.FAILED,
                     error=err,
-                    **_cost_fields(start_time, cost, in_tok, out_tok),
+                    **_cost_fields(
+                        start_time, cost, in_tok, out_tok,
+                        saved=saved, log_volume=log_handler.volume,
+                    ),
                 )
                 narration.info("We hit a problem and couldn't finish this search.")
                 logger.error("Job %s FAILED: %s", job_id, err)
@@ -311,7 +371,10 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
                 metadata=metadata,
                 location=location,
                 doc_prefix=doc_prefix,
-                **_cost_fields(start_time, cost, in_tok, out_tok),
+                **_cost_fields(
+                    start_time, cost, in_tok, out_tok,
+                    saved=saved, log_volume=log_handler.volume,
+                ),
             )
             if (metadata or {}).get("limits", {}).get("cross_reference_depth_limit"):
                 narration.info(
@@ -325,7 +388,10 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
         narration.info("Something unexpected went wrong and the search had to stop.")
         logger.exception("Job %s crashed", job_id)
         jobs.update_status(
-            job_id, jobs.FAILED, error=str(exc), **_cost_fields(start_time, 0.0, 0, 0)
+            job_id,
+            jobs.FAILED,
+            error=str(exc),
+            **_cost_fields(start_time, 0.0, 0, 0, log_volume=log_handler.volume),
         )
         return 1
     finally:

@@ -43,6 +43,14 @@ Single-key DynamoDB table (`jobId`). Status: `PENDING` → `RUNNING` → `COMPLE
   set once at COMPLETED. `list_result_files()` needs this to know where to list from —
   a job with no `doc_prefix` (not yet complete, or failed before upload) has no listable
   files.
+- `costs: list[CostLine]` — the all-in per-service cost breakdown for the run, produced
+  by `apps/worker/survey_art/costs.py` (which owns the rates and the arithmetic; this
+  package only round-trips it). `CostLine.usd` is a typed `float`, so DynamoDB's
+  `Decimal`s coerce back on read instead of reaching the JSON encoder — keep it typed if
+  you add fields. The older `bedrock_cost_usd`/`fargate_cost_usd`/token/seconds scalars
+  stay alongside it: job records written before `costs` existed still carry only those,
+  and DynamoDB items don't migrate themselves, so the frontend prefers `costs` and falls
+  back to them.
 - `expires_at: int | None` — DynamoDB TTL attribute (`expiresAt`), set by `create_job()`
   to `created_at + JOB_TTL_SECONDS` (7 days), kept in sync with the `documents/` S3
   lifecycle rule (see [`infra/AGENTS.md`](../../infra/AGENTS.md)) — a job record and the
@@ -84,7 +92,7 @@ but 404s/DNS-fails from the host browser.
 ## One `STORAGE_BUCKET`, split by prefix
 
 There's a single S3 bucket (`STORAGE_BUCKET`) for everything the app writes, divided into
-three namespaces that get different retention — not three separate bucket resources,
+four namespaces that get different retention — not four separate bucket resources,
 since S3 lifecycle rules support a `Prefix` filter and each namespace gets its own scoped
 rule:
 
@@ -100,8 +108,21 @@ rule:
   exact log outlives the DynamoDB job record it came from, useful for debugging an issue
   reported after the fact.
 
-`DOCUMENTS_PREFIX = "documents"`, `SCRATCH_PREFIX = "scratch"`, and `LOGS_PREFIX =
-"property-search-logs"` in `jobs.py` are the only places that need to know this split.
+- `extractions/` — cached "which documents does this recorded document cite" results,
+  keyed by reception number (`get_cached_extraction()`/`put_cached_extraction()`).
+  Deliberately has **no expiry rule**: a recorded document is immutable, so the answer
+  stays correct indefinitely, and every hit skips a Bedrock vision call — the largest
+  cost in a run by a wide margin (see
+  [`apps/worker/survey_art/AGENTS.md`](../../apps/worker/survey_art/AGENTS.md)). Entries
+  are a few hundred bytes and are *meant* to outlive the `documents/` copies they
+  describe, so a re-run a month later still skips the model even though the PDF itself
+  aged out. Both helpers swallow every error — a cache that's down must cost money, not
+  correctness — which also means a missing `s3:GetObject` grant on `TaskRole` shows up
+  as "every run costs full price", never as a failure.
+
+`DOCUMENTS_PREFIX = "documents"`, `SCRATCH_PREFIX = "scratch"`, `LOGS_PREFIX =
+"property-search-logs"`, and `EXTRACTIONS_PREFIX = "extractions"` in `jobs.py` are the
+only places that need to know this split.
 
 ## `upload_map_image()`
 
@@ -142,6 +163,13 @@ directly rather than a `jobId`.
 **This is deliberately not per-job.** Two searches for the same property land their
 documents in the same prefix, so `documents/` accumulates a durable, browsable archive
 by property rather than scattering copies across opaque job IDs.
+
+`upload_documents()` and `upload_thumbnails()` both PUT concurrently
+(`_UPLOAD_WORKERS`): a property can bring back ~90 documents, and one-at-a-time uploads
+put minutes of pure network latency at the end of every job. A boto3 **client** is
+thread-safe for concurrent calls like this — the `resource` layer is not, so don't
+follow this pattern with `aws.resource(...)`. `pool.map()` re-raises, so a failed upload
+still fails the job rather than silently under-reporting `file_count`.
 
 When listing, `list_result_files()` returns just the file's basename as `name` (`key.rsplit("/", 1)[-1]`),
 not the full key — a multi-segment prefix means naively splitting on the *first* `/` (the

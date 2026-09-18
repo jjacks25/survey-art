@@ -146,17 +146,24 @@ no benefit.
   (see [`packages/survey_shared/AGENTS.md`](../../packages/survey_shared/AGENTS.md));
   `scratch/maps/{jobId}.png` is ephemeral per-job output (map screenshots);
   `property-search-logs/{jobId}.log` is one complete text log per job
-  (`jobs.upload_job_log()`, same doc). The bucket's `LifecycleConfiguration` has three
+  (`jobs.upload_job_log()`, same doc). The bucket's `LifecycleConfiguration` has four
   `Prefix`-scoped rules — S3 lifecycle rules support prefix filters, so one bucket can
   carry multiple differently-aging namespaces without a second bucket resource:
   `scratch/` expires after 90 days (+ intelligent tiering), `documents/` after 7 days
   (kept in sync with `JobsTable`'s TTL, see above), `property-search-logs/` after 30
   days — deliberately longer than `JobsTable`'s 7-day TTL, so a run's exact log outlives
-  the job record it came from. `TaskRole` gets `s3:PutObject` on the whole bucket
-  (worker writes to all three prefixes); `ApiFunctionRole` gets `s3:GetObject`/
-  `ListBucket` (API presigns downloads from `documents/`). If a future write needs
-  different retention than these three prefixes, give it its own prefix and its own
-  scoped lifecycle rule rather than reaching for a new bucket.
+  the job record it came from; `extractions/{fingerprint}/{reception}.json` caches what
+  each recorded document cites and has **no expiry rule at all** (a recorded document is
+  immutable, so the answer never goes stale, and each hit skips the Bedrock vision call
+  that dominates a run's cost — see
+  [`apps/worker/survey_art/AGENTS.md`](../apps/worker/survey_art/AGENTS.md)). It still
+  gets a `NoncurrentVersionExpiration` rule, since bucket versioning is on and would
+  otherwise keep every superseded copy forever. `TaskRole` gets `s3:PutObject` **and
+  `s3:GetObject`** on the whole bucket (the worker writes all four prefixes and reads
+  back `extractions/`); `ApiFunctionRole` gets `s3:GetObject`/`ListBucket` (API presigns
+  downloads from `documents/`). If a future write needs different retention than these
+  four prefixes, give it its own prefix and its own scoped lifecycle rule rather than
+  reaching for a new bucket.
 
 ## Deploy flow
 

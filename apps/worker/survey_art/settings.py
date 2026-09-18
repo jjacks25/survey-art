@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     weld_recorder_username: str = ""
     weld_recorder_password: str = ""
 
+    # How many recorder documents to fetch at once (`_download_documents` in
+    # scrapers/weld_county.py). This is a politeness limit against a county
+    # server, not a throughput target: each worker still paces its own requests
+    # exactly as the serial version did, so this multiplies the request rate
+    # against recording.weld.gov directly. Raise it a step at a time and watch
+    # the job log for retry warnings ("No printCustom button", "returned HTTP")
+    # before going higher — the site has rate-limited bulk fetches before.
+    weld_download_concurrency: int = 4
+
     # Legacy eRecording credentials (old Java system — no longer used)
     weld_erecording_username: str = ""
     weld_erecording_password: str = ""
