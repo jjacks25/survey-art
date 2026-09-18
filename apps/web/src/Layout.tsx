@@ -49,9 +49,9 @@ export function Layout({
   // Group runs by property (docPrefix, falling back to address for jobs
   // with no docPrefix yet — still running, or failed before upload; see
   // survey_shared.jobs.property_key(), which the API's property-level
-  // delete uses the same key for). Each group's `runs` is oldest-first for
-  // the expanded view; `latest` (the first entry, since `history` itself is
-  // most-recent-first — see jobs.list_jobs()) is what the collapsed row shows.
+  // delete uses the same key for). Each group's `runs` is most-recent-first,
+  // same as `history` itself (see jobs.list_jobs()); `latest` is just its
+  // first entry — what the collapsed row shows.
   const propertyHistory = useMemo(() => {
     const groups = new Map<string, JobSummary[]>();
     for (const h of history) {
@@ -63,7 +63,7 @@ export function Layout({
     return Array.from(groups.entries()).map(([key, runsMostRecentFirst]) => ({
       key,
       latest: runsMostRecentFirst[0],
-      runs: [...runsMostRecentFirst].reverse(),
+      runs: runsMostRecentFirst,
     }));
   }, [history]);
 
