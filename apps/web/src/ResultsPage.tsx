@@ -246,13 +246,22 @@ export function ResultsPage() {
   );
 
   // job.metadata.extracted_ids (overview.json, see id_extraction.py) lists every
-  // record ID the ALTA cites; only reception_number entries are auto-fetchable, and
-  // demo mode caps how many of those actually get downloaded. Comparing the two shows
-  // "fetched X of Y" so a demo run doesn't read as though it found everything.
+  // citation any downloaded document made — one row per (citing document, cited
+  // ID), not one row per unique ID, since weld_county.py's cross-reference walk
+  // deliberately keeps that provenance (which document cited what). The same
+  // reception number recurs once per document that happens to cite it, so this
+  // count dedupes by `id` before comparing against exceptionFiles.length in the
+  // "fetched X of Y" label — otherwise a property with a dense citation graph
+  // (the same easement cited by several documents) inflates the total.
   const totalReceptionIds = useMemo(() => {
     const ids = job?.metadata?.extracted_ids;
     if (!Array.isArray(ids)) return null;
-    return ids.filter((i) => (i as { id_type?: string })?.id_type === "reception_number").length;
+    const unique = new Set(
+      ids
+        .filter((i) => (i as { id_type?: string })?.id_type === "reception_number")
+        .map((i) => (i as { id?: string }).id)
+    );
+    return unique.size;
   }, [job?.metadata]);
 
   async function poll(id: string) {
