@@ -1,14 +1,20 @@
 """All CloudFormation + SPA deploys for survey-art, in one operator tool.
 
-Manual tool — run from your own machine using your own local AWS credentials
-(e.g. `aws sso login`), never from CI. Three modes, chosen by the mutually exclusive
-flags below:
+Run from your own machine using your own local AWS credentials (e.g. `aws sso login`)
+for --bootstrap and --github-oidc (chicken-and-egg: nothing exists yet for CI to
+assume). --all/--stack/--web run identically from either your machine or the GitHub
+Actions CD workflow, which assumes the role --github-oidc provisions. Modes, chosen by
+the mutually exclusive flags below:
 
   --bootstrap   Tier 1: create/update the CloudFormation template bucket via
                 TemplateBody (infra/cloudformation/bootstrap.yaml). No template bucket
                 exists yet at this point, so this is the one stack that can't use
                 TemplateURL. Run once per account. Safe to re-run (identical template
                 is a no-op).
+  --github-oidc Create/update the GitHub Actions OIDC provider + CD deploy role
+                (infra/cloudformation/github-oidc.yaml), also via TemplateBody. Run
+                once per account; prints the role ARN to set as the
+                AWS_DEPLOY_ROLE_ARN repo variable.
   --all/--stack Tier 2: deploy the network / ecr / backend / frontend stacks (in that
                 order for --all) via TemplateURL + change sets against the bootstrap bucket.
                 Uploads the template, creates a change set (CREATE if new, else
@@ -22,6 +28,7 @@ flags below:
 
 Usage:
     uv run python infra/deploy.py --bootstrap
+    uv run python infra/deploy.py --github-oidc
     uv run python infra/deploy.py --all
     uv run python infra/deploy.py --stack backend --param ApiImageTag=abc123
     uv run python infra/deploy.py --all --diff        # preview only
@@ -47,6 +54,7 @@ logger = logging.getLogger(__name__)
 CFN_DIR = Path(__file__).parent / "cloudformation"
 PARAMS_DIR = Path(__file__).parent / "params"
 BOOTSTRAP_TEMPLATE = CFN_DIR / "bootstrap.yaml"
+GITHUB_OIDC_TEMPLATE = CFN_DIR / "github-oidc.yaml"
 DISPATCHER_SRC = Path(__file__).parent.parent / "apps" / "dispatcher" / "handler.py"
 DISPATCHER_MARKER = "# {{ dispatcher_handler }}"
 # CloudFormation's inline Lambda code (`Code.ZipFile`) caps at 4096 characters.
@@ -116,6 +124,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--all", action="store_true", help="Deploy network+ecr+backend+frontend, in order."
     )
     mode.add_argument("--stack", choices=[s[0] for s in STACKS], help="Deploy a single app stack.")
+    mode.add_argument(
+        "--github-oidc",
+        action="store_true",
+        help="Create/update the GitHub Actions OIDC provider + CD deploy role.",
+    )
+
+    g_oidc = p.add_argument_group("--github-oidc options")
+    g_oidc.add_argument("--github-org", default="jjacks25")
+    g_oidc.add_argument("--github-repo", default="survey-art")
+    g_oidc.add_argument(
+        "--no-oidc-provider",
+        action="store_true",
+        help="Skip creating the OIDC provider itself (already exists in this account).",
+    )
 
     g_bootstrap = p.add_argument_group("--bootstrap options")
     g_bootstrap.add_argument(
@@ -191,17 +213,25 @@ def _failure_reasons(cfn, stack_name: str) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def deploy_stack(cfn, stack_name: str, template_body: str, parameters: list[dict]) -> None:
+def deploy_stack(
+    cfn, stack_name: str, template_body: str, parameters: list[dict], capabilities: list[str] | None = None
+) -> None:
     """Create-or-update a stack by raw TemplateBody.
 
-    Used only for bootstrap — every other stack goes through the TemplateURL +
-    change-set path in deploy_one().
+    Used for bootstrap and github-oidc — every other stack goes through the
+    TemplateURL + change-set path in deploy_one().
     """
+    capabilities = capabilities or []
     status = stack_status(cfn, stack_name)
 
     if status is None:
         logger.info("Creating stack %s", stack_name)
-        cfn.create_stack(StackName=stack_name, TemplateBody=template_body, Parameters=parameters)
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=template_body,
+            Parameters=parameters,
+            Capabilities=capabilities,
+        )
         cfn.get_waiter("stack_create_complete").wait(StackName=stack_name)
         return
 
@@ -217,7 +247,12 @@ def deploy_stack(cfn, stack_name: str, template_body: str, parameters: list[dict
 
     logger.info("Stack %s exists (status %s); attempting update", stack_name, status)
     try:
-        cfn.update_stack(StackName=stack_name, TemplateBody=template_body, Parameters=parameters)
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=template_body,
+            Parameters=parameters,
+            Capabilities=capabilities,
+        )
     except ClientError as err:
         if err.response["Error"]["Code"] == "ValidationError" and NO_UPDATES_MESSAGE in str(err):
             logger.info("No updates to the stack detected, skipping")
@@ -243,6 +278,27 @@ def run_bootstrap(cfn, args: argparse.Namespace) -> int:
     outputs = stack_outputs(cfn, args.bootstrap_stack)
     print("Bootstrap complete.")
     print(f"  Template bucket : {outputs.get('TemplateBucketName')}")
+    return 0
+
+
+def run_github_oidc(cfn, args: argparse.Namespace) -> int:
+    template_body = GITHUB_OIDC_TEMPLATE.read_text()
+    stack_name = f"{args.project_name}-github-oidc"
+    parameters = [
+        {"ParameterKey": "ProjectName", "ParameterValue": args.project_name},
+        {"ParameterKey": "GitHubOrg", "ParameterValue": args.github_org},
+        {"ParameterKey": "GitHubRepo", "ParameterValue": args.github_repo},
+        {
+            "ParameterKey": "CreateOidcProvider",
+            "ParameterValue": "false" if args.no_oidc_provider else "true",
+        },
+    ]
+    deploy_stack(cfn, stack_name, template_body, parameters, capabilities=["CAPABILITY_NAMED_IAM"])
+
+    outputs = stack_outputs(cfn, stack_name)
+    print("GitHub OIDC setup complete.")
+    print(f"  Deploy role ARN : {outputs.get('DeployRoleArn')}")
+    print("  Set this as the AWS_DEPLOY_ROLE_ARN repository variable in GitHub.")
     return 0
 
 
@@ -498,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.bootstrap:
         return run_bootstrap(cfn, args)
+    if args.github_oidc:
+        return run_github_oidc(cfn, args)
     if args.web:
         return run_web(cfn, session.client("s3"), session.client("cloudfront"), args)
     return run_stacks(cfn, session.client("s3"), args)

@@ -89,17 +89,19 @@ build-push: ## Deploy | Build and push the api + worker images to ECR (TAG defau
 # `make deploy <word>` — the words below are consumed by the `deploy` recipe as an
 # argument (via MAKECMDGOALS), not built as their own targets, so give them empty
 # recipes rather than leaving them as unknown targets.
-bootstrap network ecr backend frontend all web diff destroy: ;
+bootstrap github-oidc network ecr backend frontend all web diff destroy: ;
 
 DEPLOY_ARG := $(word 2,$(MAKECMDGOALS))
 
-deploy: ## Deploy | AWS deploy — `make deploy <bootstrap|network|ecr|backend|frontend|all|web|diff|destroy|help>`
+deploy: ## Deploy | AWS deploy — `make deploy <bootstrap|github-oidc|network|ecr|backend|frontend|all|web|diff|destroy|help>`
 ifeq ($(DEPLOY_ARG),)
 	@$(MAKE) --no-print-directory _deploy-help
 else ifeq ($(DEPLOY_ARG),help)
 	@$(MAKE) --no-print-directory _deploy-help
 else ifeq ($(DEPLOY_ARG),bootstrap)
 	$(DEPLOY) infra/deploy.py --bootstrap --region $(REGION) $(ARGS)
+else ifeq ($(DEPLOY_ARG),github-oidc)
+	$(DEPLOY) infra/deploy.py --github-oidc --region $(REGION) $(ARGS)
 else ifeq ($(DEPLOY_ARG),web)
 	docker run --rm -v $(PWD)/apps/web:/app -w /app node:20-slim sh -c "npm install && npm run build"
 	$(DEPLOY) infra/deploy.py --web --region $(REGION) $(ARGS)
@@ -129,6 +131,7 @@ _deploy-help:
 	@echo "Usage: make deploy <target> [REGION=$(REGION)] [TAG=<sha>] [ARGS=\"--extra --flags\"]"
 	@echo ""
 	@echo "  bootstrap   One-time: create the CloudFormation template bucket"
+	@echo "  github-oidc One-time: create the GitHub Actions OIDC provider + CD deploy role"
 	@echo "  network     Deploy the network stack (VPC)"
 	@echo "  ecr         Deploy the ecr stack (api + worker repositories)"
 	@echo "  backend     Deploy the backend stack (API, worker, jobs, auth)"

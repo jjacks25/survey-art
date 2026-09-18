@@ -14,8 +14,8 @@ with everything defined in CloudFormation.
 | Scraper egress | **Public subnet**, public IP, no inbound | Avoids NAT Gateway cost (~$32/mo) |
 | Access control | **Cognito** login (JWT) at API Gateway | Managed, free-tier, password-protected |
 | Data | **DynamoDB** (jobs, saved properties) + **S3** (documents) | No relational DB needed; both serverless |
-| Deploy auth | Your own **local AWS credentials** (SSO/profile) | Deploys run from your machine only — no CI identity |
-| IaC | **CloudFormation** in 5 stacks + boto3 change-set harness | Reviewable, repeatable, ordered |
+| Deploy auth | **GitHub Actions OIDC** on merge to main; local AWS credentials (SSO/profile) otherwise | No stored AWS keys in GitHub; free hosted runner, no extra AWS compute for CD itself |
+| IaC | **CloudFormation** in 6 stacks + boto3 change-set harness | Reviewable, repeatable, ordered |
 
 Idle cost is ≈ **$0** (everything scales to zero / free tier); you pay per scrape
 (a few minutes of one small Fargate task) plus ~$0.40/mo for the Secrets Manager secret.
