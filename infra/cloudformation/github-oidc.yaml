@@ -86,21 +86,21 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*/*'
               - Sid: TemplateBucket
+                # s3:* (not just object-level actions) — bootstrap.yaml's CloudFormation
+                # calls need bucket-management verbs too (CreateBucket, PutBucketPolicy,
+                # PutLifecycleConfiguration, ...), which `make deploy all` now runs via
+                # CD, not just from a laptop.
                 Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
+                Action: s3:*
                 Resource:
                   - !Sub 'arn:aws:s3:::${ProjectName}-*-cfn-templates-*'
                   - !Sub 'arn:aws:s3:::${ProjectName}-*-cfn-templates-*/*'
               - Sid: AppBuckets
+                # Same reasoning — backend.yaml's StorageBucket and frontend.yaml's
+                # SiteBucket are also created/updated by CloudFormation, not just
+                # written to at runtime.
                 Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:DeleteObject
-                  - s3:ListBucket
+                Action: s3:*
                 Resource:
                   - !Sub 'arn:aws:s3:::${ProjectName}-*'
                   - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
@@ -260,12 +260,17 @@ Resources:
                   - ec2:DescribeTags
                 Resource: '*'
               - Sid: IamForAppRoles
+                # ${ProjectName}-* also covers this role's own name
+                # (${ProjectName}-github-deploy) — `make deploy all` now runs
+                # --github-oidc too, including via CD, so the role needs to be able
+                # to update itself (e.g. a future trust-policy or policy-doc change).
                 Effect: Allow
                 Action:
                   - iam:CreateRole
                   - iam:DeleteRole
                   - iam:GetRole
                   - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
                   - iam:TagRole
                   - iam:PutRolePolicy
                   - iam:DeleteRolePolicy
@@ -275,6 +280,17 @@ Resources:
                   - iam:PassRole
                 Resource:
                   - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+              - Sid: IamOidcProvider
+                Effect: Allow
+                Action:
+                  - iam:GetOpenIDConnectProvider
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:UpdateOpenIDConnectProviderThumbprint
+                  - iam:TagOpenIDConnectProvider
+                  - iam:UntagOpenIDConnectProvider
+                  - iam:ListOpenIDConnectProviderTags
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
               - Sid: CloudFrontDistribution
                 Effect: Allow
                 Action:

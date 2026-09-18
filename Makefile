@@ -111,6 +111,7 @@ else ifeq ($(DEPLOY_ARG),destroy)
 	$(DEPLOY) infra/deploy.py --all --region $(REGION) --destroy $(ARGS)
 else ifeq ($(DEPLOY_ARG),all)
 	$(DEPLOY) infra/deploy.py --bootstrap --region $(REGION)
+	$(DEPLOY) infra/deploy.py --github-oidc --region $(REGION)
 	$(DEPLOY) infra/deploy.py --stack network --region $(REGION)
 	$(DEPLOY) infra/deploy.py --stack ecr --region $(REGION)
 	$(MAKE) build-push TAG=$(TAG)
@@ -131,12 +132,12 @@ _deploy-help:
 	@echo "Usage: make deploy <target> [REGION=$(REGION)] [TAG=<sha>] [ARGS=\"--extra --flags\"]"
 	@echo ""
 	@echo "  bootstrap   One-time: create the CloudFormation template bucket"
-	@echo "  github-oidc One-time: create the GitHub Actions OIDC provider + CD deploy role"
+	@echo "  github-oidc Create/update the GitHub Actions OIDC provider + CD deploy role"
 	@echo "  network     Deploy the network stack (VPC)"
 	@echo "  ecr         Deploy the ecr stack (api + worker repositories)"
 	@echo "  backend     Deploy the backend stack (API, worker, jobs, auth)"
 	@echo "  frontend    Deploy the frontend stack (S3 site, CloudFront)"
-	@echo "  all         Deploy everything from scratch: bootstrap -> network -> ecr -> build+push -> backend+frontend -> web"
+	@echo "  all         Deploy everything: bootstrap -> github-oidc -> network -> ecr -> build+push -> backend+frontend -> web"
 	@echo "  web         Build the SPA and publish it (config.json, S3 sync, CloudFront invalidation)"
 	@echo "  diff        Preview change sets for network+ecr+backend+frontend without executing"
 	@echo "  destroy     Delete the app stacks (frontend, backend, ecr, network) — bootstrap is left intact"

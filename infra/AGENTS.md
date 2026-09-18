@@ -73,32 +73,38 @@ no benefit.
   (SQS→ECS RunTask), API Gateway HTTP API with a Cognito JWT authorizer.
 - **frontend.yaml** — private S3 SPA bucket (OAC), CloudFront (default → S3, `/api/*`
   → API Gateway origin), optional WAF WebACL (`WebAclArn`, must be us-east-1 scope).
-- **github-oidc.yaml** — not in the deploy order above; a standalone stack
-  (`survey-art-github-oidc`) holding only the GitHub Actions OIDC provider + CD deploy
-  role, deployed once via TemplateBody like bootstrap. See "CD on merge to main" below.
+- **github-oidc.yaml** — not in the exported-dependency deploy order above (nothing
+  else depends on its outputs); a standalone stack (`survey-art-github-oidc`) holding
+  only the GitHub Actions OIDC provider + CD deploy role, deployed like bootstrap via
+  TemplateBody. `make deploy all` runs it right after `--bootstrap`. See "CD on merge
+  to main" below.
 
 ## Key decisions & rationale
 
 - **CD on merge to main, via GitHub OIDC — no stored AWS keys.**
   [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) runs on every push
   to `main`: `make deploy all` — the exact same command (and target order:
-  bootstrap → network → ecr → build+push → backend → frontend → web) as a manual full
-  deploy from a laptop, so CI doesn't carry a second, narrower deploy path to keep in
-  sync with the Makefile. `bootstrap`/`network`/`ecr` are cheap no-ops via empty change
-  sets on every run after the first. It assumes `survey-art-github-deploy`
-  (`cloudformation/github-oidc.yaml`, its own stack — the *only* CI-related AWS
-  resources) via `aws-actions/configure-aws-credentials` +
+  bootstrap → github-oidc → network → ecr → build+push → backend → frontend → web) as
+  a manual full deploy from a laptop, so CI doesn't carry a second, narrower deploy path
+  to keep in sync with the Makefile. `bootstrap`/`github-oidc`/`network`/`ecr` are cheap
+  no-ops via empty change sets on every run after the first — including `github-oidc`
+  itself, so the deploy role's own permissions and trust policy stay in sync with the
+  template even when CD is what's applying the update. It assumes
+  `survey-art-github-deploy` (`cloudformation/github-oidc.yaml`, its own stack — the
+  *only* CI-related AWS resources) via `aws-actions/configure-aws-credentials` +
   `sts:AssumeRoleWithWebIdentity`, scoped to `repo:jjacks25/survey-art:ref:refs/heads/main`
   — no long-lived key ever leaves AWS. Runs on GitHub's free hosted runner, so the CD
   pipeline itself costs nothing beyond Actions minutes; it triggers no extra AWS compute
   (no CodeBuild/Lambda-driven deploy). You can still deploy everything from your own
   machine too — `deploy.py` uses whatever AWS credentials are active in your shell
   (`aws sso login` or a profile via `--profile`); the OIDC role is CI's identity, not a
-  replacement for local access. `--bootstrap` and `--github-oidc` (the OIDC
-  provider/role stack itself) are run from an operator's own credentials only, once —
-  chicken-and-egg, nothing exists yet for CI to assume, and `make deploy all` doesn't
-  touch either. Compute (Lambda/Fargate) still uses its own task/execution roles, never
-  the deploy role.
+  replacement for local access. The **very first** `make deploy github-oidc` (or
+  `make deploy all`) after a fresh account still has to run from an operator's own
+  credentials — chicken-and-egg, nothing exists yet for CI to assume — but every run
+  after that, CD keeps the stack itself up to date too, including its own IAM policy
+  (the role's `IamForAppRoles`/`IamOidcProvider` statements cover updating itself).
+  Compute (Lambda/Fargate) still uses its own task/execution roles, never the deploy
+  role.
 - **Public-subnet Fargate, no NAT Gateway.** The scraper needs heavy egress to
   arbitrary county sites; a public IP with an egress-only SG avoids the ~$32/mo NAT
   Gateway. Trade-off: the task is not in a private subnet (a deliberate cost choice).
