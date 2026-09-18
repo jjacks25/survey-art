@@ -31,6 +31,9 @@ class _FakeOverview:
     def set_section(self, section: str, value) -> None:
         self.sections[section] = value
 
+    def get(self, section: str, default=None):
+        return self.sections.get(section, default)
+
 
 @pytest.fixture(autouse=True)
 def _no_extraction_cache(monkeypatch):

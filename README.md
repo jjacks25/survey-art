@@ -138,6 +138,7 @@ the worker talks to real AWS for that one client and to LocalStack for everythin
 | `WELD_RECORDER_USERNAME` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `WELD_RECORDER_PASSWORD` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `WELD_DOWNLOAD_CONCURRENCY` | No | `4` | How many recorder documents to fetch at once. A politeness limit against a county server, not a throughput dial — raise it a step at a time and watch for retry warnings in the log |
+| `WELD_SECTION_DOWNLOAD_LIMIT` | No | `250` | How many of the section-wide scan's documents to download. The search itself is complete — it sweeps past the recorder's 100-row render cap by recording date, and one section can hold 800+ documents — so this is the cost/runtime dial. Every document found is listed in `overview.json` either way; the ones fetched are the most survey-relevant first (plats and surveys, then easements/ROW, then deeds, financing paper last). `0` means no cap |
 | `CO_DENVER_USERNAME` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
 | `CO_DENVER_PASSWORD` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
 | `WELD_HEADED` | No | `0` | Set to `1` to show the Playwright browser window |

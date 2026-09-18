@@ -58,12 +58,14 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 from pydantic import ValidationError
 
 from survey_art.county_sites import SUPPORTED_COUNTIES
+from survey_art.doc_classify import CATEGORIES, classify, reception_sort_key
 from survey_art.document_filter import DEFAULT_FILTER, DocumentFilter
 from survey_art.download import download_dir as make_download_dir
 from survey_art.geocode import GeocodedAddress
@@ -1276,6 +1278,8 @@ async def _run_advanced_search(
     range_: str = "",
     subdivision: str = "",
     search_name: str = "",
+    start_date: str = "",
+    end_date: str = "",
 ) -> list[dict]:
     """Drive the recorder's Advanced Search UI and return the result rows.
 
@@ -1286,34 +1290,61 @@ async def _run_advanced_search(
         {"reception": str, "doc_type": str, "rec_date": str, "doc_id": str}
 
     where `doc_id` is Tyler's internal DOC ID (e.g. 'DOC808S1754'). Note this
-    returns ALL rows matching the search criteria — caller should post-filter
-    by `doc_type`.
+    returns whatever rows the search criteria match, up to `_RESULT_ROW_CAP` —
+    callers post-filter by `doc_type`, and anything that needs the *complete*
+    set goes through `_search_all_rows()` instead.
 
     `search_name` fills 'Search Name as Grantor or Grantee' (the owner-name
     search) — it's a field on this same Advanced Search form
-    (`#field_BothNamesID`), not a separate Basic Search page.
+    (`#field_BothNamesID`), not a separate Basic Search page. `start_date` /
+    `end_date` are MM/DD/YYYY strings for the Recording Date range.
     """
     await page.goto(_ADVANCED_SEARCH_URL, wait_until="networkidle", timeout=30_000)
     # The form opens with a "Continue session?" dialog if any user state exists.
+    # Measured across ~60 consecutive searches on one login it never appeared
+    # once, so don't wait long for it.
     try:
-        await page.click("button:has-text('Yes - Continue')", timeout=3_000)
+        await page.click("button:has-text('Yes - Continue')", timeout=1_500)
         await page.wait_for_load_state("networkidle", timeout=10_000)
     except Exception:
         pass
 
-    # Fill the relevant fields. Empty strings are ignored.
-    if section:
-        await page.fill("#field_PLSSLegalID_DOT_Section", section)
-    if township:
-        # Township should be entered as the numeric portion only (e.g. "5",
-        # not "5N"). Strip any trailing N/S direction.
-        await page.fill("#field_PLSSLegalID_DOT_Township", township.rstrip("NnSs"))
-    if range_:
-        await page.fill("#field_PLSSLegalID_DOT_Range", range_.rstrip("EeWw"))
-    if subdivision:
-        await page.fill("#field_PlattedLegalID_DOT_Subdivision", subdivision)
-    if search_name:
-        await page.fill("#field_BothNamesID", search_name)
+    # **Every search starts by clearing the last one.** Tyler holds the search
+    # criteria server-side, not in the form: reloading the page gives you empty
+    # inputs while the server still has the previous query, and the next search
+    # is silently ANDed with it. Measured — a name search, then a section search
+    # on a page whose inputs read Section=32/Township=5/Range=65/Name=(blank):
+    #
+    #     no reset                   4 rows
+    #     click 'Clear Selections' 100 rows
+    #
+    # That is how job 82f98c14 came to search S32-T5N-R65W three times for a
+    # parcel's easements, exemptions and recorded ALTA and get 4 rows each time:
+    # the owner's name was still in effect on the server. It poisons in both
+    # directions — the section criteria then cut the *next* name search from 30
+    # rows to 4 — so a whole run's research quietly narrows to nothing.
+    try:
+        await page.click(
+            "a:has-text('Clear Selections'), button:has-text('Clear Selections')", timeout=5_000
+        )
+        await page.wait_for_timeout(1_000)
+    except Exception as exc:
+        logger.warning("Advanced Search: could not clear the previous search: %s", exc)
+
+    # Fill every field, blanking the ones this call doesn't use — belt and
+    # braces alongside the clear above, and the only way the form ever shows
+    # what was actually searched. Township/range go in as the numeric portion
+    # only ("5", not "5N").
+    for selector, value in (
+        ("#field_PLSSLegalID_DOT_Section", section),
+        ("#field_PLSSLegalID_DOT_Township", township.rstrip("NnSs")),
+        ("#field_PLSSLegalID_DOT_Range", range_.rstrip("EeWw")),
+        ("#field_PlattedLegalID_DOT_Subdivision", subdivision),
+        ("#field_BothNamesID", search_name),
+        ("#field_RecordingDateID_DOT_StartDate", start_date),
+        ("#field_RecordingDateID_DOT_EndDate", end_date),
+    ):
+        await page.fill(selector, value)
 
     await page.click("#searchButton")
     await page.wait_for_load_state("networkidle", timeout=30_000)
@@ -1337,15 +1368,70 @@ async def _run_advanced_search(
         }"""
     )
     logger.info(
-        "Advanced Search (S=%s T=%s R=%s Sub=%s Name=%s): %d row(s)",
+        "Advanced Search (S=%s T=%s R=%s Sub=%s Name=%s Dates=%s-%s): %d row(s)",
         section,
         township,
         range_,
         subdivision,
         search_name,
+        start_date or "*",
+        end_date or "*",
         len(rows),
     )
     return rows
+
+
+# The result list renders at most this many rows for one search. There is no
+# paging control, no "load more", and scrolling the list adds nothing — measured
+# against S32-T5N-R65W, which stops dead at 100 of its 872 documents. Rows come
+# back newest-first, so what a single search silently drops is *all the old
+# records* — the 1889 ditch deed, the 1952 highway ROW, the 2019 ROW takes. That
+# is the trail a surveyor is actually following.
+_RESULT_ROW_CAP = 100
+
+# Weld's recorded documents are certified from Jan 1 1865 (the search form says
+# so), so that's the floor of the date sweep below.
+_RECORDS_BEGIN = date(1865, 1, 1)
+
+
+async def _search_all_rows(page, **criteria: str) -> list[dict]:
+    """Every row matching `criteria`, not just the first `_RESULT_ROW_CAP`.
+
+    The form has no pagination but it does have a Recording Date range, so a
+    search that comes back at the cap is split in half by date and each half
+    re-run, recursively, until every window is under it. Rows are deduplicated
+    by reception number because a document recorded on a boundary date can come
+    back from both halves.
+
+    Measured on S32-T5N-R65W: 29 searches, 872 documents, back to 1886 — against
+    100 documents and nothing older than 2022 for the single unbounded search.
+    Cost is one extra search per split, and splits only happen where the records
+    are actually dense, so a quiet section stays a handful of queries.
+    """
+
+    async def sweep(start: date, end: date) -> list[dict]:
+        rows = await _run_advanced_search(
+            page,
+            **criteria,
+            start_date=start.strftime("%m/%d/%Y"),
+            end_date=end.strftime("%m/%d/%Y"),
+        )
+        if len(rows) < _RESULT_ROW_CAP or start >= end:
+            # A single day still at the cap is as far as the form can narrow;
+            # take what it gives rather than looping forever.
+            return rows
+        mid = start + (end - start) / 2
+        return await sweep(start, mid) + await sweep(mid + timedelta(days=1), end)
+
+    by_reception: dict[str, dict] = {}
+    for row in await sweep(_RECORDS_BEGIN, date.today()):
+        by_reception.setdefault(row["reception"], row)
+    logger.info(
+        "Date-swept search (%s): %d distinct document(s)",
+        ", ".join(f"{k}={v}" for k, v in criteria.items() if v) or "no criteria",
+        len(by_reception),
+    )
+    return list(by_reception.values())
 
 
 @asynccontextmanager
@@ -1431,10 +1517,13 @@ async def _easement_row_search(
     township = parcel.township  # _run_advanced_search strips N/S
     range_ = parcel.range_  # and E/W respectively
 
-    rows = await _run_advanced_search(page, section=section, township=township, range_=range_)
+    # Date-swept: the type filter below runs on rows the form already returned,
+    # so a capped search silently filters the newest 100 documents rather than
+    # every easement ever recorded against the section.
+    rows = await _search_all_rows(page, section=section, township=township, range_=range_)
     # If a Subdivision is on file, repeat with Platted Legal.
     if parcel.subdivision:
-        sub_rows = await _run_advanced_search(page, subdivision=parcel.subdivision)
+        sub_rows = await _search_all_rows(page, subdivision=parcel.subdivision)
         # Deduplicate by reception across the two searches.
         by_reception_in_results = {r["reception"]: r for r in rows}
         for r in sub_rows:
@@ -1466,11 +1555,32 @@ async def _easement_row_search(
     return targets
 
 
+def _section_scan_rank(doc_type_label: str) -> int:
+    """Survey relevance of one section-scan row, lowest first.
+
+    Only consulted when the section has more documents than
+    `weld_section_download_limit` — it decides what a run gives up first, not
+    what it collects. A section's paper is mostly financing: 289 of
+    S32-T5N-R65W's 872 documents are deeds of trust, and none of them tell a
+    surveyor anything about a boundary.
+    """
+    upper = doc_type_label.upper().strip()
+    if any(t in upper for t in ("DEED OF TRUST", "TRUST DEED", "MORTGAGE", "RELEASE")):
+        return 4
+    if _matches_survey_filter(upper) or "PLAT" in upper or _matches_exemption_filter(upper):
+        return 0
+    if _matches_easement_filter(upper):
+        return 1
+    if _matches_vesting_deed_label(upper):
+        return 2
+    return 3
+
+
 async def _section_township_range_search(
     page,
     parcel: ParcelInfo,
     seen_receptions: set[str],
-) -> list[tuple[str, _DocRecord]]:
+) -> tuple[list[tuple[str, _DocRecord]], list[dict]]:
     """S/T/R Advanced Search for every other document recorded against this
     parcel's section — not just easements/ROW (see `_easement_row_search`).
 
@@ -1478,8 +1588,16 @@ async def _section_township_range_search(
     the SOP: a surveyor wants to know about anything else recorded in this
     section, not only what the property's own Document History or ALTA
     happened to cite. Mutates `seen_receptions` in place.
+
+    Returns `(targets, every_row_found)`. The search is date-swept, so the
+    second element is the section's whole index — 872 documents for
+    S32-T5N-R65W — and goes into overview.json whether or not each one is
+    downloaded. Targets are ordered by survey relevance and cut to
+    `weld_section_download_limit`, so what the cap drops is the least useful
+    end of the list (deeds of trust, 289 of that section's 872) rather than
+    everything recorded before 2022, which is what the old unbounded search
+    dropped.
     """
-    targets: list[tuple[str, _DocRecord]] = []
     if not (parcel.section and parcel.township and parcel.range_):
         logger.warning(
             "Section/Township/Range search: parcel S/T/R is incomplete (%s/%s/%s) — skipping.",
@@ -1487,32 +1605,31 @@ async def _section_township_range_search(
             parcel.township,
             parcel.range_,
         )
-        return targets
+        return [], []
 
     section = parcel.section.lstrip("0") or parcel.section
-    rows = await _run_advanced_search(
+    rows = await _search_all_rows(
         page, section=section, township=parcel.township, range_=parcel.range_
     )
 
-    for r in rows:
-        reception = r["reception"]
-        if not reception or reception in seen_receptions:
-            continue
-        seen_receptions.add(reception)
-        targets.append(
-            (
-                "section_township_range_search",
-                _DocRecord(
-                    reception=reception,
-                    rec_date=r["rec_date"],
-                    doc_type=r["doc_type"],
-                    grantor="",
-                    grantee="",
-                    url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
-                ),
-            )
+    fresh = [r for r in rows if r["reception"] and r["reception"] not in seen_receptions]
+    fresh.sort(key=lambda r: _date_sort_key(r["rec_date"]), reverse=True)  # newest first
+    fresh.sort(key=lambda r: _section_scan_rank(r["doc_type"]))  # stable: rank, then date
+    limit = get_settings().weld_section_download_limit
+    if limit and len(fresh) > limit:
+        logger.info(
+            "Section scan: %d document(s) found, downloading the %d most survey-relevant "
+            "(raise WELD_SECTION_DOWNLOAD_LIMIT for more).",
+            len(fresh),
+            limit,
         )
-    return targets
+        fresh = fresh[:limit]
+
+    targets: list[tuple[str, _DocRecord]] = []
+    for r in fresh:
+        seen_receptions.add(r["reception"])
+        targets.append(("section_township_range_search", _row_to_record(r)))
+    return targets, rows
 
 
 def _select_direct_extraction_targets(
@@ -1683,7 +1800,9 @@ async def _expand_cross_references(
       than one per citing document.
     """
     extracted: set[str] = set()
-    extracted_ids: list[dict] = []
+    # Seeded from what's already on file so a second walk (the section scan's
+    # surveys, further down `scrape()`) adds to the table instead of replacing it.
+    extracted_ids: list[dict] = list(ov.get("extracted_ids", []))
     new_results: list[tuple[str, _DocRecord, list[Path]]] = []
     level = list(initial_results)
     depth = 0
@@ -1822,6 +1941,25 @@ _VESTING_DEED_LABELS = {
     "GENERAL WARRANTY DEED",
 }
 
+# Any other label with DEED in it also vests title — "JOINT TENANCY WARRANTY
+# DEED", "PERSONAL REPRESENTATIVES DEED", "BARGAIN AND SALE DEED",
+# "TREASURERS DEED" — so the set above is a floor, not the whole list. What has
+# to stay out is the paperwork that says DEED without conveying the land: a
+# deed of trust is a mortgage, and mineral/royalty deeds and easement deeds
+# convey something other than the fee.
+_NOT_A_VESTING_DEED = (
+    "DEED OF TRUST",
+    "TRUST DEED",
+    "EASEMENT",
+    "MINERAL",
+    "ROYALTY",
+    "RELEASE",
+    "ASSIGNMENT",
+    "MODIFICATION",
+    "AMENDMENT",
+    "SUBORDINATION",
+)
+
 # Document Types filter list for the subdivision-exemption search.
 _EXEMPTION_DOC_TYPES = {
     "SUBDIVISION EXEMPTION",
@@ -1832,7 +1970,10 @@ _EXEMPTION_DOC_TYPES = {
 
 
 def _matches_vesting_deed_label(doc_type_label: str) -> bool:
-    return doc_type_label.upper().strip() in _VESTING_DEED_LABELS
+    upper = doc_type_label.upper().strip()
+    if upper in _VESTING_DEED_LABELS:
+        return True
+    return "DEED" in upper and not any(t in upper for t in _NOT_A_VESTING_DEED)
 
 
 def _matches_exemption_filter(doc_type_label: str) -> bool:
@@ -1857,6 +1998,100 @@ def _row_to_record(row: dict) -> _DocRecord:
     )
 
 
+# An owner-name search narrowed to this section returns a handful of rows; the
+# cap only bites on the county-wide fallback query, where an owner who holds
+# land all over Weld comes back with dozens. Deeds are never what gets cut —
+# the list is ordered with them first.
+_MAX_OWNER_NAME_DOCS = 25
+
+
+async def _owner_name_search(
+    page,
+    parcel: ParcelInfo,
+    seen_receptions: set[str],
+) -> list[tuple[str, _DocRecord]]:
+    """Advanced Search under the current owner's name — everything it returns.
+
+    This is the surveyor's own manual move, and it has to run on **every**
+    route, not just the empty-history one: a vesting deed is rarely named on a
+    survey, and the parcel's Document History only lists what the assessor
+    linked to the account, which routinely isn't the deed. Account R8961716
+    (job cab228bd) is the case that prompted this — one recorded-exemption row
+    on file, no deed anywhere in the run, while the owner's warranty deed sits
+    in the recorder under his name.
+
+    Every row comes back, not only the deeds: a document recorded under this
+    owner's name is worth having whatever the recorder calls it. Deed rows are
+    tagged `vesting_deed` so the one the surveyor is after is obvious in the
+    output (and so a run that found none can say so) — the tag is a highlight,
+    not a filter.
+
+    Queries are tried in order and the first one that turns up a deed wins:
+
+    1. owner name + the parcel's S/T/R — every hit is both this owner's and
+       this section's, so there is nothing to guess at;
+    2. surname only + the same S/T/R — Weld prints owners "LAST FIRST M" and
+       Tyler indexes some names with a comma, so the full string can miss.
+       Only ever run bounded by S/T/R, or a common surname returns the county;
+    3. owner name alone — for a platted lot indexed by subdivision rather than
+       section, where the S/T/R queries find nothing.
+
+    Rows from every query tried are kept, so a query that found no deed still
+    contributes what it did find. Mutates `seen_receptions` in place, like the
+    other search helpers.
+    """
+    if not parcel.owner:
+        logger.warning("Owner-name search: no owner name on record — skipping.")
+        return []
+
+    queries: list[dict[str, str]] = []
+    if parcel.section and parcel.township and parcel.range_:
+        str_query = {
+            "section": parcel.section.lstrip("0") or parcel.section,
+            "township": parcel.township,
+            "range_": parcel.range_,
+        }
+        queries.append({"search_name": parcel.owner, **str_query})
+        surname = parcel.owner.split()[0]
+        if surname != parcel.owner:
+            queries.append({"search_name": surname, **str_query})
+    queries.append({"search_name": parcel.owner})
+
+    found: dict[str, dict] = {}
+    for query in queries:
+        for row in await _search_all_rows(page, **query):
+            if row["reception"]:
+                found.setdefault(row["reception"], row)
+        if any(_matches_vesting_deed_label(r["doc_type"]) for r in found.values()):
+            break  # the deed is here; no need to widen the net further
+
+    rows = sorted(found.values(), key=lambda r: _date_sort_key(r["rec_date"]), reverse=True)
+    rows.sort(key=lambda r: not _matches_vesting_deed_label(r["doc_type"]))  # deeds first
+
+    targets: list[tuple[str, _DocRecord]] = []
+    for row in rows[:_MAX_OWNER_NAME_DOCS]:
+        if row["reception"] in seen_receptions:
+            continue
+        seen_receptions.add(row["reception"])
+        role = "vesting_deed" if _matches_vesting_deed_label(row["doc_type"]) else "owner_name"
+        targets.append((role, _row_to_record(row)))
+
+    deeds = sum(1 for role, _ in targets if role == "vesting_deed")
+    logger.info(
+        "Owner-name search (%s): %d row(s), %d new target(s), %d of them deeds",
+        parcel.owner,
+        len(found),
+        len(targets),
+        deeds,
+    )
+    if not deeds:
+        narration.info(
+            f"No deed recorded under {parcel.owner}'s name turned up in the "
+            "Clerk & Recorder — the vesting deed will need a manual look."
+        )
+    return targets
+
+
 async def _select_owner_name_search_targets(
     page,
     parcel: ParcelInfo,
@@ -1869,7 +2104,7 @@ async def _select_owner_name_search_targets(
     already-authenticated `_recorder_search_session`.
 
     Returns role-tagged docs in download order:
-      - ("vesting_deed", row)          most recent deed found via owner search
+      - ("vesting_deed", row)          `_owner_name_search()`'s hits
       - ("affidavit", row)             AFFIDAVIT rows from the owner search —
                                         the SOP flags these as typical Exhibit
                                         A carriers for a large owner's
@@ -1889,15 +2124,12 @@ async def _select_owner_name_search_targets(
     targets: list[tuple[str, _DocRecord]] = []
     seen: set[str] = set()
 
-    # Owner-name search ("Search Name as Grantor or Grantee").
+    # Owner-name search ("Search Name as Grantor or Grantee"). The deeds come
+    # from the shared helper — same search every other route now runs — and the
+    # county-wide sweep below is kept for the affidavits it also turns up.
+    targets += await _owner_name_search(page, parcel, seen)
     if parcel.owner:
         owner_rows = await _run_advanced_search(page, search_name=parcel.owner)
-        vesting_candidates = [r for r in owner_rows if _matches_vesting_deed_label(r["doc_type"])]
-        if vesting_candidates:
-            most_recent = max(vesting_candidates, key=lambda r: _date_sort_key(r["rec_date"]))
-            if most_recent["reception"]:
-                seen.add(most_recent["reception"])
-                targets.append(("vesting_deed", _row_to_record(most_recent)))
         for row in owner_rows:
             reception = row["reception"]
             if reception and reception not in seen and "AFFIDAVIT" in row["doc_type"].upper():
@@ -2242,63 +2474,72 @@ async def scrape(
         password=s.weld_recorder_password,
     )
 
-    # --- The S/T/R easement/ROW scan also runs after direct extraction. ---
-    if route_section == "direct_extraction":
-        # Also run the S/T/R easement/ROW scan — per the SOP this research is
-        # required regardless of whether direct extraction already found the
-        # ALTA (its Schedule B-2 only lists what its surveyor happened to
-        # cite, not necessarily everything else recorded against the section).
+    # --- Searches that run on every route, whatever Document History held. ---
+    # The owner-name deed search runs for every property: a vesting deed is
+    # rarely named on a survey and often isn't linked to the account either, so
+    # searching the recorder under the owner's name is the only reliable way to
+    # get it (see `_owner_name_search`). The empty-history route has
+    # already run it as part of picking its targets.
+    # The S/T/R easement/ROW scan is the other half — per the SOP that research
+    # is required even when direct extraction already found the ALTA, since its
+    # Schedule B-2 only lists what its surveyor happened to cite. The other two
+    # routes run it while selecting their own targets.
+    narration.info(
+        "Also checking the Clerk & Recorder for the current owner's deed, and "
+        "for easements and rights-of-way recorded against this parcel's section..."
+    )
+    known_receptions = {doc.reception for _, doc in targets}
+    supplemental: list[tuple[str, _DocRecord]] = []
+    async with _recorder_search_session(
+        s.weld_recorder_username, s.weld_recorder_password
+    ) as search_page:
+        if search_page:
+            if route_section != "owner_name_search":
+                supplemental += await _owner_name_search(search_page, parcel, known_receptions)
+            if route_section == "direct_extraction":
+                supplemental += await _easement_row_search(search_page, parcel, known_receptions)
+    if supplemental:
+        deeds = sum(1 for role, _ in supplemental if role == "vesting_deed")
         narration.info(
-            "Also checking the Clerk & Recorder for easements and rights-of-way "
-            "recorded against this parcel's section..."
+            f"Found {deeds} deed(s) recorded under the owner's name, plus "
+            f"{len(supplemental) - deeds} other document(s) — downloading them now..."
         )
-        known_receptions = {doc.reception for _, doc in targets}
-        async with _recorder_search_session(
-            s.weld_recorder_username, s.weld_recorder_password
-        ) as search_page:
-            supplemental = (
-                await _easement_row_search(search_page, parcel, known_receptions)
-                if search_page
-                else []
-            )
-        if supplemental:
-            narration.info(f"Found {len(supplemental)} additional easement/ROW document(s).")
-            sup_results, _sup_cost, sup_in_tok, sup_out_tok = await _download_documents(
-                address,
-                supplemental,
-                doc_filter,
-                dest,
-                username=s.weld_recorder_username,
-                password=s.weld_recorder_password,
-            )
-            in_tok += sup_in_tok
-            out_tok += sup_out_tok
-            targets = targets + supplemental
-            results = results + sup_results
-            ov.set_section(
-                "easement_and_row_search",
-                {
-                    "targets": [
-                        {
-                            "role": role,
-                            "reception": doc.reception,
-                            "doc_type": doc.doc_type,
-                            "url": doc.url,
-                        }
-                        for role, doc in supplemental
-                    ],
-                    "results": [
-                        {
-                            "role": role,
-                            "reception": doc.reception,
-                            "doc_type": doc.doc_type,
-                            "status": "downloaded" if paths else "failed",
-                            "files": [str(p) for p in paths],
-                        }
-                        for role, doc, paths in sup_results
-                    ],
-                },
-            )
+        sup_results, _sup_cost, sup_in_tok, sup_out_tok = await _download_documents(
+            address,
+            supplemental,
+            doc_filter,
+            dest,
+            username=s.weld_recorder_username,
+            password=s.weld_recorder_password,
+        )
+        in_tok += sup_in_tok
+        out_tok += sup_out_tok
+        targets = targets + supplemental
+        results = results + sup_results
+        ov.set_section(
+            "owner_deed_and_easement_search",
+            {
+                "targets": [
+                    {
+                        "role": role,
+                        "reception": doc.reception,
+                        "doc_type": doc.doc_type,
+                        "url": doc.url,
+                    }
+                    for role, doc in supplemental
+                ],
+                "results": [
+                    {
+                        "role": role,
+                        "reception": doc.reception,
+                        "doc_type": doc.doc_type,
+                        "status": "downloaded" if paths else "failed",
+                        "files": [str(p) for p in paths],
+                    }
+                    for role, doc, paths in sup_results
+                ],
+            },
+        )
 
     # --- Read every document downloaded so far for the other documents it
     # cites — not just the ALTA — and fetch those too, recursively. ---
@@ -2354,16 +2595,24 @@ async def scrape(
         "Searching the Clerk & Recorder for other documents recorded in this "
         "property's section..."
     )
+    str_targets: list[tuple[str, _DocRecord]] = []
+    section_index: list[dict] = []
     async with _recorder_search_session(
         s.weld_recorder_username, s.weld_recorder_password
     ) as search_page:
-        str_targets = (
-            await _section_township_range_search(search_page, parcel, known_receptions)
-            if search_page
-            else []
-        )
+        if search_page:
+            str_targets, section_index = await _section_township_range_search(
+                search_page, parcel, known_receptions
+            )
     if str_targets:
-        narration.info(f"Found {len(str_targets)} additional document(s) in this section.")
+        if len(section_index) > len(str_targets):
+            narration.info(
+                f"This section has {len(section_index)} recorded document(s) — "
+                f"downloading the {len(str_targets)} most relevant to a survey. "
+                "The full list is in the property metadata."
+            )
+        else:
+            narration.info(f"Found {len(str_targets)} additional document(s) in this section.")
         str_results, _str_cost, str_in_tok, str_out_tok = await _download_documents(
             address,
             str_targets,
@@ -2398,8 +2647,49 @@ async def scrape(
                     }
                     for role, doc, paths in str_results
                 ],
+                # Every document the recorder indexes against this section,
+                # downloaded or not — a document that wasn't fetched is still
+                # one the surveyor may want to pull by hand.
+                "section_index": [
+                    {
+                        "reception": r["reception"],
+                        "doc_type": r["doc_type"],
+                        "rec_date": r["rec_date"],
+                    }
+                    for r in section_index
+                ],
             },
         )
+
+        # A recorded survey or plat from this section carries its own title
+        # exception table — the same list a title commitment gives, as the last
+        # surveyor to work here compiled it. That makes these the section-scan
+        # documents worth paying to read; the rest are delivered as files.
+        survey_results = [
+            (role, doc, paths)
+            for role, doc, paths in str_results
+            if paths and _section_scan_rank(doc.doc_type) == 0
+        ]
+        if survey_results:
+            narration.info(
+                f"Reading {len(survey_results)} survey/plat document(s) from this section "
+                "for the records they cite..."
+            )
+            survey_refs, sr_in_tok, sr_out_tok = await _expand_cross_references(
+                address,
+                doc_filter,
+                dest,
+                ov,
+                survey_results,
+                known_receptions,
+                username=s.weld_recorder_username,
+                password=s.weld_recorder_password,
+            )
+            in_tok += sr_in_tok
+            out_tok += sr_out_tok
+            if survey_refs:
+                results = results + survey_refs
+                targets = targets + [(role, doc) for role, doc, _ in survey_refs]
 
     # Record per-target results in overview.json. A target with zero files
     # captured is "failed"; non-zero is "downloaded".
@@ -2417,6 +2707,32 @@ async def scrape(
         )
         saved_paths.extend(paths)
     ov.merge_section(route_section, {"results": results_section})
+
+    # One row per downloaded file, keyed by the filename the Results tab shows,
+    # so the frontend can group the grid by category and sort by reception
+    # without re-deriving either from the filename. Every route's documents land
+    # here — each route writes its own section above, and a surveyor scanning
+    # the grid doesn't care which search turned a document up.
+    ov.set_section(
+        "documents",
+        sorted(
+            (
+                {
+                    "file": path.name,
+                    "reception": doc.reception,
+                    "doc_type": doc.doc_type,
+                    "category": classify(doc.doc_type),
+                    "role": role,
+                }
+                for role, doc, paths in results
+                for path in paths
+            ),
+            key=lambda row: (
+                CATEGORIES.index(row["category"]),
+                reception_sort_key(row["reception"]),
+            ),
+        ),
+    )
 
     if not saved_paths:
         return (

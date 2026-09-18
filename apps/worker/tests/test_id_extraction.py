@@ -150,6 +150,21 @@ class TestClassify:
 
         assert (found.id, found.id_type) == ("Book 999 Page 426", "book_page")
 
+    def test_reads_the_abbreviated_forms_a_title_exception_table_uses(self):
+        # Transcribed from the Latham ALTA's TITLE EXCEPTIONS block (title
+        # commitment FCIF25219389): the column form abbreviates book/page and
+        # zero-pads receptions, and an O&G assignment says "instrument" for
+        # what a deed calls a reception.
+        (book_page,) = _classify("BK. 571, PG. 55")
+        (padded,) = _classify("REC. NO. 02050963")
+        (instrument,) = _classify("instrument number 3783697")
+
+        assert (book_page.id, book_page.id_type) == ("Book 571 Page 55", "book_page")
+        # Zero-padded and plain spellings must land on one id, or the run fetches
+        # the document twice and the padded copy fetches nothing.
+        assert (padded.id, padded.id_type) == ("2050963", "reception_number")
+        assert (instrument.id, instrument.id_type) == ("3783697", "reception_number")
+
     def test_unrecognised_format_is_kept_as_other(self):
         # Worth storing for the surveyor even though nothing can auto-fetch it.
         (found,) = _classify("PLAT NO. 4-B")

@@ -88,23 +88,38 @@ class IdExtraction(BaseModel):
 
 # Matches the label forms seen on Weld ALTAs and title commitments:
 # "RECORDING NO: 1766550.", "RECORDING NO.: 1766548", "REC. NO. 2786305",
-# "AT RECEPTION NUMBER 2696065". The label is required so that unrelated numbers
-# on the sheet (dates, bearings, acreages, ordinance numbers) aren't mistaken for
-# records. The trailing group catches the "RECEPTION NOS. x AND y" idiom, where a
-# single label covers two documents; it only fires on a number, so
-# "...AT RECEPTION NUMBER 2873123 AND JANUARY 24, 2005..." doesn't trip it.
+# "AT RECEPTION NUMBER 2696065", "instrument number 3783697" (the form an oil &
+# gas assignment uses for the same thing). The label is required so that
+# unrelated numbers on the sheet (dates, bearings, acreages, ordinance numbers)
+# aren't mistaken for records. The trailing group catches the "RECEPTION NOS. x
+# AND y" idiom, where a single label covers two documents; it only fires on a
+# number, so "...AT RECEPTION NUMBER 2873123 AND JANUARY 24, 2005..." doesn't
+# trip it.
 _RECEPTION_RE = re.compile(
-    r"REC(?:EPTION|ORDING|ORDED)?\.?\s*(?:NOS?|NUM(?:BER)?S?|#)?\.?\s*:?\s*"
+    r"(?:REC(?:EPTION|ORDING|ORDED)?|INSTRUMENT)\.?\s*(?:NOS?|NUM(?:BER)?S?|#)?\.?\s*:?\s*"
     r"(\d{5,9})\b(?:\s*(?:,|AND|&)\s*(\d{5,9})\b)?",
     re.IGNORECASE,
 )
+# "BOOK 233 AT PAGE 185" and the abbreviated column form an ALTA's title
+# exception table uses, "BK. 571, PG. 55".
 _BOOK_PAGE_RE = re.compile(
-    r"BOOK\s*(?:NO\.?\s*)?(\d{1,6})\s*(?:,|\bAT\b)?\s*PAGE\s*(\d{1,6})\b",
+    r"\bB(?:OO)?K\.?\s*(?:NO\.?\s*)?(\d{1,6})\s*(?:,|\bAT\b)?\s*P(?:AGE|G)\.?\s*(\d{1,6})\b",
     re.IGNORECASE,
 )
 # Weld reception numbers are 5-9 digits. Used only for a value the model returned
 # without its printed label.
 _BARE_RECEPTION_RE = re.compile(r"^\d{5,9}$")
+
+
+def _reception(number: str) -> str:
+    """Normalise a printed reception number to the form the recorder indexes.
+
+    Documents print the same reception with and without leading zeros — an ALTA
+    exception table writes "REC. NO. 02050963" for what the recorder knows as
+    2050963. Left as printed, the two spellings dedupe as different documents
+    and the zero-padded one fetches nothing.
+    """
+    return number.lstrip("0") or number
 
 
 def _classify(raw: str, context: str = "") -> list[ExtractedId]:
@@ -128,12 +143,16 @@ def _classify(raw: str, context: str = "") -> list[ExtractedId]:
         ]
     if m := _RECEPTION_RE.search(text):
         return [
-            ExtractedId(id=number, id_type="reception_number", context=context, raw=text)
+            ExtractedId(
+                id=_reception(number), id_type="reception_number", context=context, raw=text
+            )
             for number in m.groups()
             if number
         ]
     if _BARE_RECEPTION_RE.match(text):
-        return [ExtractedId(id=text, id_type="reception_number", context=context, raw=text)]
+        return [
+            ExtractedId(id=_reception(text), id_type="reception_number", context=context, raw=text)
+        ]
     return [ExtractedId(id=text, id_type="other", context=context, raw=text)]
 
 
