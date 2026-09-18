@@ -311,6 +311,27 @@ section (see `RAW_SECTION_KEYS` in `apps/web/src/App.tsx`) — it's for complete
 use, not the curated view a surveyor reads. If you add a new grouped section or rename a
 field, only touch the grouped path — `raw_report_fields` should stay a verbatim dump.
 
+## `documents` — what each downloaded file is, for the Results tab
+
+`scrape()` ends by writing an `overview.json` section listing every file it saved:
+`{file, reception, doc_type, category, role}`, sorted by category and then reception
+number. `doc_classify.py` assigns the category, and its `CATEGORIES` list **is** the
+display order — the frontend derives the order from the row sequence rather than keeping
+its own copy (see [`apps/web/AGENTS.md`](../../../apps/web/AGENTS.md)), so a new category
+goes in that module and nowhere else.
+
+Categories are matched by keyword against the type label, ordered so the specific reading
+wins (`MINERAL & ROYALTY DEED` is mineral, not a vesting deed; `ASSIGNMENT DEED OF TRUST`
+is financing). The recorder's own vocabulary is far larger than it looks useful —
+114 distinct document types in one section — so enumerating it is not an option;
+`tests/test_doc_classify.py` pins the rules against `weld_document_types.json`, a real
+sweep of S32-T5N-R65W's 872 documents, and fails if too much starts falling through to
+"Other".
+
+Note `doc_type` is not always a recorder label: a Schedule B-2 exception carries the
+description the model read off the citing document ("20' sewer easement"), since that's
+all the run knows about a document it reached by citation. The keyword rules handle both.
+
 ## `extracted_ids` — cross-reference expansion, not just the ALTA
 
 `_expand_cross_references()` in `scrapers/weld_county.py` reads **every** document the

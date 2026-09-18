@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     # before going higher — the site has rate-limited bulk fetches before.
     weld_download_concurrency: int = 4
 
+    # How many documents from the section-wide scan (`_section_township_range_search`)
+    # to actually download. The search itself is now complete — it date-sweeps
+    # past the recorder's 100-row render cap, and S32-T5N-R65W alone has 872
+    # documents — so this is the cost/runtime dial, not a coverage one: every
+    # row found is listed in overview.json either way, and the ones downloaded
+    # are the most survey-relevant first (plats and surveys, then easements and
+    # ROW, then deeds, then the rest). 0 means no cap — fetch the section.
+    weld_section_download_limit: int = 250
+
     # Legacy eRecording credentials (old Java system — no longer used)
     weld_erecording_username: str = ""
     weld_erecording_password: str = ""

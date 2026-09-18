@@ -144,9 +144,20 @@ four `Tabs.Panel`s from the response:
   when a stale container returned an old schema; keep the guard even though the schema
   is now stable, since it costs nothing and a backend regression here is a page-blanking
   bug, not just an empty tab.
-- **Results** — file cards once `job.status === "COMPLETED"`; PDF thumbnails render as
-  scaled/clipped `<iframe>`s (no pdf.js dependency), other types fall back to a file-type
-  icon. Each card sets `overflow: "hidden"` + `minWidth: 0` and the filename `Text` gets
+- **Results** — file cards once `job.status === "COMPLETED"`, **grouped by document
+  category and sorted by reception number within each group**. The grouping is not
+  computed here: the worker writes `overview.json`'s `documents` section (one row per
+  downloaded file — `file`, `reception`, `doc_type`, `category`, `role` — see
+  `survey_art/doc_classify.py`) already ordered by category and then reception, and
+  `fileGroups` walks it in that order. So **the category list and its order live in
+  `doc_classify.py`, not in the frontend** — adding or reordering a category needs no
+  change here. A file with no row in that section (another county's scraper, or a run
+  from before the section existed) falls back to `ROLE_CATEGORIES`, which maps the
+  `{role}_{reception}.{ext}` filename's role to the same category names; anything
+  unrecognised lands under "Other". Card labels follow the same fallback chain —
+  reception number and doc type when indexed, the filename when not. PDF thumbnails
+  render as scaled/clipped `<iframe>`s (no pdf.js dependency), other types fall back to
+  a file-type icon. Each card sets `overflow: "hidden"` + `minWidth: 0` and the filename `Text` gets
   `wordBreak: "break-word"` — a long unbreakable filename in a narrow `SimpleGrid` column
   used to overflow into the neighboring card at high zoom without these.
   Each card also carries a download `ActionIcon` in its top-right corner. It is an

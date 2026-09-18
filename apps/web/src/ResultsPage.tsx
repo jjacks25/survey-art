@@ -30,7 +30,40 @@ import { LayoutContext } from "./Layout";
 import { MetadataView, PropertyMap } from "./MetadataView";
 import { TERMINAL, statusColor, fileIcon, isPdf } from "./utils";
 
-function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void) {
+/** What the worker recorded about one downloaded file — `overview.json`'s
+ * `documents` section (see weld_county.py / doc_classify.py). Absent for a file
+ * the scraper didn't index (another county, or a run that predates it), which
+ * is why every use of it falls back to the filename. */
+export interface DocInfo {
+  file: string;
+  reception: string;
+  doc_type: string;
+  category: string;
+  role: string;
+}
+
+/** Fallback grouping for a file with no `documents` row: the scraper's filenames
+ * are `{role}_{reception}.{ext}`, so the role still says roughly what a document
+ * is. Runs from before the worker wrote that section — which are still in the
+ * history sidebar — would otherwise pile into one undifferentiated group. */
+const ROLE_CATEGORIES: Record<string, string> = {
+  alta: "Surveys & Plats",
+  subdivision_exemption: "Surveys & Plats",
+  vesting_deed: "Deeds & Vesting",
+  easement_or_row: "Easements & Rights of Way",
+  exception: "Cited exceptions",
+  owner_name: "Recorded under the owner's name",
+  affidavit: "Affidavits, Notices & Agreements",
+  section_township_range_search: "Recorded in this section",
+};
+
+/** `{role}_{reception}.{ext}` → its two halves. */
+function splitFilename(name: string): { role: string; reception: string } {
+  const match = /^(.*)_([^_]+)\.[^.]+$/.exec(name);
+  return match ? { role: match[1], reception: match[2] } : { role: "", reception: "" };
+}
+
+function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void, info?: DocInfo) {
   return (
     <Box key={f.name} style={{ position: "relative", minWidth: 0 }}>
       {/* Anchor, not a button: an <a download> inside the card's
@@ -84,9 +117,17 @@ function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void) {
           ) : (
             <Text style={{ fontSize: 32 }}>{fileIcon(f.name)}</Text>
           )}
-          <Text size="xs" ta="center" lineClamp={2} style={{ wordBreak: "break-word", width: "100%" }}>
-            {f.name}
+          {/* Reception number first: it's what a surveyor cross-references
+              against a title commitment. The doc type under it, and the raw
+              filename only when the worker didn't index this file. */}
+          <Text size="xs" fw={600} ta="center" style={{ width: "100%" }}>
+            {info?.reception || splitFilename(f.name).reception || f.name}
           </Text>
+          {info?.doc_type && (
+            <Text size="xs" c="dimmed" ta="center" lineClamp={2} style={{ wordBreak: "break-word", width: "100%" }}>
+              {info.doc_type}
+            </Text>
+          )}
           <Text size="xs" c="dimmed">{(f.size / 1024).toFixed(1)} KB</Text>
         </Stack>
       </UnstyledButton>
@@ -244,26 +285,81 @@ export function ResultsPage() {
   const [fileSearch, setFileSearch] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // A substring match against the whole filename — which already covers more
-  // than reception numbers, since weld_county.py's filenames also carry the
-  // doc type ("exception_1766550.pdf", "easement_or_row_3772227.pdf",
-  // "vesting_deed_...", "alta_..."). There's no separate reception-number/doc-
-  // type field on FileEntry to match against instead, so this is deliberately
-  // "search the filename," not "search by reception number" specifically.
-  const matchesSearch = (f: FileEntry) =>
-    !fileSearch.trim() || f.name.toLowerCase().includes(fileSearch.trim().toLowerCase());
+  // What the worker knows about each file, keyed by the filename the S3 listing
+  // returns (`overview.json`'s `documents` section — one row per downloaded
+  // file, already ordered by category and then reception number).
+  const docIndex = useMemo(() => {
+    const rows = job?.metadata?.documents;
+    const index = new Map<string, DocInfo>();
+    if (Array.isArray(rows)) {
+      for (const row of rows as DocInfo[]) if (row?.file) index.set(row.file, row);
+    }
+    return index;
+  }, [job?.metadata]);
+
+  // Matches the reception number and document type as well as the filename —
+  // a surveyor searching "easement" or "4508544" means the document, not the
+  // string the scraper happened to save it under.
+  const matchesSearch = (f: FileEntry) => {
+    const q = fileSearch.trim().toLowerCase();
+    if (!q) return true;
+    const info = docIndex.get(f.name);
+    return [f.name, info?.reception, info?.doc_type, info?.category]
+      .some((field) => field?.toLowerCase().includes(q));
+  };
+
+  // Documents grouped by what they are, in the order the worker sorted them
+  // (doc_classify.py's CATEGORIES — surveys and plats first, financing paper
+  // last), each group already in reception-number order. Deriving the group
+  // order from the data keeps the category list in one place rather than
+  // duplicating it here. A file the worker didn't index — another county, or a
+  // run from before this existed — still shows up, under "Other".
+  const fileGroups = useMemo(() => {
+    const byName = new Map(files.map((f) => [f.name, f]));
+    const groups = new Map<string, FileEntry[]>();
+    const placed = new Set<string>();
+    for (const row of (Array.isArray(job?.metadata?.documents)
+      ? (job?.metadata?.documents as DocInfo[])
+      : [])) {
+      const file = byName.get(row.file);
+      if (!file || placed.has(row.file) || !matchesSearch(file)) continue;
+      placed.add(row.file);
+      groups.set(row.category, [...(groups.get(row.category) ?? []), file]);
+    }
+    for (const file of files) {
+      if (placed.has(file.name) || !matchesSearch(file)) continue;
+      const { role } = splitFilename(file.name);
+      const category = ROLE_CATEGORIES[role] ?? "Other";
+      groups.set(category, [...(groups.get(category) ?? []), file]);
+    }
+    return [...groups.entries()].map(([category, entries]) => ({
+      category,
+      // Indexed rows arrive in reception order already; fallback ones don't.
+      files: entries
+        .slice()
+        .sort((a, b) => {
+          const key = (f: FileEntry) =>
+            docIndex.get(f.name)?.reception ?? splitFilename(f.name).reception;
+          const [x, y] = [key(a), key(b)];
+          const [nx, ny] = [Number(x), Number(y)];
+          return Number.isFinite(nx) && Number.isFinite(ny) ? nx - ny : x.localeCompare(y);
+        }),
+    }));
+  }, [files, docIndex, fileSearch, job?.metadata]);
+
+  const matchingFileCount = useMemo(
+    () => fileGroups.reduce((n, g) => n + g.files.length, 0),
+    [fileGroups]
+  );
 
   // Schedule B-2/cross-reference exception docs (weld_county.py writes them
-  // "exception_{reception}.pdf") are cited leads, not the directly-extracted set —
-  // split them out so a surveyor sees the primary documents first, with the
-  // exceptions clearly labeled.
-  const primaryFiles = useMemo(
-    () => files.filter((f) => !f.name.startsWith("exception_") && matchesSearch(f)),
-    [files, fileSearch]
-  );
+  // "exception_{reception}.pdf") are cited leads rather than documents the
+  // property's own history named — still worth counting against how many
+  // citations were found, even now that they're filed by type rather than
+  // split into their own section.
   const exceptionFiles = useMemo(
-    () => files.filter((f) => f.name.startsWith("exception_") && matchesSearch(f)),
-    [files, fileSearch]
+    () => files.filter((f) => f.name.startsWith("exception_")),
+    [files]
   );
 
   // job.logs mixes plain-English progress steps ("milestone") with verbose
@@ -480,31 +576,29 @@ export function ResultsPage() {
                 onChange={(e) => setFileSearch(e.currentTarget.value)}
                 maw={320}
               />
-              {primaryFiles.length === 0 && exceptionFiles.length === 0 ? (
+              {exceptionFiles.length > 0 && totalReceptionIds !== null && (
+                <Text size="xs" c="dimmed">
+                  Cited exceptions: fetched {exceptionFiles.length} of {totalReceptionIds}{" "}
+                  reception numbers found in the documents read.
+                </Text>
+              )}
+              {matchingFileCount === 0 ? (
                 <Text c="dimmed" size="sm">No documents match "{fileSearch}".</Text>
               ) : (
-                <>
-                  {primaryFiles.length > 0 && (
+                fileGroups.map((group) => (
+                  <Box key={group.category}>
+                    <Divider
+                      label={`${group.category} (${group.files.length})`}
+                      labelPosition="left"
+                      mb="sm"
+                    />
                     <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
-                      {primaryFiles.map((f) => renderFileCard(f, setPreviewFile))}
+                      {group.files.map((f) =>
+                        renderFileCard(f, setPreviewFile, docIndex.get(f.name))
+                      )}
                     </SimpleGrid>
-                  )}
-                  {exceptionFiles.length > 0 && (
-                    <>
-                      <Divider
-                        label={
-                          totalReceptionIds !== null
-                            ? `ALTA-cited exceptions (fetched ${exceptionFiles.length} of ${totalReceptionIds})`
-                            : `ALTA-cited exceptions (${exceptionFiles.length})`
-                        }
-                        labelPosition="left"
-                      />
-                      <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
-                        {exceptionFiles.map((f) => renderFileCard(f, setPreviewFile))}
-                      </SimpleGrid>
-                    </>
-                  )}
-                </>
+                  </Box>
+                ))
               )}
             </Stack>
           )}
