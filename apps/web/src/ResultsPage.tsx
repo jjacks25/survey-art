@@ -18,6 +18,7 @@ import {
   Table,
   Tabs,
   Text,
+  TextInput,
   Timeline,
   Title,
   Tooltip,
@@ -210,14 +211,30 @@ export function ResultsPage() {
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
+  const [fileSearch, setFileSearch] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // A substring match against the whole filename — which already covers more
+  // than reception numbers, since weld_county.py's filenames also carry the
+  // doc type ("exception_1766550.pdf", "easement_or_row_3772227.pdf",
+  // "vesting_deed_...", "alta_..."). There's no separate reception-number/doc-
+  // type field on FileEntry to match against instead, so this is deliberately
+  // "search the filename," not "search by reception number" specifically.
+  const matchesSearch = (f: FileEntry) =>
+    !fileSearch.trim() || f.name.toLowerCase().includes(fileSearch.trim().toLowerCase());
 
   // Schedule B-2/cross-reference exception docs (weld_county.py writes them
   // "exception_{reception}.pdf") are cited leads, not the directly-extracted set —
   // split them out so a surveyor sees the primary documents first, with the
   // exceptions clearly labeled.
-  const primaryFiles = useMemo(() => files.filter((f) => !f.name.startsWith("exception_")), [files]);
-  const exceptionFiles = useMemo(() => files.filter((f) => f.name.startsWith("exception_")), [files]);
+  const primaryFiles = useMemo(
+    () => files.filter((f) => !f.name.startsWith("exception_") && matchesSearch(f)),
+    [files, fileSearch]
+  );
+  const exceptionFiles = useMemo(
+    () => files.filter((f) => f.name.startsWith("exception_") && matchesSearch(f)),
+    [files, fileSearch]
+  );
 
   // job.logs mixes plain-English progress steps ("milestone") with verbose
   // developer diagnostics ("detail" — see survey_shared.jobs.LogEntry). The Logs
@@ -418,22 +435,36 @@ export function ResultsPage() {
             <Text c="dimmed" size="sm">No documents found.</Text>
           ) : (
             <Stack gap="md">
-              <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
-                {primaryFiles.map((f) => renderFileCard(f, setPreviewFile))}
-              </SimpleGrid>
-              {exceptionFiles.length > 0 && (
+              <TextInput
+                placeholder="Search documents (reception number, doc type, filename)..."
+                value={fileSearch}
+                onChange={(e) => setFileSearch(e.currentTarget.value)}
+                maw={320}
+              />
+              {primaryFiles.length === 0 && exceptionFiles.length === 0 ? (
+                <Text c="dimmed" size="sm">No documents match "{fileSearch}".</Text>
+              ) : (
                 <>
-                  <Divider
-                    label={
-                      totalReceptionIds !== null
-                        ? `ALTA-cited exceptions (fetched ${exceptionFiles.length} of ${totalReceptionIds})`
-                        : `ALTA-cited exceptions (${exceptionFiles.length})`
-                    }
-                    labelPosition="left"
-                  />
-                  <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
-                    {exceptionFiles.map((f) => renderFileCard(f, setPreviewFile))}
-                  </SimpleGrid>
+                  {primaryFiles.length > 0 && (
+                    <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
+                      {primaryFiles.map((f) => renderFileCard(f, setPreviewFile))}
+                    </SimpleGrid>
+                  )}
+                  {exceptionFiles.length > 0 && (
+                    <>
+                      <Divider
+                        label={
+                          totalReceptionIds !== null
+                            ? `ALTA-cited exceptions (fetched ${exceptionFiles.length} of ${totalReceptionIds})`
+                            : `ALTA-cited exceptions (${exceptionFiles.length})`
+                        }
+                        labelPosition="left"
+                      />
+                      <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
+                        {exceptionFiles.map((f) => renderFileCard(f, setPreviewFile))}
+                      </SimpleGrid>
+                    </>
+                  )}
                 </>
               )}
             </Stack>
