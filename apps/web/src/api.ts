@@ -51,6 +51,15 @@ export interface JobSummary {
   docPrefix?: string | null;
 }
 
+/** A property that's been searched at least once, kept permanently — unlike
+ * JobSummary/the sidebar's run history, this list survives deleteJob/deleteProperty. */
+export interface SavedProperty {
+  key: string;
+  address: string;
+  county: string;
+  savedAt: number;
+}
+
 export class ApiClient {
   constructor(
     private apiBase: string,
@@ -80,6 +89,10 @@ export class ApiClient {
 
   listJobs() {
     return this.request<{ jobs: JobSummary[] }>("/api/jobs");
+  }
+
+  listSavedProperties() {
+    return this.request<{ properties: SavedProperty[] }>("/api/saved-properties");
   }
 
   getFiles(jobId: string) {

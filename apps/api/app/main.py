@@ -31,6 +31,8 @@ from .schemas import (
     JobResponse,
     JobSummary,
     KmzIdentifyResponse,
+    SavedPropertiesResponse,
+    SavedPropertySummary,
 )
 
 _MAX_KMZ_BYTES = 10 * 1024 * 1024
@@ -57,6 +59,7 @@ def health() -> dict:
 def create_job(req: CreateJobRequest) -> CreateJobResponse:
     job_id = uuid.uuid4().hex
     jobs.create_job(job_id, address=req.address, county=req.county or "")
+    jobs.save_property(address=req.address, county=req.county or "")
 
     aws.client("sqs").send_message(
         QueueUrl=get_shared_settings().require_job_queue_url(),
@@ -89,6 +92,19 @@ def list_jobs() -> JobListResponse:
                 docPrefix=j.doc_prefix,
             )
             for j in jobs.list_jobs()
+        ]
+    )
+
+
+@app.get("/api/saved-properties", response_model=SavedPropertiesResponse)
+def list_saved_properties() -> SavedPropertiesResponse:
+    """Every property ever searched, most-recent-first — unlike `GET /api/jobs`,
+    unaffected by deleting run history (`DELETE /api/jobs/{id}` /
+    `DELETE /api/properties`), so it's always available to re-run."""
+    return SavedPropertiesResponse(
+        properties=[
+            SavedPropertySummary(key=p.key, address=p.address, county=p.county, savedAt=p.saved_at)
+            for p in jobs.list_saved_properties()
         ]
     )
 

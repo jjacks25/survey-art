@@ -11,6 +11,7 @@ from moto import mock_aws
 os.environ.setdefault("AWS_REGION", "us-west-2")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-west-2")
 os.environ.setdefault("JOBS_TABLE", "test-jobs")
+os.environ.setdefault("SAVED_PROPERTIES_TABLE", "test-saved-properties")
 os.environ.setdefault("STORAGE_BUCKET", "test-storage")
 os.environ.setdefault("JOB_QUEUE_URL", "")  # filled in per-test after the queue is created
 
@@ -24,6 +25,12 @@ def aws_env():
             TableName="test-jobs",
             AttributeDefinitions=[{"AttributeName": "jobId", "AttributeType": "S"}],
             KeySchema=[{"AttributeName": "jobId", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        dynamodb.create_table(
+            TableName="test-saved-properties",
+            AttributeDefinitions=[{"AttributeName": "propertyKey", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "propertyKey", "KeyType": "HASH"}],
             BillingMode="PAY_PER_REQUEST",
         )
 

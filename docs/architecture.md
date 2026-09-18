@@ -13,7 +13,7 @@ with everything defined in CloudFormation.
 | Scraper compute | **Fargate** task (Chromium + browser-use) | Long-running browser jobs exceed Lambda's limits |
 | Scraper egress | **Public subnet**, public IP, no inbound | Avoids NAT Gateway cost (~$32/mo) |
 | Access control | **Cognito** login (JWT) at API Gateway | Managed, free-tier, password-protected |
-| Data | **DynamoDB** (jobs) + **S3** (documents) | No relational DB needed; both serverless |
+| Data | **DynamoDB** (jobs, saved properties) + **S3** (documents) | No relational DB needed; both serverless |
 | Deploy auth | Your own **local AWS credentials** (SSO/profile) | Deploys run from your machine only — no CI identity |
 | IaC | **CloudFormation** in 5 stacks + boto3 change-set harness | Reviewable, repeatable, ordered |
 
@@ -45,7 +45,8 @@ flowchart TB
             pub --- worker
         end
 
-        ddb[("DynamoDB: jobs")]
+        ddb[("DynamoDB: jobs<br/>(7-day TTL)")]
+        savedddb[("DynamoDB: saved properties<br/>(no TTL, never deleted)")]
         s3res[("S3: results")]
         secrets["Secrets Manager<br/>LLM + county creds"]
     end
@@ -60,6 +61,7 @@ flowchart TB
     user -->|"GET /"| cf --> s3site
     user -->|"/api/* + JWT"| cf --> apigw --> api
     api -->|write job| ddb
+    api -->|"save property (upsert)"| savedddb
     api -->|enqueue| sqs --> dispatch -->|RunTask| worker
     worker -->|documents| s3res
     worker -->|status| ddb
@@ -83,6 +85,7 @@ sequenceDiagram
 
     U->>A: POST /api/jobs {address}
     A->>DB: put job (PENDING)
+    A->>DB: upsert saved property record
     A->>Q: enqueue {jobId, address}
     A-->>U: 202 {jobId}
     Q->>D: message
@@ -142,6 +145,18 @@ Playwright's timing-sensitive waits and cause flaky scrape failures. The fix (se
 non-blocking), and a dedicated background thread drains the queue and does the actual
 DynamoDB write. Any future handler that talks to a network service from inside the
 scraper's logging path should follow the same pattern.
+
+**Two DynamoDB tables, two different lifetimes.** `JobsTable` (single-key on `jobId`)
+backs the search-history sidebar and has a 7-day TTL (`expiresAt`), kept in sync with
+the `documents/` S3 lifecycle rule (see [`infra/AGENTS.md`](../infra/AGENTS.md)) — a
+job record and the documents it points at age out together, and the sidebar's delete
+buttons (`DELETE /api/jobs/{id}`, `DELETE /api/properties`) can wipe run history
+entirely. `SavedPropertiesTable` (single-key on `propertyKey`, no TTL) is a separate,
+permanent record of every property ever searched (address/county only), upserted on
+every `POST /api/jobs` and never pruned by either delete endpoint — it's what lets the
+SPA re-run a property after its run history has been cleared or expired. See
+[`packages/survey_shared/AGENTS.md`](../packages/survey_shared/AGENTS.md) for the
+`Job`/`SavedProperty` models.
 
 **Property metadata** comes from `overview.json`, a per-property JSON file the Weld
 scraper already builds incrementally while it runs (parcel identify results, property
@@ -208,7 +223,7 @@ flowchart LR
     bootstrap["bootstrap<br/>template bucket"]
     network["network<br/>VPC · subnets · SG · NACLs"]
     ecr["ecr<br/>api + worker repos"]
-    backend["backend<br/>S3 · DynamoDB · SQS · Cognito<br/>IAM · ECS · Lambda · API GW"]
+    backend["backend<br/>S3 · DynamoDB (jobs + saved properties) · SQS · Cognito<br/>IAM · ECS · Lambda · API GW"]
     frontend["frontend<br/>S3 site · CloudFront · OAC · WAF"]
     bootstrap --> network --> ecr --> backend --> frontend
 ```

@@ -36,6 +36,7 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       JOBS_TABLE: survey-art-jobs
+      SAVED_PROPERTIES_TABLE: survey-art-saved-properties
       STORAGE_BUCKET: survey-art-storage
       JOB_QUEUE_URL: http://localstack:4566/000000000000/survey-art-jobs
       CORS_ORIGINS: http://localhost:5173
