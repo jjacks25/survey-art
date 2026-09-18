@@ -18,6 +18,7 @@ import {
   Table,
   Tabs,
   Text,
+  TextInput,
   Timeline,
   Title,
   Tooltip,
@@ -60,12 +61,24 @@ function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void) {
         }}
       >
         <Stack align="center" gap={4} style={{ minWidth: 0, width: "100%" }}>
-          {isPdf(f.name) ? (
+          {f.thumbnailUrl ? (
+            // A real, worker-generated first-page image — no PDF fetch/render
+            // in the browser at all, so this is the fast path (see worker.py's
+            // `_make_thumbnails()`). Falls back to the iframe below only when
+            // no thumbnail was generated (e.g. a vector PDF, not a county scan).
+            <img
+              src={f.thumbnailUrl}
+              alt={f.name}
+              loading="lazy"
+              style={{ width: "100%", height: 90, objectFit: "cover", borderRadius: 4 }}
+            />
+          ) : isPdf(f.name) ? (
             <div style={{ width: "100%", height: 90, overflow: "hidden", borderRadius: 4, pointerEvents: "none" }}>
               <iframe
                 src={`${f.url}#toolbar=0&view=FitH`}
                 title={f.name}
-                style={{ width: "400%", height: 360, border: "none", transform: "scale(0.25)", transformOrigin: "top left" }}
+                loading="lazy"
+                style={{ width: "150%", height: 135, border: "none", transform: "scale(0.667)", transformOrigin: "top left" }}
               />
             </div>
           ) : (
@@ -198,14 +211,30 @@ export function ResultsPage() {
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
+  const [fileSearch, setFileSearch] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // A substring match against the whole filename — which already covers more
+  // than reception numbers, since weld_county.py's filenames also carry the
+  // doc type ("exception_1766550.pdf", "easement_or_row_3772227.pdf",
+  // "vesting_deed_...", "alta_..."). There's no separate reception-number/doc-
+  // type field on FileEntry to match against instead, so this is deliberately
+  // "search the filename," not "search by reception number" specifically.
+  const matchesSearch = (f: FileEntry) =>
+    !fileSearch.trim() || f.name.toLowerCase().includes(fileSearch.trim().toLowerCase());
 
   // Schedule B-2/cross-reference exception docs (weld_county.py writes them
   // "exception_{reception}.pdf") are cited leads, not the directly-extracted set —
   // split them out so a surveyor sees the primary documents first, with the
   // exceptions clearly labeled.
-  const primaryFiles = useMemo(() => files.filter((f) => !f.name.startsWith("exception_")), [files]);
-  const exceptionFiles = useMemo(() => files.filter((f) => f.name.startsWith("exception_")), [files]);
+  const primaryFiles = useMemo(
+    () => files.filter((f) => !f.name.startsWith("exception_") && matchesSearch(f)),
+    [files, fileSearch]
+  );
+  const exceptionFiles = useMemo(
+    () => files.filter((f) => f.name.startsWith("exception_") && matchesSearch(f)),
+    [files, fileSearch]
+  );
 
   // job.logs mixes plain-English progress steps ("milestone") with verbose
   // developer diagnostics ("detail" — see survey_shared.jobs.LogEntry). The Logs
@@ -217,13 +246,22 @@ export function ResultsPage() {
   );
 
   // job.metadata.extracted_ids (overview.json, see id_extraction.py) lists every
-  // record ID the ALTA cites; only reception_number entries are auto-fetchable, and
-  // demo mode caps how many of those actually get downloaded. Comparing the two shows
-  // "fetched X of Y" so a demo run doesn't read as though it found everything.
+  // citation any downloaded document made — one row per (citing document, cited
+  // ID), not one row per unique ID, since weld_county.py's cross-reference walk
+  // deliberately keeps that provenance (which document cited what). The same
+  // reception number recurs once per document that happens to cite it, so this
+  // count dedupes by `id` before comparing against exceptionFiles.length in the
+  // "fetched X of Y" label — otherwise a property with a dense citation graph
+  // (the same easement cited by several documents) inflates the total.
   const totalReceptionIds = useMemo(() => {
     const ids = job?.metadata?.extracted_ids;
     if (!Array.isArray(ids)) return null;
-    return ids.filter((i) => (i as { id_type?: string })?.id_type === "reception_number").length;
+    const unique = new Set(
+      ids
+        .filter((i) => (i as { id_type?: string })?.id_type === "reception_number")
+        .map((i) => (i as { id?: string }).id)
+    );
+    return unique.size;
   }, [job?.metadata]);
 
   async function poll(id: string) {
@@ -406,22 +444,36 @@ export function ResultsPage() {
             <Text c="dimmed" size="sm">No documents found.</Text>
           ) : (
             <Stack gap="md">
-              <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
-                {primaryFiles.map((f) => renderFileCard(f, setPreviewFile))}
-              </SimpleGrid>
-              {exceptionFiles.length > 0 && (
+              <TextInput
+                placeholder="Search documents (reception number, doc type, filename)..."
+                value={fileSearch}
+                onChange={(e) => setFileSearch(e.currentTarget.value)}
+                maw={320}
+              />
+              {primaryFiles.length === 0 && exceptionFiles.length === 0 ? (
+                <Text c="dimmed" size="sm">No documents match "{fileSearch}".</Text>
+              ) : (
                 <>
-                  <Divider
-                    label={
-                      totalReceptionIds !== null
-                        ? `ALTA-cited exceptions (fetched ${exceptionFiles.length} of ${totalReceptionIds})`
-                        : `ALTA-cited exceptions (${exceptionFiles.length})`
-                    }
-                    labelPosition="left"
-                  />
-                  <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
-                    {exceptionFiles.map((f) => renderFileCard(f, setPreviewFile))}
-                  </SimpleGrid>
+                  {primaryFiles.length > 0 && (
+                    <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
+                      {primaryFiles.map((f) => renderFileCard(f, setPreviewFile))}
+                    </SimpleGrid>
+                  )}
+                  {exceptionFiles.length > 0 && (
+                    <>
+                      <Divider
+                        label={
+                          totalReceptionIds !== null
+                            ? `ALTA-cited exceptions (fetched ${exceptionFiles.length} of ${totalReceptionIds})`
+                            : `ALTA-cited exceptions (${exceptionFiles.length})`
+                        }
+                        labelPosition="left"
+                      />
+                      <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
+                        {exceptionFiles.map((f) => renderFileCard(f, setPreviewFile))}
+                      </SimpleGrid>
+                    </>
+                  )}
                 </>
               )}
             </Stack>

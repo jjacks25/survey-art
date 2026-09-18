@@ -374,6 +374,34 @@ def _extract_with_bedrock(reader: PdfReader, model: str) -> IdExtraction:
     )
 
 
+_THUMBNAIL_MAX_WIDTH = 400
+
+
+def make_thumbnail(pdf_path: Path) -> bytes | None:
+    """JPEG thumbnail of `pdf_path`'s first page, or None if it can't be made
+    (no embedded page raster — a vector PDF rather than a county scan — or an
+    unreadable file). Reuses `_page_rasters()`: the same "the embedded image
+    *is* the page" shortcut `_extract_with_bedrock` relies on, so no PDF
+    renderer is needed here either. Never raises — a thumbnail is a nice-to-
+    have for the Results grid, not something that should fail an upload.
+    """
+    try:
+        reader = PdfReader(pdf_path)
+        raster = next(_page_rasters(reader), None)
+    except Exception as exc:
+        logger.warning("make_thumbnail: could not read %s: %s", pdf_path, exc)
+        return None
+    if raster is None:
+        return None
+    width, height = raster.size
+    scale = min(1.0, _THUMBNAIL_MAX_WIDTH / max(1, width))
+    if scale < 1.0:
+        raster = raster.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    raster.convert("RGB").save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
