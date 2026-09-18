@@ -12,6 +12,7 @@ import json
 import logging
 import mimetypes
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -57,6 +58,23 @@ class LogEntry(BaseModel):
     kind: Literal["milestone", "detail"] = "detail"
 
 
+class CostLine(BaseModel):
+    """One service's share of a run's cost, for the Run Details tab.
+
+    Produced by `apps/worker/survey_art/costs.py`, which owns the rates and the
+    arithmetic; this package just round-trips the result. `basis` is "measured"
+    only for figures that come from a provider's own accounting (today: Bedrock
+    tokens) and "estimated" for everything priced from a published rate card, so
+    the UI can label them honestly rather than implying they're billed amounts.
+    """
+
+    key: str
+    label: str
+    usd: float
+    detail: str = ""
+    basis: Literal["measured", "estimated"] = "estimated"
+
+
 class Job(BaseModel):
     """A scrape job record. Field aliases are the DynamoDB item attribute names."""
 
@@ -90,6 +108,12 @@ class Job(BaseModel):
     bedrock_output_tokens: int | None = Field(default=None, alias="bedrockOutputTokens")
     fargate_cost_usd: float | None = Field(default=None, alias="fargateCostUsd")
     fargate_seconds: float | None = Field(default=None, alias="fargateSeconds")
+    # The full per-service breakdown (see apps/worker/survey_art/costs.py). The four
+    # fields above stay because job records written before this existed still carry
+    # them and nothing migrates DynamoDB items — the frontend prefers `costs` and
+    # falls back to them. `usd` is typed, so DynamoDB's Decimals coerce back to float
+    # on read rather than reaching the JSON encoder.
+    costs: list[CostLine] = Field(default_factory=list)
 
     @field_validator("logs", mode="before")
     @classmethod
@@ -191,6 +215,7 @@ def update_status(
     bedrock_output_tokens: int | None = None,
     fargate_cost_usd: float | None = None,
     fargate_seconds: float | None = None,
+    costs: list[dict] | None = None,
 ) -> None:
     """Set status, unless the job was already cancelled — a cancel wins over a
     worker that finishes (or fails) after the user gave up on it."""
@@ -229,6 +254,14 @@ def update_status(
     if fargate_seconds is not None:
         expr.append("fargateSeconds = :fs")
         values[":fs"] = Decimal(str(fargate_seconds))
+    if costs is not None:
+        # `costs` is aliased like `status`/`error`/`location` above — cheaper than
+        # checking DynamoDB's reserved-word list every time this attribute is touched.
+        expr.append("#c = :c")
+        names["#c"] = "costs"
+        # DynamoDB rejects native floats; go through str() so the decimal value is
+        # what was computed, not its binary-float neighbour (same rule as `location`).
+        values[":c"] = [{**line, "usd": Decimal(str(line["usd"]))} for line in costs]
     try:
         _table().update_item(
             Key={"jobId": job_id},
@@ -408,6 +441,11 @@ def _download_metadata(key: str) -> dict | None:
         return None
 
 
+# Concurrent S3 PUTs for a job's documents/thumbnails. Latency-bound, not
+# CPU-bound, so this sits well above the task's 1 vCPU.
+_UPLOAD_WORKERS = 8
+
+
 def upload_documents(prefix: str, files: list[Path]) -> int:
     """Upload downloaded county documents to the storage bucket under
     ``documents/{prefix}/`` (e.g. ``documents/co/weld/123_main_st/``, see
@@ -415,19 +453,27 @@ def upload_documents(prefix: str, files: list[Path]) -> int:
     for the same property land in the same place across repeated searches.
     Kept under the ``documents/`` prefix, which the bucket's lifecycle rule
     excludes, so these durable records never expire (unlike ``scratch/``).
-    Returns count uploaded."""
+    Returns count uploaded.
+
+    Uploaded concurrently: a property can bring back ~90 documents, and these
+    are independent network round-trips, so doing them one at a time put minutes
+    of pure latency at the end of every job. A boto3 client is thread-safe for
+    concurrent calls like this (it's the *resource* layer that isn't)."""
     s3 = aws.client("s3")
     bucket = aws.storage_bucket()
-    count = 0
-    for path in files:
-        if not path.is_file():
-            continue
-        key = f"{DOCUMENTS_PREFIX}/{prefix}/{path.name}"
+    uploadable = [p for p in files if p.is_file()]
+    if not uploadable:
+        return 0
+
+    def put(path: Path) -> None:
         content_type, _ = mimetypes.guess_type(path.name)
         extra_args = {"ContentType": content_type} if content_type else {}
+        key = f"{DOCUMENTS_PREFIX}/{prefix}/{path.name}"
         s3.upload_file(str(path), bucket, key, ExtraArgs=extra_args)
-        count += 1
-    return count
+
+    with ThreadPoolExecutor(max_workers=_UPLOAD_WORKERS) as pool:
+        list(pool.map(put, uploadable))  # `map` re-raises, so a failed upload still fails the job
+    return len(uploadable)
 
 
 THUMBNAILS_SUBPREFIX = ".thumbnails"
@@ -439,14 +485,76 @@ def upload_thumbnails(prefix: str, thumbnails: dict[str, bytes]) -> None:
     step). Stored under ``documents/{prefix}/.thumbnails/{filename}.jpg`` —
     same durable prefix and retention as the documents themselves, but a
     leading-dot subpath `list_result_files()` explicitly skips so a thumbnail
-    never shows up as a document of its own in the Results grid."""
+    never shows up as a document of its own in the Results grid.
+
+    Concurrent for the same reason as `upload_documents()` — one PUT per
+    document, all independent."""
     if not thumbnails:
         return
     s3 = aws.client("s3")
     bucket = aws.storage_bucket()
-    for filename, jpeg_bytes in thumbnails.items():
+
+    def put(item: tuple[str, bytes]) -> None:
+        filename, jpeg_bytes = item
         key = f"{DOCUMENTS_PREFIX}/{prefix}/{THUMBNAILS_SUBPREFIX}/{filename}.jpg"
         s3.put_object(Bucket=bucket, Key=key, Body=jpeg_bytes, ContentType="image/jpeg")
+
+    with ThreadPoolExecutor(max_workers=_UPLOAD_WORKERS) as pool:
+        list(pool.map(put, thumbnails.items()))
+
+
+EXTRACTIONS_PREFIX = "extractions"
+
+
+def _extraction_key(fingerprint: str, reception: str) -> str:
+    return f"{EXTRACTIONS_PREFIX}/{fingerprint}/{reception}.json"
+
+
+def get_cached_extraction(fingerprint: str, reception: str) -> dict | None:
+    """A previous run's citation-extraction result for this recorded document,
+    or None if there isn't one.
+
+    A recorded document is immutable once filed, so what it cites never changes
+    and the answer is reusable forever — across re-runs of the same property
+    (the Reprocess button) and across different parcels, since the recorder's
+    section-wide searches return the same easements and plats for every parcel
+    in a section. That matters because reading one is the single biggest cost in
+    a run: no Weld recorder PDF has a text layer, so every one takes the Bedrock
+    vision path at roughly two cents a document.
+
+    `fingerprint` scopes the key to whatever would change the answer (the model
+    and the tiling parameters), so tuning either doesn't silently serve results
+    produced by the old settings — it just starts a new, empty namespace.
+
+    Best-effort: any failure returns None and the caller re-extracts. A cache
+    that's down must cost money, not correctness.
+    """
+    try:
+        obj = aws.client("s3").get_object(
+            Bucket=aws.storage_bucket(), Key=_extraction_key(fingerprint, reception)
+        )
+        return json.loads(obj["Body"].read())
+    except Exception:  # noqa: BLE001 — a miss and an outage are the same to the caller
+        return None
+
+
+def put_cached_extraction(fingerprint: str, reception: str, payload: dict) -> None:
+    """Store one extraction result for reuse. Best-effort; never raises.
+
+    These are a few hundred bytes each and outlive the documents they describe —
+    the `documents/` lifecycle rule doesn't cover this prefix, deliberately, so a
+    re-run a month later still skips the model call even though the PDF itself
+    has aged out and has to be re-downloaded.
+    """
+    try:
+        aws.client("s3").put_object(
+            Bucket=aws.storage_bucket(),
+            Key=_extraction_key(fingerprint, reception),
+            Body=json.dumps(payload).encode(),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not cache extraction for %s: %s", reception, exc)
 
 
 def upload_map_image(job_id: str, path: Path) -> str | None:

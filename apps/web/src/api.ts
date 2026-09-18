@@ -27,6 +27,20 @@ export interface Job {
   bedrockOutputTokens?: number | null;
   fargateCostUsd?: number | null;
   fargateSeconds?: number | null;
+  /** Full per-service cost breakdown, biggest line first (worker's costs.py).
+   * Absent on job records written before it existed — RunCost falls back to the
+   * bedrock/fargate scalars above for those. */
+  costs?: CostLine[] | null;
+}
+
+export interface CostLine {
+  key: string;
+  label: string;
+  usd: number;
+  detail: string;
+  /** "measured" = the provider's own usage accounting; "estimated" = priced
+   * from a published rate card by the worker. */
+  basis: "measured" | "estimated";
 }
 
 export interface FileEntry {

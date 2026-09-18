@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from survey_art.id_extraction import ExtractedId, IdExtraction
+from survey_art.scrapers import weld_county
 from survey_art.scrapers.weld_county import _DocRecord, _expand_cross_references
 
 
@@ -29,6 +30,15 @@ class _FakeOverview:
 
     def set_section(self, section: str, value) -> None:
         self.sections[section] = value
+
+
+@pytest.fixture(autouse=True)
+def _no_extraction_cache(monkeypatch):
+    """These tests are about the walk, not the cache. Stub the S3 round-trip so
+    they neither reach the network nor need the cache to miss by accident."""
+    monkeypatch.setattr(weld_county.jobs, "get_cached_extraction", lambda *a, **k: None)
+    monkeypatch.setattr(weld_county.jobs, "put_cached_extraction", lambda *a, **k: None)
+    monkeypatch.setattr(weld_county, "cache_fingerprint", lambda *a, **k: "test")
 
 
 @pytest.mark.asyncio
@@ -76,6 +86,71 @@ async def test_cycle_does_not_infinite_loop_or_double_extract(monkeypatch):
     # known/fetched) re-cited by doc 2 — extracted_ids is a citation log, not
     # just the set of newly-fetched receptions.
     assert [row["id"] for row in ov.sections["extracted_ids"]] == ["2", "1", "3"]
+
+
+@pytest.mark.asyncio
+async def test_a_whole_depth_level_is_fetched_in_one_call(monkeypatch):
+    """Two documents at the same depth citing different documents must produce a
+    single batched download, not one per citing document.
+
+    `_download_documents` launches a browser and logs in per call, so batching a
+    level is what keeps that cost at one-per-level instead of one-per-document.
+    """
+
+    def fake_extract(path: Path) -> IdExtraction:
+        cites = {"a": ["c"], "b": ["d"], "c": [], "d": []}[path.name]
+        return IdExtraction(
+            ids=[ExtractedId(id=r, id_type="reception_number") for r in cites],
+            source="text_layer",
+        )
+
+    download_calls: list[list[str]] = []
+
+    async def fake_download(address, targets, doc_filter, dest, *, username, password):
+        download_calls.append([doc.reception for _, doc in targets])
+        return [(role, doc, [Path(doc.reception)]) for role, doc in targets], 0.0, 0, 0
+
+    monkeypatch.setattr("survey_art.scrapers.weld_county.extract_document_ids", fake_extract)
+    monkeypatch.setattr("survey_art.scrapers.weld_county._download_documents", fake_download)
+
+    initial = [("alta", _doc("a"), [Path("a")]), ("vesting_deed", _doc("b"), [Path("b")])]
+    new_results, _in_tok, _out_tok = await _expand_cross_references(
+        "123 Main St", None, Path("/tmp"), _FakeOverview(), initial, {"a", "b"},
+        username="u", password="p",
+    )
+
+    assert download_calls == [["c", "d"]]
+    assert {doc.reception for _, doc, _ in new_results} == {"c", "d"}
+
+
+@pytest.mark.asyncio
+async def test_stops_fetching_at_the_depth_limit(monkeypatch):
+    """Each document cites one more forever; the walk must stop chasing citations
+    once `_MAX_CROSS_REFERENCE_DEPTH` levels deep, and say so in the overview."""
+
+    def fake_extract(path: Path) -> IdExtraction:
+        nxt = str(int(path.name) + 1)
+        return IdExtraction(
+            ids=[ExtractedId(id=nxt, id_type="reception_number")], source="text_layer"
+        )
+
+    levels: list[list[str]] = []
+
+    async def fake_download(address, targets, doc_filter, dest, *, username, password):
+        levels.append([doc.reception for _, doc in targets])
+        return [(role, doc, [Path(doc.reception)]) for role, doc in targets], 0.0, 0, 0
+
+    monkeypatch.setattr("survey_art.scrapers.weld_county.extract_document_ids", fake_extract)
+    monkeypatch.setattr("survey_art.scrapers.weld_county._download_documents", fake_download)
+
+    ov = _FakeOverview()
+    await _expand_cross_references(
+        "123 Main St", None, Path("/tmp"), ov, [("alta", _doc("0"), [Path("0")])], {"0"},
+        username="u", password="p",
+    )
+
+    assert len(levels) == weld_county._MAX_CROSS_REFERENCE_DEPTH
+    assert ov.sections["limits"] == {"cross_reference_depth_limit": True}
 
 
 @pytest.mark.asyncio

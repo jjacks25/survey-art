@@ -189,6 +189,27 @@ four `Tabs.Panel`s from the response:
   `job.location`, (3) a plain address-based Google Maps search, (4) a "no location yet"
   message.
 
+## Run Details: the cost table renders whatever the worker sends
+
+`RunCost` (`ResultsPage.tsx`) maps over `job.costs` — a `CostLine[]` the worker's
+`costs.py` produces, already sorted biggest-first — and sums it for the total. It has no
+per-service knowledge, so **adding an AWS service to the breakdown needs no frontend
+change**; add the line there.
+
+Two details that are deliberate:
+
+- `costLines()` synthesises the old two-line shape (`bedrockCostUsd`/`fargateCostUsd`)
+  for job records written before `costs` existed. DynamoDB items don't migrate, and
+  those runs are still in the history sidebar, so don't drop the fallback.
+- `formatUsd()` gives sub-cent lines six decimals instead of four. At four, every small
+  line renders `$0.0000`, which reads as "free" rather than "small" — the point of
+  itemising is that the reader can see S3 and DynamoDB are genuinely negligible next to
+  the model bill, not that they're zero.
+
+Each row also shows `basis` — "billed usage" only for Bedrock (the provider's own
+accounting); everything else is "estimated" from published rates, since AWS cost reports
+lag 24-48h and can't back a number shown the moment a job finishes.
+
 ## Cancelling a job
 
 `ResultsPage` shows a Cancel button next to the status badge while the job is

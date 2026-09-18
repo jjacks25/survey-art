@@ -61,13 +61,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
 from survey_art.county_sites import SUPPORTED_COUNTIES
 from survey_art.document_filter import DEFAULT_FILTER, DocumentFilter
 from survey_art.download import download_dir as make_download_dir
 from survey_art.geocode import GeocodedAddress
-from survey_art.id_extraction import IdExtraction, extract_document_ids
+from survey_art.id_extraction import IdExtraction, cache_fingerprint, extract_document_ids
 from survey_art.settings import get_settings
+from survey_shared import jobs
 
 logger = logging.getLogger(__name__)
 # Plain-language, step-by-step narration for the non-technical end user (streamed
@@ -991,6 +993,136 @@ async def _recorder_login(ctx, username: str, password: str) -> bool:
         return False
 
 
+async def _fetch_document(
+    ctx,
+    role: str,
+    doc: _DocRecord,
+    dest_dir: Path,
+    cookie_lock: asyncio.Lock,
+) -> tuple[str, _DocRecord, list[Path]]:
+    """Fetch one recorder document. Returns `(role, doc, [path])`, or an empty
+    path list if every attempt failed.
+
+    Pace and retry. The Schedule B-2 exception walk turned this from "2
+    documents" into "one per exception" — ~90 for a commercial ALTA — and
+    occasionally the site serves a viewer page with no `#printCustom` button.
+    That never means the document is missing; the same reception fetches
+    cleanly moments later. So every non-success retries after a growing pause,
+    re-asserting the disclaimer cookie (see below) rather than re-authenticating.
+
+    Measured over the 80 documents ALTA 4571638 cites: 80/80, with only 3
+    single-attempt retries. Two earlier versions scored 44/80 and 57/80 — the
+    first because it treated any HTTP response as final and never retried, the
+    second because it re-logged-in between attempts.
+    """
+    doc_saved: list[Path] = []
+    for attempt in range(_DOC_FETCH_ATTEMPTS):
+        # Pace every attempt, not just the retries. Those 80/80 measurements
+        # were taken with a paused *serial* loop, and what the county's server
+        # reacts to is the request rate — so each concurrent worker keeps
+        # pacing itself exactly as the serial version did, and concurrency
+        # (`weld_download_concurrency`) is what provides the speedup instead.
+        await asyncio.sleep(_DOC_FETCH_PAUSE_S * (attempt + 1))
+        if attempt:
+            # Re-assert the disclaimer cookie rather than re-authenticating.
+            # Hitting the login endpoint again is actively harmful: when the
+            # session is still valid it replies with the login *page* (HTTP 200,
+            # HTML, no JSON `success`), and that response sets
+            # `disclaimerAccepted=false` alongside the injected `true`. The
+            # server reads the false one, serves the disclaimer instead of the
+            # document, and every following fetch loses its download button —
+            # a re-login "fix" turned a partial failure into a total one.
+            #
+            # Cookies are context-wide, so this clear/re-add pair is shared with
+            # every fetch running right now and has to be atomic: without the
+            # lock a sibling can land in the window where the cookie is missing
+            # and get served the disclaimer instead of its document.
+            async with cookie_lock:
+                await ctx.clear_cookies(name="disclaimerAccepted")
+                await ctx.add_cookies([_DISCLAIMER_COOKIE])
+        # Nothing below may escape: these run under one `asyncio.gather`, so a
+        # raise here would cancel every other document in flight (mid-write, in
+        # the worst case) and skip the browser teardown. A document that can't
+        # be fetched returns no paths instead — the caller already treats that
+        # as "failed" and carries on with the rest.
+        doc_page = None
+        try:
+            doc_page = await ctx.new_page()
+            await doc_page.goto(doc.url, wait_until="domcontentloaded", timeout=30_000)
+            # The print button's `data-href` is the only thing this page is
+            # opened for, so wait for that button rather than for the network to
+            # go idle: the viewer is PDF.js fetching page images over HTTP Range
+            # requests, which keeps the network busy long after the button
+            # exists. A timeout here isn't fatal — fall through and let the
+            # `href` check below produce the real diagnostic.
+            try:
+                await doc_page.wait_for_selector("#printCustom", timeout=20_000)
+            except Exception:
+                pass
+
+            href = await doc_page.evaluate(
+                "() => { const b = document.getElementById('printCustom');"
+                " return b ? b.getAttribute('data-href') : null; }"
+            )
+            if not href:
+                image_div = await doc_page.query_selector("#ImageDiv")
+                msg = (await image_div.inner_text()).strip()[:200] if image_div else ""
+                logger.warning(
+                    "No printCustom button for %s reception %s (attempt %d/%d) — %s",
+                    role,
+                    doc.reception,
+                    attempt + 1,
+                    _DOC_FETCH_ATTEMPTS,
+                    msg or "(no diagnostic message)",
+                )
+                continue
+
+            pdf_url = f"https://recording.weld.gov{href}"
+            resp = await ctx.request.get(pdf_url)
+            body = await resp.body() if resp.status == 200 else b""
+            if resp.status != 200:
+                logger.warning(
+                    "Print endpoint returned HTTP %s for %s reception %s (attempt %d/%d)",
+                    resp.status,
+                    role,
+                    doc.reception,
+                    attempt + 1,
+                    _DOC_FETCH_ATTEMPTS,
+                )
+                continue
+            if not body or body[:5] != b"%PDF-":
+                logger.warning(
+                    "Print endpoint returned non-PDF body for %s reception %s "
+                    "(head=%r, %d bytes, attempt %d/%d)",
+                    role,
+                    doc.reception,
+                    body[:8],
+                    len(body),
+                    attempt + 1,
+                    _DOC_FETCH_ATTEMPTS,
+                )
+                continue
+
+            dst = dest_dir / f"{role}_{doc.reception}.pdf"
+            dst.write_bytes(body)
+            doc_saved.append(dst)
+            logger.info(
+                "Saved %s (%d bytes) for %s reception %s",
+                dst.name,
+                len(body),
+                role,
+                doc.reception,
+            )
+            break
+        except Exception as exc:
+            logger.warning("Download error for %s reception %s: %s", role, doc.reception, exc)
+        finally:
+            if doc_page is not None:
+                await doc_page.close()
+
+    return role, doc, doc_saved
+
+
 async def _download_documents(
     address: str,
     targets: list[tuple[str, _DocRecord]],
@@ -1023,7 +1155,6 @@ async def _download_documents(
     from playwright.async_api import async_playwright
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    results: list[tuple[str, _DocRecord, list[Path]]] = []
 
     # Set WELD_HEADED=1 to watch the browser drive itself (useful for debugging).
     import os
@@ -1070,100 +1201,20 @@ async def _download_documents(
         # serves the complete multi-page document. We open the viewer just
         # long enough to read that href, then fetch it directly.
         #
-        # Pace and retry. The Schedule B-2 exception walk turned this loop from
-        # "2 documents" into "one per exception" — ~90 for a commercial ALTA — and occasionally
-        # the site serves a viewer page with no `#printCustom` button. That never
-        # means the document is missing; the same reception fetches cleanly moments
-        # later. So every non-success retries after a growing pause, re-asserting
-        # the disclaimer cookie (see below) rather than re-authenticating.
-        #
-        # Measured over the 80 documents ALTA 4571638 cites: 80/80, with only 3
-        # single-attempt retries. Two earlier versions of this loop scored 44/80 and
-        # 57/80 — the first because it treated any HTTP response as final and never
-        # retried, the second because it re-logged-in between attempts.
-        for index, (role, doc) in enumerate(targets):
-            doc_saved: list[Path] = []
-            for attempt in range(_DOC_FETCH_ATTEMPTS):
-                if index or attempt:
-                    await asyncio.sleep(_DOC_FETCH_PAUSE_S * (attempt + 1))
-                # Re-assert the disclaimer cookie rather than re-authenticating.
-                # Hitting the login endpoint again is actively harmful: when the
-                # session is still valid it replies with the login *page* (HTTP 200,
-                # HTML, no JSON `success`), and that response sets
-                # `disclaimerAccepted=false` alongside the injected `true`. The
-                # server reads the false one, serves the disclaimer instead of the
-                # document, and every following fetch loses its download button —
-                # a re-login "fix" turned a partial failure into a total one.
-                if attempt:
-                    await ctx.clear_cookies(name="disclaimerAccepted")
-                    await ctx.add_cookies([_DISCLAIMER_COOKIE])
-                doc_page = await ctx.new_page()
-                try:
-                    await doc_page.goto(doc.url, wait_until="domcontentloaded", timeout=30_000)
-                    await doc_page.wait_for_load_state("networkidle", timeout=20_000)
+        # Fetches run concurrently, bounded by `weld_download_concurrency`, in
+        # tabs of this one already-authenticated context — so the session is
+        # established once and never re-established mid-run. `gather` preserves
+        # input order, so `results` still lines up with `targets`.
+        limit = max(1, get_settings().weld_download_concurrency)
+        semaphore = asyncio.Semaphore(limit)
+        cookie_lock = asyncio.Lock()
+        logger.info("Fetching %d document(s), %d at a time", len(targets), limit)
 
-                    href = await doc_page.evaluate(
-                        "() => { const b = document.getElementById('printCustom');"
-                        " return b ? b.getAttribute('data-href') : null; }"
-                    )
-                    if not href:
-                        image_div = await doc_page.query_selector("#ImageDiv")
-                        msg = (await image_div.inner_text()).strip()[:200] if image_div else ""
-                        logger.warning(
-                            "No printCustom button for %s reception %s (attempt %d/%d) — %s",
-                            role,
-                            doc.reception,
-                            attempt + 1,
-                            _DOC_FETCH_ATTEMPTS,
-                            msg or "(no diagnostic message)",
-                        )
-                        continue
+        async def fetch(role: str, doc: _DocRecord):
+            async with semaphore:
+                return await _fetch_document(ctx, role, doc, dest_dir, cookie_lock)
 
-                    pdf_url = f"https://recording.weld.gov{href}"
-                    resp = await ctx.request.get(pdf_url)
-                    body = await resp.body() if resp.status == 200 else b""
-                    if resp.status != 200:
-                        logger.warning(
-                            "Print endpoint returned HTTP %s for %s reception %s (attempt %d/%d)",
-                            resp.status,
-                            role,
-                            doc.reception,
-                            attempt + 1,
-                            _DOC_FETCH_ATTEMPTS,
-                        )
-                        continue
-                    if not body or body[:5] != b"%PDF-":
-                        logger.warning(
-                            "Print endpoint returned non-PDF body for %s reception %s "
-                            "(head=%r, %d bytes, attempt %d/%d)",
-                            role,
-                            doc.reception,
-                            body[:8],
-                            len(body),
-                            attempt + 1,
-                            _DOC_FETCH_ATTEMPTS,
-                        )
-                        continue
-
-                    dst = dest_dir / f"{role}_{doc.reception}.pdf"
-                    dst.write_bytes(body)
-                    doc_saved.append(dst)
-                    logger.info(
-                        "Saved %s (%d bytes) for %s reception %s",
-                        dst.name,
-                        len(body),
-                        role,
-                        doc.reception,
-                    )
-                    break
-                except Exception as exc:
-                    logger.warning(
-                        "Download error for %s reception %s: %s", role, doc.reception, exc
-                    )
-                finally:
-                    await doc_page.close()
-
-            results.append((role, doc, doc_saved))
+        results = list(await asyncio.gather(*(fetch(role, doc) for role, doc in targets)))
 
         await browser.close()
 
@@ -1559,6 +1610,37 @@ _MAX_CROSS_REFERENCE_DOCS = 150
 _MAX_CROSS_REFERENCE_DEPTH = 3
 
 
+def _extract_cited_ids(reception: str, path: Path) -> IdExtraction:
+    """Read one document for the documents it cites, reusing a previous run's
+    answer when there is one.
+
+    Reading a recorder PDF is the most expensive thing a run does — none of them
+    carry a text layer, so each takes the Bedrock vision path — and the answer
+    never changes, because a recorded document is immutable once filed. So the
+    same reception number costs the model once, ever, rather than once per run:
+    a re-run of the same property is close to free, and a different parcel in
+    the same section reuses every easement and plat the section-wide search
+    returns for both.
+
+    Runs on a worker thread (see `_expand_cross_references`) — both the S3 round
+    trip and `extract_document_ids` block.
+    """
+    fingerprint = cache_fingerprint()
+    cached = jobs.get_cached_extraction(fingerprint, reception)
+    if cached is not None:
+        try:
+            # Deliberately not carrying the original token counts over: this run
+            # didn't spend them, and the cost breakdown reads these fields.
+            return IdExtraction(ids=cached.get("ids", []), source="cache")
+        except ValidationError as exc:
+            logger.warning("Ignoring malformed cached extraction for %s: %s", reception, exc)
+
+    result = extract_document_ids(path)
+    if result.source != "none":
+        jobs.put_cached_extraction(fingerprint, reception, {"ids": result.to_metadata()})
+    return result
+
+
 async def _expand_cross_references(
     address: str,
     doc_filter: DocumentFilter,
@@ -1583,70 +1665,101 @@ async def _expand_cross_references(
     text-layer path before Bedrock, so this only pays for a vision call on
     the documents that are actually scanned images.
 
-    `extracted_ids` is written to `ov` once per document processed, as a
-    single flat list (the shape the frontend already renders as a table) —
-    cheap because nothing is duplicated per property, and a crash mid-walk
-    still leaves everything found so far on disk.
+    `extracted_ids` is written to `ov` once per level processed, as a single
+    flat list (the shape the frontend already renders as a table) — cheap
+    because nothing is duplicated per property, and a crash mid-walk still
+    leaves everything found so far on disk.
+
+    The walk runs a whole depth level at a time rather than one document at a
+    time, which is what makes it finish in minutes instead of an hour:
+
+    * every document at a level is read concurrently, and each read goes to a
+      worker thread, so a level costs about as long as its slowest document
+      instead of the sum of all of them (`extract_document_ids` blocks on both
+      PDF decoding and Bedrock, so calling it inline would also stall the event
+      loop and every download sharing it);
+    * a level's citations are fetched in one `_download_documents()` call, which
+      opens a browser and logs in once per call — so one login per level rather
+      than one per citing document.
     """
     extracted: set[str] = set()
     extracted_ids: list[dict] = []
     new_results: list[tuple[str, _DocRecord, list[Path]]] = []
-    queue: list[tuple[str, _DocRecord, list[Path], int]] = [(*r, 0) for r in initial_results]
+    level = list(initial_results)
+    depth = 0
     discovered = 0
     in_tok = out_tok = 0
-    hit_depth_limit = False
 
-    while queue:
-        role, doc, paths, depth = queue.pop(0)
-        if not paths or doc.reception in extracted:
-            continue
-        extracted.add(doc.reception)
+    while level:
+        # Only the first saved file per document: one that came down as separate
+        # per-page images (rather than one merged PDF) only gets its first page
+        # read — the same simplification the ALTA-only walk made before.
+        batch = [
+            (role, doc, paths)
+            for role, doc, paths in level
+            if paths and doc.reception not in extracted
+        ]
+        if not batch:
+            break
+        extracted.update(doc.reception for _, doc, _ in batch)
 
-        # Only the first saved file: a document that came down as separate
-        # per-page images (rather than one merged PDF) only gets its first
-        # page read — the same simplification the ALTA-only walk made before.
-        extraction = extract_document_ids(paths[0])
-        in_tok += extraction.input_tokens
-        out_tok += extraction.output_tokens
-        if extraction.ids:
-            extracted_ids.extend(
-                {**row, "source_reception": doc.reception, "source_doc_type": doc.doc_type}
-                for row in extraction.to_metadata()
+        extractions = await asyncio.gather(
+            *(
+                asyncio.to_thread(_extract_cited_ids, doc.reception, paths[0])
+                for _, doc, paths in batch
             )
-            ov.set_section("extracted_ids", extracted_ids)
-
-        if discovered >= _MAX_CROSS_REFERENCE_DOCS:
-            continue  # keep draining the queue for extraction, just stop fetching more
-        if depth >= _MAX_CROSS_REFERENCE_DEPTH:
-            if not hit_depth_limit:
-                narration.info(
-                    "Reached the cross-reference depth limit — no longer chasing "
-                    "citations from citations."
-                )
-                hit_depth_limit = True
-                ov.set_section("limits", {"cross_reference_depth_limit": True})
-            continue
-
-        new_targets = _select_schedule_b2_exception_targets(extraction, known_receptions)
-        if not new_targets:
-            continue
-        if discovered + len(new_targets) > _MAX_CROSS_REFERENCE_DOCS:
-            new_targets = new_targets[: _MAX_CROSS_REFERENCE_DOCS - discovered]
-            narration.info("Reached the cross-reference safety limit — stopping further lookups.")
-        discovered += len(new_targets)
-        known_receptions.update(target_doc.reception for _, target_doc in new_targets)
-
-        narration.info(
-            f"{doc.doc_type or 'A downloaded document'} references "
-            f"{len(new_targets)} other recorded document(s) — downloading them now..."
         )
+
+        next_targets: list[tuple[str, _DocRecord]] = []
+        for (_role, doc, _paths), extraction in zip(batch, extractions, strict=True):
+            in_tok += extraction.input_tokens
+            out_tok += extraction.output_tokens
+            if extraction.ids:
+                extracted_ids.extend(
+                    {**row, "source_reception": doc.reception, "source_doc_type": doc.doc_type}
+                    for row in extraction.to_metadata()
+                )
+                ov.set_section("extracted_ids", extracted_ids)
+
+            if discovered >= _MAX_CROSS_REFERENCE_DOCS:
+                continue  # keep reading the level for citations, just stop fetching more
+            if depth >= _MAX_CROSS_REFERENCE_DEPTH:
+                continue
+
+            found = _select_schedule_b2_exception_targets(extraction, known_receptions)
+            if not found:
+                continue
+            if discovered + len(found) > _MAX_CROSS_REFERENCE_DOCS:
+                found = found[: _MAX_CROSS_REFERENCE_DOCS - discovered]
+                narration.info(
+                    "Reached the cross-reference safety limit — stopping further lookups."
+                )
+            discovered += len(found)
+            known_receptions.update(target_doc.reception for _, target_doc in found)
+            narration.info(
+                f"{doc.doc_type or 'A downloaded document'} references "
+                f"{len(found)} other recorded document(s) — downloading them now..."
+            )
+            next_targets += found
+
+        if depth >= _MAX_CROSS_REFERENCE_DEPTH:
+            narration.info(
+                "Reached the cross-reference depth limit — no longer chasing "
+                "citations from citations."
+            )
+            ov.set_section("limits", {"cross_reference_depth_limit": True})
+            break
+        if not next_targets:
+            break
+
         downloaded, _dl_cost, dl_in, dl_out = await _download_documents(
-            address, new_targets, doc_filter, dest, username=username, password=password
+            address, next_targets, doc_filter, dest, username=username, password=password
         )
         in_tok += dl_in
         out_tok += dl_out
         new_results.extend(downloaded)
-        queue.extend((*r, depth + 1) for r in downloaded)
+        level = downloaded
+        depth += 1
 
     return new_results, in_tok, out_tok
 

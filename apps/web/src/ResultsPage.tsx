@@ -25,7 +25,7 @@ import {
   UnstyledButton,
 } from "@mantine/core";
 
-import { FileEntry, Job } from "./api";
+import { CostLine, FileEntry, Job } from "./api";
 import { LayoutContext } from "./Layout";
 import { MetadataView, PropertyMap } from "./MetadataView";
 import { TERMINAL, statusColor, fileIcon, isPdf } from "./utils";
@@ -94,48 +94,78 @@ function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void) {
   );
 }
 
-/** Estimated infra cost breakdown for one run. Bedrock is a real dollar figure
- * (browser-use's own usage accounting); Fargate is estimated from wall-clock
- * task runtime against a flat on-demand rate — see worker.py's `_cost_fields`. */
+/** Every AWS service this run touched, itemised and totalled. `job.costs` comes
+ * from the worker's `costs.py`, which owns the rates and the arithmetic — this
+ * just renders whatever lines it produced, so adding a service there needs no
+ * change here. Older job records predate `costs` and carry only the two scalar
+ * fields, so those are synthesised into the same shape rather than branching the
+ * render path. */
+function costLines(job: Job): CostLine[] {
+  if (job.costs?.length) return job.costs;
+  return [
+    {
+      key: "bedrock",
+      label: "Bedrock / LLM",
+      usd: job.bedrockCostUsd ?? 0,
+      detail: `${(job.bedrockInputTokens ?? 0).toLocaleString()} in / ${(job.bedrockOutputTokens ?? 0).toLocaleString()} out tokens`,
+      basis: "measured",
+    },
+    {
+      key: "fargate",
+      label: "ECS / Fargate",
+      usd: job.fargateCostUsd ?? 0,
+      detail: `${(job.fargateSeconds ?? 0).toFixed(0)}s runtime`,
+      basis: "estimated",
+    },
+  ];
+}
+
+/** Sub-cent lines would all render as "$0.0000" at the total's precision, which
+ * reads as "free" rather than "small". Give them enough digits to stay distinct. */
+function formatUsd(n: number): string {
+  if (n === 0) return "$0";
+  if (n < 0.0001) return `$${n.toFixed(6)}`;
+  return `$${n.toFixed(4)}`;
+}
+
 function RunCost({ job }: { job: Job }) {
-  if (job.bedrockCostUsd == null && job.fargateCostUsd == null) {
+  if (job.bedrockCostUsd == null && job.fargateCostUsd == null && !job.costs?.length) {
     return (
       <Text c="dimmed" size="sm">
         Cost will appear here once the job finishes.
       </Text>
     );
   }
-  const bedrock = job.bedrockCostUsd ?? 0;
-  const fargate = job.fargateCostUsd ?? 0;
-  const total = bedrock + fargate;
-  const fmt = (n: number) => `$${n.toFixed(4)}`;
+  const lines = costLines(job);
+  const total = lines.reduce((sum, line) => sum + line.usd, 0);
   return (
     <Stack gap="sm">
       <Text fw={500} size="sm">Estimated Cost</Text>
       <Table w="auto" verticalSpacing="xs">
         <Table.Tbody>
-          <Table.Tr>
-            <Table.Td>Bedrock / LLM</Table.Td>
-            <Table.Td>{fmt(bedrock)}</Table.Td>
-            <Table.Td c="dimmed">
-              {(job.bedrockInputTokens ?? 0).toLocaleString()} in / {(job.bedrockOutputTokens ?? 0).toLocaleString()} out tokens
-            </Table.Td>
-          </Table.Tr>
-          <Table.Tr>
-            <Table.Td>ECS / Fargate</Table.Td>
-            <Table.Td>{fmt(fargate)}</Table.Td>
-            <Table.Td c="dimmed">{(job.fargateSeconds ?? 0).toFixed(0)}s runtime</Table.Td>
-          </Table.Tr>
+          {lines.map((line) => (
+            <Table.Tr key={line.key}>
+              <Table.Td>{line.label}</Table.Td>
+              <Table.Td>{formatUsd(line.usd)}</Table.Td>
+              <Table.Td c="dimmed">{line.detail}</Table.Td>
+              <Table.Td c="dimmed">
+                {line.basis === "measured" ? "billed usage" : "estimated"}
+              </Table.Td>
+            </Table.Tr>
+          ))}
           <Table.Tr>
             <Table.Td fw={700}>Total</Table.Td>
-            <Table.Td fw={700}>{fmt(total)}</Table.Td>
+            <Table.Td fw={700}>{formatUsd(total)}</Table.Td>
+            <Table.Td />
             <Table.Td />
           </Table.Tr>
         </Table.Tbody>
       </Table>
       <Text c="dimmed" size="xs">
-        Fargate cost is estimated from task runtime, not billed usage. Bedrock cost is
-        reported by the model provider's own usage accounting.
+        Bedrock is reported by the model provider's own usage accounting. Every other
+        line is estimated from what this run measured (runtime, bytes stored, request
+        counts) against published us-west-2 on-demand rates — AWS cost reports lag
+        24-48h, so nothing here is a billed figure.
       </Text>
     </Stack>
   );

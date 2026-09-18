@@ -14,14 +14,23 @@ Two paths, cheapest first:
    scans are raster-only, and a 36"x24" survey sheet has far too much fine print
    to survive being downsampled to a single model-sized image, so each page is
    split into tiles that stay legible (see `_TILE_MAX_NATIVE_PX`) and sent as
-   images with a forced tool call.
+   images with a forced tool call. Tile batches are independent requests and go
+   out concurrently through one shared, bounded pool (`_BEDROCK_CONCURRENCY`).
 
 Both paths funnel through the same `_classify()` normaliser, so a reception
 number looks identical whichever way it was found.
+
+On a real Weld property none of this is optional: recorder scans carry no text
+layer at all, so path 1 never fires and every downloaded document pays for a
+vision read. That is why the concurrency above matters — a run is hundreds of
+Bedrock calls, not a handful. Callers on the event loop should push this whole
+function to a thread (`asyncio.to_thread`); it blocks on PDF decoding as well as
+on the network.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import logging
 import math
@@ -56,7 +65,10 @@ class IdExtraction(BaseModel):
     """Result of reading one document for the IDs it references."""
 
     ids: list[ExtractedId] = []
-    source: Literal["text_layer", "bedrock", "none"] = "none"
+    # "cache" is a previous run's result replayed from S3 — the ids are whatever
+    # produced them originally, but the token counts are 0, because this run
+    # didn't spend them. Keep it that way: the cost breakdown reads these.
+    source: Literal["text_layer", "bedrock", "cache", "none"] = "none"
     input_tokens: int = 0
     output_tokens: int = 0
 
@@ -178,6 +190,35 @@ _TILE_MAX_NATIVE_PX = 3_000_000
 _TILE_OVERLAP = 0.04  # so a line straddling a tile edge is whole in one of them
 _MAX_PAGES = 25  # cost guard; ALTAs run 2-6 sheets
 _MAX_IMAGES_PER_REQUEST = 20  # Converse hard limit; a 300-DPI sheet needs 9
+
+# Tile batches are independent requests, so they go out concurrently rather than
+# one page at a time. One shared pool for the whole process — not one per
+# document — so that reading many documents at once (see `_expand_cross_references`
+# in scrapers/weld_county.py) still can't put more than this many calls in flight.
+#
+# This is a courtesy cap, not a quota ceiling: a full 86-document Weld property is
+# ~340 requests / ~1.6M input tokens, against an account limit of 10,000 requests
+# and 5M tokens *per minute* for the Haiku 4.5 cross-region profile. Raising it
+# buys little — the wall clock is already dominated by the slowest single document.
+_BEDROCK_CONCURRENCY = 16
+_bedrock_pool: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _pool() -> concurrent.futures.ThreadPoolExecutor:
+    """The shared Bedrock request pool, created on first use.
+
+    Built lazily rather than at import time so that merely importing this module
+    (the CLI, the API's test collection) doesn't spin up threads that never get
+    used. Never shut down: it lives for the life of the worker process, which
+    exits after one job.
+    """
+    global _bedrock_pool
+    if _bedrock_pool is None:
+        _bedrock_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_BEDROCK_CONCURRENCY, thread_name_prefix="bedrock"
+        )
+    return _bedrock_pool
+
 
 _TOOL_NAME = "record_references"
 _EXTRACT_TOOL = {
@@ -351,23 +392,34 @@ def _read_page(client, model: str, tiles: list[bytes]) -> tuple[list[ExtractedId
 
 def _extract_with_bedrock(reader: PdfReader, model: str) -> IdExtraction:
     client = _bedrock_client()
-    found: list[ExtractedId] = []
-    in_tokens = out_tokens = 0
 
+    batches: list[tuple[int, list[bytes]]] = []
     for page_no, raster in enumerate(_page_rasters(reader), start=1):
         tiles = _tiles(raster)
         logger.info("id_extraction: reading page %d as %d tile(s)", page_no, len(tiles))
-        for start in range(0, len(tiles), _MAX_IMAGES_PER_REQUEST):
-            batch = tiles[start : start + _MAX_IMAGES_PER_REQUEST]
-            try:
-                page_ids, page_in, page_out = _read_page(client, model, batch)
-            except Exception as exc:
-                # One bad page shouldn't lose the pages that did work.
-                logger.warning("id_extraction: Bedrock failed on page %d: %s", page_no, exc)
-                continue
-            found.extend(page_ids)
-            in_tokens += page_in
-            out_tokens += page_out
+        batches += [
+            (page_no, tiles[start : start + _MAX_IMAGES_PER_REQUEST])
+            for start in range(0, len(tiles), _MAX_IMAGES_PER_REQUEST)
+        ]
+
+    def read(batch: tuple[int, list[bytes]]) -> tuple[list[ExtractedId], int, int]:
+        page_no, tiles = batch
+        try:
+            return _read_page(client, model, tiles)
+        except Exception as exc:
+            # One bad page shouldn't lose the pages that did work.
+            logger.warning("id_extraction: Bedrock failed on page %d: %s", page_no, exc)
+            return [], 0, 0
+
+    found: list[ExtractedId] = []
+    in_tokens = out_tokens = 0
+    # `map` yields in submission order however the calls interleave, so
+    # `_dedupe`'s "first occurrence wins" still means "the earliest page's
+    # context is the one kept" — the result is identical to reading serially.
+    for page_ids, page_in, page_out in _pool().map(read, batches):
+        found.extend(page_ids)
+        in_tokens += page_in
+        out_tokens += page_out
 
     return IdExtraction(
         ids=_dedupe(found), source="bedrock", input_tokens=in_tokens, output_tokens=out_tokens
@@ -405,6 +457,18 @@ def make_thumbnail(pdf_path: Path) -> bytes | None:
 # --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
+
+
+def cache_fingerprint(model: str | None = None) -> str:
+    """Key namespace for cached extractions — everything that would change the
+    answer for the same document.
+
+    Tile geometry is in here because it's the quality knob (see
+    `_TILE_MAX_NATIVE_PX`): re-tuning it must not keep serving results the old
+    settings produced, and bumping it is how you invalidate the cache.
+    """
+    model = model or get_settings().id_extraction_model
+    return f"{model}_{_TILE_MAX_NATIVE_PX}_{_TILE_MAX_PX}".replace("/", "_").replace(":", "_")
 
 
 def extract_document_ids(pdf_path: Path, *, model: str | None = None) -> IdExtraction:

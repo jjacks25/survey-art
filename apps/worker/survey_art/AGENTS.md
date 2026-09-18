@@ -79,6 +79,11 @@ perform blocking I/O directly in `emit()`.
   `image_url` in the metadata that gets persisted — the local path is meaningless
   outside the (ephemeral, per-job) worker container, so it's popped rather than kept
   alongside the URL.
+- `_make_thumbnails(saved)` — first-page JPEG thumbnails for every saved PDF, rendered
+  in a thread pool (`_TAIL_WORKERS`). Each one decodes a full-page scan raster and a
+  property can bring back ~90 of them, so serially this added minutes to the end of a
+  job. Pillow releases the GIL for decode/resize, so threads suffice on the task's 1
+  vCPU — no process pool. A thumbnail that can't be rendered is skipped, never fatal.
 - `_doc_prefix(tmp, saved, input_address, metadata)` — computes the
   `{state}/{county}/{identifier}` prefix documents are uploaded under (see
   [`packages/survey_shared/AGENTS.md`](../../../packages/survey_shared/AGENTS.md)). County
@@ -95,12 +100,72 @@ perform blocking I/O directly in `emit()`.
   [`packages/survey_shared/AGENTS.md`](../../../packages/survey_shared/AGENTS.md)).
   Never raises — a failed archive upload must not fail a job that's already finished.
 
+## The extraction cache — the one real cost lever
+
+Reading a document for its citations is the most expensive thing a run does. On real
+Weld data **no recorder PDF has a text layer**, so `id_extraction.py`'s free path never
+fires and all ~90 documents take the Bedrock vision path — ~340 model calls and ~98% of
+a run's total cost.
+
+`_extract_cited_ids()` (`scrapers/weld_county.py`) puts an S3 cache in front of that,
+keyed by reception number under `extractions/`. A recorded document is immutable once
+filed, so its citations never change and the answer is reusable forever. Two ways that
+pays off, both common:
+
+- **Re-running a property** (the Reprocess button) costs ~$0 in Bedrock instead of ~$2.
+- **A different parcel in the same section** reuses everything
+  `_section_township_range_search()` and `_easement_row_search()` turn up — those return
+  the same easements, plats and ROW documents for every parcel in a section.
+
+Three invariants to keep:
+
+1. **A hit reports zero tokens.** `IdExtraction(source="cache")` carries the original
+   ids but `input_tokens=0`/`output_tokens=0`, because *this* run didn't spend them and
+   `costs.py` prices the run off those fields. Copying the original counts over would
+   silently re-bill every cached document.
+2. **Failures aren't cached.** `source="none"` means the read failed (unreadable PDF,
+   Bedrock outage); storing it would make that failure permanent for the document.
+3. **The key includes a fingerprint** (`id_extraction.cache_fingerprint()`) of the model
+   and the tile geometry — everything that would change the answer. Re-tune
+   `_TILE_MAX_NATIVE_PX` and you get a fresh namespace rather than results produced by
+   the old settings. That's also how you invalidate the cache deliberately.
+
+The cache needs `s3:GetObject` on `TaskRole` (added in `infra/cloudformation/backend.yaml`).
+It swallows every error by design, so a missing grant doesn't fail the run — it just
+makes the cache always miss and every run cost full price. If cache hits never appear in
+the logs, check that permission first. `extractions/` deliberately has **no** expiry
+lifecycle rule, so entries outlive the `documents/` copies they describe.
+
 ## Estimated cost & run time (`worker.py`, frontend's Run Details tab)
 
 Every job records a cost/runtime breakdown, written by `run_job()` via
 `jobs.update_status()` on every exit path (`COMPLETED`, `FAILED`, and the generic
 `except` — a crashed job still burned real Bedrock tokens and real Fargate seconds, so
-it still gets a number). Two independent inputs, one real and one estimated:
+it still gets a number).
+
+**`costs.py` owns the all-in itemisation.** It turns quantities the run measured
+(tokens, seconds, bytes stored, log volume, derived poll counts) into one `CostLine` per
+service — Bedrock, Fargate, S3, DynamoDB, API Gateway+Lambda+SQS, CloudWatch Logs —
+which `Job.costs` round-trips and the Run Details tab renders and totals generically.
+**Add a service there, not in the frontend**: the tab renders whatever lines it gets.
+
+Two things about that module worth knowing before editing it:
+
+- **Only Bedrock is `basis="measured"`.** Everything else is arithmetic over a published
+  rate card, and the UI says so. Don't mark a line "measured" unless a provider reports
+  the number.
+- **Its rates are us-west-2 and were read from the AWS Pricing API on 2026-09-17.**
+  DynamoDB on-demand in this region is $0.625/M write and $0.125/M read — *half* the
+  widely-quoted us-east-1 figures. Don't "correct" them back.
+
+For scale, on a real ~50-minute Weld property: Bedrock $1.98, Fargate $0.042, DynamoDB
+$0.019, everything else under a cent. Bedrock is ~97% of the run, which is the entire
+reason the extraction cache above exists. Note the DynamoDB line is third-largest and
+grows **quadratically** with log volume — `append_log()` rewrites the whole job item per
+line, so N appends against a growing item cost ~N²/2 write units. Irrelevant next to a
+$2 model bill; not irrelevant on a fully-cached re-run that costs $0.06 total.
+
+The two inputs feeding the biggest lines:
 
 - **Bedrock cost — a real dollar figure.** `run_async()` (`pipeline.py`) returns
   `(saved, err, cost, in_tok, out_tok)` all the way up from whichever scraper ran —
@@ -178,10 +243,30 @@ internal `extracted` set (already read for citations — never sent through
 documents both cite it). Real recorder data is a finite graph, so this terminates on its
 own; `_MAX_CROSS_REFERENCE_DOCS` is just a cost/runtime backstop for a pathological case.
 
+**It walks a whole depth level at a time, not a document at a time** — this is a
+performance property, but changing it back would quietly cost ~20 minutes a run:
+
+- Every document at a level is read concurrently (`asyncio.gather` over
+  `asyncio.to_thread(extract_document_ids, ...)`). On real Weld data *no* recorder PDF
+  has a text layer, so every document pays for a Bedrock vision read — a property is
+  ~340 Bedrock calls, not a handful. A level now costs about as long as its slowest
+  document instead of the sum of all of them.
+- `extract_document_ids()` is synchronous and blocks on both PDF decoding and the
+  network, so it **must** go through `asyncio.to_thread` — calling it inline stalls the
+  event loop and every download sharing it (the same failure mode as the log handler,
+  above).
+- A level's citations are fetched in **one** `_download_documents()` call. That function
+  launches a browser and logs in per call, so batching keeps it at one login per depth
+  level rather than one per citing document — and re-logging-in mid-run is exactly what
+  poisons the disclaimer cookie (see `_fetch_document`'s comments).
+
+Keep the per-document monkeypatch point intact when editing: the tests patch
+`weld_county.extract_document_ids`, and `asyncio.to_thread` resolves it at call time.
+
 Every ID found — from any document, not just the ALTA — lands in `overview.json` as
 `extracted_ids`, one flat list of `{id, id_type, context, raw, source_reception,
 source_doc_type}` rows (the last two say which downloaded document cited it), written
-once per document processed so a crash mid-walk still leaves everything found so far.
+once per level processed so a crash mid-walk still leaves everything found so far.
 The frontend renders it as a table for free (see `MetadataValue` in
 [`apps/web/AGENTS.md`](../../../apps/web/AGENTS.md)) — it only reads the array shape, so
 adding `source_reception`/`source_doc_type` columns didn't require a frontend change.
@@ -196,6 +281,31 @@ wait out ~90 downloads, but it should still show the surveyor everything cited.
 
 `extract_document_ids()` also never raises — it enriches a document that already
 downloaded, so a Bedrock outage must leave the run otherwise intact.
+
+## Document fetching: concurrency is a politeness budget, not a throughput dial
+
+`_download_documents()` fetches a batch of recorder documents by running
+`_fetch_document()` in `weld_download_concurrency`-many tabs of **one** already
+authenticated Playwright context. Two things about it are load-bearing:
+
+- **Each worker still paces itself exactly as the old serial loop did** (a growing
+  `_DOC_FETCH_PAUSE_S` sleep before *every* attempt, not just retries). The 80/80 success
+  measurement recorded in that function's docstring was taken with that pacing in place,
+  and what recording.weld.gov reacts to is request rate. `WELD_DOWNLOAD_CONCURRENCY`
+  (default 4) therefore multiplies the load on a county server directly — raise it a
+  step at a time and watch the job log for retry warnings ("No printCustom button",
+  "Print endpoint returned HTTP"). Getting the worker's IP throttled is a worse outcome
+  than a slow run.
+- **The disclaimer-cookie re-assert is under an `asyncio.Lock`.** Cookies are
+  context-wide, so the `clear_cookies` / `add_cookies` pair a retry performs is shared
+  with every fetch in flight; without the lock a sibling can land in the window where the
+  cookie is missing and get served the disclaimer page instead of its document. Any new
+  context-wide mutation in this path needs the same treatment.
+
+The page wait is `wait_for_selector("#printCustom")`, deliberately **not**
+`wait_for_load_state("networkidle")`: the viewer is PDF.js pulling page images over HTTP
+Range requests, so the network stays busy long after the only thing we need (the print
+button's `data-href`) exists.
 
 ## Adding metadata/map support to another county
 

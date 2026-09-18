@@ -45,7 +45,7 @@ Conditions:
 
 Resources:
   # ---------------- Data ----------------
-  # One bucket, three prefixes, kept apart by lifecycle scope rather than by
+  # One bucket, four prefixes, kept apart by lifecycle scope rather than by
   # separate resources:
   #   scratch/     - ephemeral per-job artifacts (map screenshots). 90-day
   #                  expiry via the Filter-scoped rule below.
@@ -59,6 +59,13 @@ Resources:
   #                  deliberately longer than JobsTable's 7-day TTL, so a
   #                  run's exact log survives long enough to debug an issue
   #                  reported after the job record itself has aged out.
+  #   extractions/ - cached "what does this recorded document cite" results,
+  #                  keyed by reception number (jobs.get_cached_extraction()).
+  #                  Deliberately NO expiry rule: a recorded document is
+  #                  immutable, so the answer stays correct forever, and each
+  #                  hit saves a Bedrock vision call — by far the largest cost
+  #                  in a run. Entries are a few hundred bytes; keeping them
+  #                  outlive the documents/ copies they describe is the point.
   StorageBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -98,6 +105,16 @@ Resources:
             Status: Enabled
             Prefix: property-search-logs/
             ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          # No ExpirationInDays here on purpose — see the prefix notes above.
+          # Bucket versioning is on, so this only stops superseded copies of a
+          # re-extracted document piling up behind the current one.
+          - Id: extractions-noncurrent-cleanup
+            Status: Enabled
+            Prefix: extractions/
             NoncurrentVersionExpiration:
               NoncurrentDays: 1
             AbortIncompleteMultipartUpload:
@@ -233,7 +250,13 @@ Resources:
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
                 Resource: !GetAtt JobsTable.Arn
               - Effect: Allow
-                Action: [s3:PutObject]
+                # GetObject backs the extraction cache (jobs.get_cached_extraction()) —
+                # the worker reads back its own previous runs' citation-extraction
+                # results under extractions/ so a re-read of the same recorded document
+                # never pays for a second Bedrock vision call. Without it the cache
+                # silently always misses (it swallows errors by design) and every run
+                # costs full price.
+                Action: [s3:PutObject, s3:GetObject]
                 Resource: !Sub '${StorageBucket.Arn}/*'
               - Effect: Allow
                 # Cross-region inference profiles fan out to the underlying model in

@@ -137,6 +137,7 @@ the worker talks to real AWS for that one client and to LocalStack for everythin
 | `APPLICATION_MODE` | No | `regular` | `demo` caps the Schedule B-2 exception downloads at 5 so a walkthrough finishes in minutes |
 | `WELD_RECORDER_USERNAME` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `WELD_RECORDER_PASSWORD` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
+| `WELD_DOWNLOAD_CONCURRENCY` | No | `4` | How many recorder documents to fetch at once. A politeness limit against a county server, not a throughput dial — raise it a step at a time and watch for retry warnings in the log |
 | `CO_DENVER_USERNAME` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
 | `CO_DENVER_PASSWORD` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
 | `WELD_HEADED` | No | `0` | Set to `1` to show the Playwright browser window |
@@ -315,10 +316,17 @@ verified index — a surveyor should still eyeball the exception PDFs against Sc
 
 **Runtime.** This step turns a Weld run from two downloads into up to ~90, and the
 recorder starts refusing requests after roughly 40 in a row (a non-200 from the print
-endpoint, or a viewer page with no download button). `_download_documents()` paces
-itself, re-asserts the disclaimer cookie, and retries every failure, so expect a
-commercial ALTA to take 10-20 minutes rather than one. Set `APPLICATION_MODE=demo`
-to stop after the first 10 — enough to show the step working without the wait.
+endpoint, or a viewer page with no download button). `_download_documents()` paces each
+worker, re-asserts the disclaimer cookie, and retries every failure.
+
+Both halves of that work run concurrently rather than one document at a time —
+`WELD_DOWNLOAD_CONCURRENCY` fetches (default 4), and the whole of a citation level read
+for IDs at once — so expect a commercial ALTA in roughly **5-10 minutes** rather than the
+hour it took serially. None of the Weld recorder's PDFs carry a text layer, so all ~90
+documents take the Bedrock path; that's ~340 model calls per property, well inside the
+account's 10,000-requests-per-minute Haiku quota but the reason the concurrency matters.
+Set `APPLICATION_MODE=demo` to stop after the first 10 — enough to show the step working
+without the wait.
 
 Every ID found is written to `overview.json` under `extracted_ids` (and so shows up
 in the UI's Property Metadata tab) with its type, context, and which downloaded
@@ -335,6 +343,29 @@ reception) and an internal `extracted` set (never re-run extraction on the same
 document, even if two other documents both cite it) keep this from doing wasted work
 or looping on a citation cycle; `_MAX_CROSS_REFERENCE_DOCS` is a cost/runtime backstop
 on top of that, not something normal runs should ever hit.
+
+**Cost, and the cache that cuts it.** Reading those ~90 documents is ~98% of what a run
+costs — about **$2 per property** at Haiku 4.5 rates, against roughly 4 cents for
+everything else combined. So `_extract_cited_ids()` caches each result in S3 under
+`extractions/`, keyed by reception number: a recorded document is immutable, so what it
+cites never changes and the answer is reusable indefinitely. Two common cases go to
+near-zero Bedrock cost as a result:
+
+- **Re-running a property** (the Reprocess button) — every document is already read.
+- **Another parcel in the same section** — the section-wide recorder searches return the
+  same easements, plats and rights-of-way for every parcel in that section.
+
+The cache key includes the model and the tile geometry, so re-tuning either starts a
+fresh namespace rather than serving results the old settings produced. Cache misses are
+silent by design (an unreachable cache must cost money, not correctness) — which also
+means a missing `s3:GetObject` grant on the worker's task role shows up only as "every
+run costs full price".
+
+The Run Details tab shows the full per-service breakdown for a run — Bedrock, Fargate,
+S3, DynamoDB, API Gateway/Lambda/SQS, CloudWatch Logs — with a total. Only the Bedrock
+line is a billed figure (the provider's own usage accounting); the rest are estimated
+from measured quantities against published us-west-2 on-demand rates, since AWS cost
+reports lag 24-48h. See `apps/worker/survey_art/costs.py` for the rates and assumptions.
 
 > **Bedrock model access:** Anthropic models on Bedrock need the *Anthropic use case
 > details* form submitted once per account (Bedrock console → Model access). Until

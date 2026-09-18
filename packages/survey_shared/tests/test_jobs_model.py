@@ -72,6 +72,31 @@ class TestFromItem:
         assert job.created_at == 111
         assert job.file_count == 5
 
+    def test_cost_lines_coerce_dynamo_decimals_to_float(self):
+        # `costs` is written as Decimal (DynamoDB rejects floats) and has to come
+        # back as float, or the API's JSON encoder sees a Decimal on the way out.
+        item = _job().to_item()
+        item["costs"] = [
+            {
+                "key": "bedrock",
+                "label": "Bedrock / LLM",
+                "usd": Decimal("1.9763"),
+                "detail": "1,717,584 in / 51,736 out tokens",
+                "basis": "measured",
+            }
+        ]
+        job = Job.from_item(item)
+
+        assert isinstance(job.costs[0].usd, float)
+        assert job.costs[0].usd == 1.9763
+
+    def test_a_record_written_before_costs_existed_still_loads(self):
+        # DynamoDB items don't migrate; older runs carry only the scalar fields.
+        item = _job().to_item()
+        item.pop("costs", None)
+
+        assert Job.from_item(item).costs == []
+
     def test_legacy_plain_string_logs_still_load(self):
         # Job records written before `kind` existed store bare strings, not
         # {"message", "kind"} dicts — an old, still-live record must not 500.
