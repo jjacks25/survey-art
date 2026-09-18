@@ -178,9 +178,33 @@ class TestTiling:
 
         cols, rows = _grid(10792, 7227)
         assert len(tiles) == cols * rows
-        for png in tiles:
-            width, height = Image.open(io.BytesIO(png)).size
+        for encoded in tiles:
+            width, height = Image.open(io.BytesIO(encoded)).size
             assert width * height <= id_extraction._TILE_MAX_PX
+
+    def test_downscaling_a_bitonal_scan_antialiases(self):
+        """County scans are mode "1", and PIL resamples those by nearest-
+        neighbour whatever filter you pass — so resizing before converting to
+        greyscale drops most of the strokes off a survey sheet.
+
+        A page of 1-in-3 vertical strokes shrunk ~3x should average out to a
+        near-uniform mid grey. Resampled without averaging, every output pixel
+        instead lands on one source column and comes back pure black or pure
+        white. Counting distinct grey levels does NOT detect this — JPEG's DCT
+        invents intermediate values from any input — so measure how many pixels
+        are at the extremes: ~0% when it works, 100% when it doesn't.
+        """
+        page = Image.new("1", (4000, 3000), color=1)
+        for x in range(0, 4000, 3):
+            for y in range(3000):
+                page.putpixel((x, y), 0)
+
+        tile = Image.open(io.BytesIO(id_extraction._tile_bytes(page))).convert("L")
+
+        assert tile.size[0] * tile.size[1] <= id_extraction._TILE_MAX_PX
+        histogram = tile.histogram()
+        extreme = sum(histogram[:32]) + sum(histogram[224:])
+        assert extreme / sum(histogram) < 0.25, "tile was resampled without averaging"
 
 
 class TestExtractDocumentIds:
@@ -233,6 +257,7 @@ class TestExtractDocumentIds:
         with (
             patch.object(id_extraction, "PdfReader", return_value=FakeReader(FakePage())),
             patch.object(id_extraction, "_bedrock_client", return_value=client),
+            patch.object(id_extraction, "_page_turn", return_value=(0, 0, 0)),
             patch.object(
                 id_extraction, "_page_rasters", return_value=iter([Image.new("L", (900, 700))])
             ),
@@ -292,6 +317,7 @@ class TestExtractDocumentIds:
         with (
             patch.object(id_extraction, "PdfReader", return_value=FakeReader(FakePage())),
             patch.object(id_extraction, "_bedrock_client", return_value=client),
+            patch.object(id_extraction, "_page_turn", return_value=(0, 0, 0)),
             patch.object(
                 id_extraction,
                 "_page_rasters",
@@ -301,6 +327,90 @@ class TestExtractDocumentIds:
             result = extract_document_ids(pdf)
 
         assert result.receptions() == ["2786305"]
+
+    def test_a_page_the_probe_flags_is_read_both_ways_and_the_better_one_kept(
+        self, tmp_path: Path
+    ):
+        """Turning a flagged page outright is not safe — the probe has a real
+        false-positive rate, and turning an upright page loses every reference
+        on it. So both renders are read and the fuller answer wins.
+        """
+        pdf = tmp_path / "map_of_survey.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        def reader_returning(turned: list[tuple[str, str]], upright: list[tuple[str, str]]):
+            def read_page(_client, _model, tiles):
+                # The turned render is the portrait one: the raster below is
+                # wider than it is tall, and rotating swaps that.
+                width, height = Image.open(io.BytesIO(tiles[0])).size
+                values = turned if width < height else upright
+                return (
+                    [id_extraction.ExtractedId(id=v, id_type=t) for v, t in values],
+                    0,
+                    0,
+                )
+
+            return read_page
+
+        def receptions(*ids: str) -> list[tuple[str, str]]:
+            return [(i, "reception_number") for i in ids]
+
+        def run(read_page):
+            with (
+                patch.object(id_extraction, "PdfReader", return_value=FakeReader(FakePage())),
+                patch.object(id_extraction, "_bedrock_client", return_value=MagicMock()),
+                patch.object(id_extraction, "_page_turn", return_value=(90, 40, 5)),
+                patch.object(id_extraction, "_read_page", side_effect=read_page),
+                patch.object(
+                    id_extraction, "_page_rasters", return_value=iter([Image.new("L", (900, 700))])
+                ),
+            ):
+                return extract_document_ids(pdf)
+
+        # Genuinely sideways: the turned render finds more, so it wins.
+        found = run(reader_returning(receptions("2696065", "2696066"), receptions("9999999")))
+        assert found.receptions() == ["2696065", "2696066"]
+        assert (found.input_tokens, found.output_tokens) == (40, 5), "probe tokens must be billed"
+
+        # A false positive on an upright page. Turning it outright would lose
+        # both of its references; keeping the fuller answer does not.
+        kept = run(reader_returning(receptions("9999999"), receptions("1766550", "2786305")))
+        assert kept.receptions() == ["1766550", "2786305"]
+
+        # A wrongly-turned page still emits free text, and that must not win
+        # the comparison — only parsed citations count.
+        noise = [(f"illegible note {n}", "other") for n in range(5)]
+        kept = run(reader_returning(noise, receptions("1766550")))
+        assert kept.receptions() == ["1766550"]
+
+    def test_page_turn_asks_the_direction_only_once_it_suspects_a_turn(self):
+        """Two questions, because one prompt cannot answer both well: the 3-way
+        probe finds turned pages but names the wrong direction for a third of
+        them, so the direction comes from a separate 2-way question.
+        """
+        client = MagicMock()
+
+        def answer(pick):
+            return {
+                "output": {
+                    "message": {
+                        "content": [
+                            {"toolUse": {"name": "pick_orientation", "input": {"readable": pick}}}
+                        ]
+                    }
+                },
+                "usage": {"inputTokens": 100, "outputTokens": 4},
+            }
+
+        client.converse.return_value = answer(1)
+        assert id_extraction._page_turn(client, "m", Image.new("L", (900, 700))) == (0, 100, 4)
+        assert client.converse.call_count == 1, "an upright page costs exactly one call"
+
+        client.converse.side_effect = [answer(3), answer(2)]
+        client.converse.return_value = None
+        # The 3-way probe's own answer was "turned clockwise"; the 2-way
+        # question overrules it, and the 2-way answer is the one that ships.
+        assert id_extraction._page_turn(client, "m", Image.new("L", (900, 700))) == (270, 200, 8)
 
     def test_unreadable_pdf_returns_empty_rather_than_failing_the_scrape(self, tmp_path: Path):
         result = extract_document_ids(tmp_path / "missing.pdf")

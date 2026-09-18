@@ -310,6 +310,22 @@ ballgame — at a third of the tile count the same sheet scored 20/36 with 11 di
 transpositions. `_TILE_MAX_NATIVE_PX` in `id_extraction.py` carries the scores; re-run
 them before raising it.
 
+Two rendering details are load-bearing for those numbers, and both are easy to undo by
+accident: the tile is converted out of bitonal **before** it is downscaled (PIL
+resamples mode `"1"` by nearest-neighbour, which shreds thin strokes), and tiles are
+sent 4 per request rather than the API's maximum of 20. Together they took a measured
+sample from 129/194 references to 141/194.
+
+A third detail is the page's orientation. Weld recorder scans routinely store a
+landscape sheet in a portrait raster with the text running vertically, and **no page
+sets `/Rotate`**, so nothing in the file says so — 33 of the 333 pages in a real run,
+disproportionately the exhibit tables carrying reception numbers. A sideways page does
+not come back empty; the model invents plausible numbers instead. So each page is asked
+which way up it is before tiling, and a page that looks turned is read both ways with
+the better answer kept. That took corpus-verified references from 218 to 257 for about
+20% more per run. See
+[`apps/worker/survey_art/AGENTS.md`](apps/worker/survey_art/AGENTS.md) for the detail.
+
 A misread reception usually 404s and disappears, but it can also fetch a real *wrong*
 document. Two did in that run. Treat `extracted_ids` as a strong lead list, not a
 verified index — a surveyor should still eyeball the exception PDFs against Schedule B-2.
@@ -355,8 +371,10 @@ near-zero Bedrock cost as a result:
 - **Another parcel in the same section** — the section-wide recorder searches return the
   same easements, plats and rights-of-way for every parcel in that section.
 
-The cache key includes the model and the tile geometry, so re-tuning either starts a
-fresh namespace rather than serving results the old settings produced. Cache misses are
+The cache key includes the model, the tile geometry, the wire encoding and the
+orientation pass, so changing
+any of them starts a fresh namespace rather than serving results the old settings
+produced. Cache misses are
 silent by design (an unreachable cache must cost money, not correctness) — which also
 means a missing `s3:GetObject` grant on the worker's task role shows up only as "every
 run costs full price".

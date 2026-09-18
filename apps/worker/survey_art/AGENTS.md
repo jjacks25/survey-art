@@ -100,6 +100,85 @@ perform blocking I/O directly in `emit()`.
   [`packages/survey_shared/AGENTS.md`](../../../packages/survey_shared/AGENTS.md)).
   Never raises — a failed archive upload must not fail a job that's already finished.
 
+## Rendering a tile: the scans are bitonal, so conversion order matters
+
+Every recorder raster in this corpus is PIL mode `"1"` (1-bit black and white),
+and **PIL resamples a mode `"1"` image by nearest-neighbour whatever filter you
+pass it**. So `_fit()` in `id_extraction.py` — which every downscale in that
+module goes through — converts to `"L"` *before*
+resizing, not after. Getting that backwards means a 36"x24" sheet downscaled to
+0.43x throws away ~57% of its rows and columns with no averaging at all, which
+breaks thin strokes and turns 8s into 6s — the digit-transposition failure that
+the `_TILE_MAX_NATIVE_PX` comment warns about. It cost ~9% of the references on
+a measured sample and produced wrong-but-real reception numbers, which then
+fetch the wrong document.
+
+Two consequences worth keeping in mind:
+
+- **Tiles go over the wire as JPEG, not PNG.** An antialiased greyscale scan is
+  pathological for PNG (~6x the bytes of the bitonal original), enough to
+  overrun a Converse request body. Bedrock prices an image by its dimensions,
+  so the encoding is free either way.
+- **`make_thumbnail()` has the same hazard** and the same fix, and it matters
+  more there — a thumbnail is a ~0.04x downscale, so without averaging almost
+  every stroke falls between samples and the result is noise. It caps width
+  rather than pixel area, so it converts and then hands off to
+  `Image.thumbnail` instead of going through `_fit`.
+
+`tests/test_id_extraction.py::test_downscaling_a_bitonal_scan_antialiases` pins
+this. Note it deliberately does **not** count distinct grey levels: JPEG's DCT
+invents intermediate values from any input, so that check passes even when the
+resampling is broken. It measures what fraction of pixels sit at the extremes
+instead (~0% when correct, 100% when not).
+
+## Sideways pages: ask, then read both ways
+
+Weld recorder scans routinely store a landscape sheet in a portrait raster with
+the text running vertically, and **no page sets `/Rotate`** — all 333 pages of
+the R1611986 corpus report 0 — so nothing in the file declares it. 33 of those
+333 pages (9.9%) are turned, and they skew towards the pages that matter:
+exhibit tables with a `RECEPTION NUMBER` column. All twelve exhibits of
+`exception_2873123.pdf` are sideways.
+
+`_page_turn()` decides, per page, before tiling. Three things about it are
+counter-intuitive enough to be worth not rediscovering:
+
+- **You cannot trigger on a low yield.** The model does not fail quietly on a
+  sideways page, it invents plausible reception numbers. 0 of 86 documents
+  return zero references, and the worst offender returns five, all fabricated.
+  An earlier design escalated to a stronger model on an empty result; it would
+  never have fired.
+- **Two questions, not one.** "How many degrees?" finds turned pages and then
+  answers 90 for all of them, including the ones needing 270. "Which of these
+  reads normally?" gets the direction right. So: a 3-way call (as supplied /
+  anticlockwise / clockwise) on every page, then a 2-way call on the ~10% it
+  flags.
+- **Smaller thumbnails are better.** 65k pixels beats 260k beats 1M, and
+  batching several pages into one call costs precision the same way batching
+  tiles does. Orientation is a gestalt property; shrink the page until only
+  layout survives. Measured on 33 hand-read pages: 16/16 found, 2 false
+  positives, 1 turned the wrong way.
+
+A flagged page is then **read both ways and the better answer kept**, never
+just turned — the probe's false positives are real, and turning an upright page
+loses every reference on it. "Better" counts only references that parsed as an
+actual citation (`id_type != "other"`): a wrongly-turned render still emits
+plenty of free text, and counting that junk loses real reception numbers.
+
+The wording of the tool's one field is load-bearing. Describing it as "the
+1-based index of the image that reads normally" instead of spelling out
+"Which image reads normally: 1, 2 or 3" flipped `exception_2696065.pdf` — a
+41-reference Map of Survey, plainly sideways — from 90 back to 0, reproducibly.
+Re-score if you touch either string.
+
+An ink-projection heuristic with no model call at all was tried first and
+rejected: 7/16 recall at 70% precision, firing on `exception_3511023`'s dense
+upright township tables and missing `exception_2873123`'s sideways exhibits.
+
+Cost: the probe adds ~9% and re-reading flagged pages ~12%. Over the corpus,
+corpus-verified reception numbers — ids naming a PDF the scraper actually
+downloaded, so no human adjudication needed — go 218 → 257.
+
 ## The extraction cache — the one real cost lever
 
 Reading a document for its citations is the most expensive thing a run does. On real
@@ -125,10 +204,11 @@ Three invariants to keep:
    silently re-bill every cached document.
 2. **Failures aren't cached.** `source="none"` means the read failed (unreadable PDF,
    Bedrock outage); storing it would make that failure permanent for the document.
-3. **The key includes a fingerprint** (`id_extraction.cache_fingerprint()`) of the model
-   and the tile geometry — everything that would change the answer. Re-tune
-   `_TILE_MAX_NATIVE_PX` and you get a fresh namespace rather than results produced by
-   the old settings. That's also how you invalidate the cache deliberately.
+3. **The key includes a fingerprint** (`id_extraction.cache_fingerprint()`) of the model,
+   the tile geometry *and the wire encoding* — everything that would change the answer.
+   Re-tune `_TILE_MAX_NATIVE_PX`, or change how a tile is rendered, and you get a fresh
+   namespace rather than results produced by the old settings. That's also how you
+   invalidate the cache deliberately.
 
 The cache needs `s3:GetObject` on `TaskRole` (added in `infra/cloudformation/backend.yaml`).
 It swallows every error by design, so a missing grant doesn't fail the run — it just

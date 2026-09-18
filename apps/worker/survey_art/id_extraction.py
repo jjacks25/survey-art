@@ -16,6 +16,8 @@ Two paths, cheapest first:
    split into tiles that stay legible (see `_TILE_MAX_NATIVE_PX`) and sent as
    images with a forced tool call. Tile batches are independent requests and go
    out concurrently through one shared, bounded pool (`_BEDROCK_CONCURRENCY`).
+   A page is first asked which way up it is (see `_page_turn`), because a tenth
+   of these scans store a landscape sheet sideways and declare nothing.
 
 Both paths funnel through the same `_classify()` normaliser, so a reception
 number looks identical whichever way it was found.
@@ -185,11 +187,29 @@ def _extract_from_text_layer(reader: PdfReader) -> list[ExtractedId]:
 # a digit transposition of a real number (1767982 read as 1766982), and a wrong
 # reception can still fetch a real — but wrong — document, which is worse than
 # finding nothing. Re-run the sheet-1 score before raising this.
+#
+# Raising it to 9 MP was retried after `_tile_bytes()` was fixed to antialias,
+# on the theory that the extra tiles had only ever been compensating for the
+# aliasing. They were not. Summed over an 8-document sample 9 MP looks level
+# (138 vs 141 of 194 references), but that total is 72% two large documents;
+# per document it is clearly worse, because a letter-size deed at ~3.8 MP stops
+# being split at all and gets downscaled 0.55x instead of 0.78x, losing the one
+# reception number it carries. Keep 3 MP.
 _TILE_MAX_PX = 1_150_000
 _TILE_MAX_NATIVE_PX = 3_000_000
 _TILE_OVERLAP = 0.04  # so a line straddling a tile edge is whole in one of them
 _MAX_PAGES = 25  # cost guard; ALTAs run 2-6 sheets
-_MAX_IMAGES_PER_REQUEST = 20  # Converse hard limit; a 300-DPI sheet needs 9
+# Converse allows 20 per call, but fewer images per request measures better —
+# the model attends to each tile more closely. On the 8-document sample, at the
+# tile geometry above and with the antialiasing fix in `_tile_bytes`:
+#
+#     20 per request -> 134/194 references, 6 misread
+#      4 per request -> 141/194 references, 9 misread
+#
+# The ALTA goes 34/36 -> 36/36 and the 12-page vesting deed 96/103 -> 103/103.
+# Costs ~3% more input tokens, because the prompt is re-sent per request; the
+# extra requests are absorbed by _BEDROCK_CONCURRENCY.
+_MAX_IMAGES_PER_REQUEST = 4
 
 # Tile batches are independent requests, so they go out concurrently rather than
 # one page at a time. One shared pool for the whole process — not one per
@@ -238,8 +258,8 @@ _EXTRACT_TOOL = {
                                     "type": "string",
                                     "description": (
                                         "The identifier with its printed label, copied "
-                                        "exactly, e.g. 'RECORDING NO: 1766550' or "
-                                        "'BOOK 999 AT PAGE 426'."
+                                        "exactly, e.g. 'RECORDING NO: 0000000' or "
+                                        "'BOOK 000 AT PAGE 000'."
                                     ),
                                 },
                                 "context": {
@@ -260,14 +280,22 @@ _EXTRACT_TOOL = {
     }
 }
 
+# Every example identifier here is deliberately all-zeroes. They used to be real
+# reception numbers copied off a Weld ALTA (1766550, BOOK 999 AT PAGE 426,
+# 2696065) — and all three are real documents that this scraper downloads, so a
+# model that leaned on the examples produced plausible, checkable, completely
+# wrong citations. Measured on the R1611986 sample: 7 spurious emissions of those
+# three ids across 8 documents that contain none of them, against 0 with the
+# placeholders below. Keep example ids unmistakably fake.
 _PROMPT = (
     "These images are tiles of one page of a land survey / title commitment. Read every "
     "one and find every reference to another recorded document: exception and easement "
     "items, rights-of-way, prior deeds, cross-referenced plats, notes and legends.\n\n"
     "Call record_references once with all of them. For each, copy the identifier and its "
-    "printed label exactly as shown ('RECORDING NO: 1766550', 'BOOK 999 AT PAGE 426', "
-    "'RECEPTION NUMBER 2696065') — do not reformat, renumber, or guess digits. Include "
-    "brief context saying what the document is.\n\n"
+    "printed label exactly as shown ('RECORDING NO: 0000000', 'BOOK 000 AT PAGE 000', "
+    "'RECEPTION NUMBER 0000000') — do not reformat, renumber, or guess digits. The "
+    "examples just show punctuation; never report a number you did not read in one of "
+    "the images. Include brief context saying what the document is.\n\n"
     "Tiles overlap, so the same reference may appear twice — report it each time you see "
     "it; duplicates are removed later. Skip dates, bearings, distances, section/township/"
     "range numbers and ordinance numbers. If a tile has no references, that's fine — call "
@@ -320,18 +348,208 @@ def _tiles(image: Image.Image) -> list[bytes]:
                 min(width, int((col + 1) * tile_w + pad_x)),
                 min(height, int((row + 1) * tile_h + pad_y)),
             )
-            out.append(_png_bytes(image.crop(box)))
+            out.append(_tile_bytes(image.crop(box)))
     return out
 
 
-def _png_bytes(tile: Image.Image) -> bytes:
-    width, height = tile.size
-    scale = min(1.0, math.sqrt(_TILE_MAX_PX / max(1, width * height)))
+# What the tiles go over the wire as. Bedrock prices an image by its dimensions,
+# not its bytes, so this is free — and it has to be JPEG: an antialiased
+# greyscale scan is pathological for PNG (~6x the bytes of the bitonal original),
+# which is enough to overrun a Converse request body at 20 images per call.
+_TILE_FORMAT = "jpeg"
+_TILE_QUALITY = 85
+
+
+def _fit(image: Image.Image, max_px: int) -> Image.Image:
+    """Greyscale `image`, shrunk to at most `max_px` pixels.
+
+    The `convert("L")` has to happen *before* the resize. County recorder scans
+    are mode "1" (bitonal), and PIL resamples a mode "1" image by
+    nearest-neighbour no matter which filter you ask for — so resizing first
+    threw away ~57% of the rows and columns of a 36"x24" sheet with no averaging
+    at all, breaking thin strokes and turning 8s into 6s. Converting first lets
+    LANCZOS actually average, which is what makes a downscaled digit legible.
+    Same output dimensions either way, so this costs nothing.
+
+    Every downscale in this module goes through here, because every one of them
+    is handed a bitonal recorder scan.
+    """
+    image = image.convert("L")
+    width, height = image.size
+    scale = min(1.0, math.sqrt(max_px / max(1, width * height)))
     if scale < 1.0:
-        tile = tile.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.LANCZOS)
+        image = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))), Image.LANCZOS
+        )
+    return image
+
+
+def _tile_bytes(tile: Image.Image) -> bytes:
+    """Downscale one tile to the model's budget and encode it."""
     buf = io.BytesIO()
-    tile.convert("L").save(buf, format="PNG", optimize=True)
+    _fit(tile, _TILE_MAX_PX).save(
+        buf, format=_TILE_FORMAT.upper(), quality=_TILE_QUALITY, optimize=True
+    )
     return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Which way up is the page?                                                     #
+# --------------------------------------------------------------------------- #
+
+# Weld recorder scans routinely store a landscape sheet in a portrait raster with
+# the text running sideways, and **no page in the corpus sets `/Rotate`** (all 333
+# are 0), so nothing in the file declares it. Measured over those 333 pages, 33
+# (9.9%) are turned 90 degrees — and they are disproportionately the pages that
+# matter, recorder exhibit tables with a RECEPTION NUMBER column. All twelve
+# exhibit pages of exception_2873123.pdf are sideways.
+#
+# Sideways is not a quiet failure. The model does not return nothing; it invents
+# plausible reception numbers. So "re-read the ones that came back empty" cannot
+# work: 0 of 86 documents return zero references, and the worst offender
+# (exception_2696065.pdf, a 41-reference Map of Survey) returns five, all made up.
+#
+# Turning the page instead: over the corpus, corpus-verified reception numbers —
+# ids that name a PDF the scraper actually downloaded, so no human adjudication
+# needed — go 218 -> 257 (+18%).
+_TURN_PROBE_MAX_PX = 130_000  # ~360x360
+_TURN_DIRECTION_MAX_PX = 65_000
+
+# Two questions, because one prompt cannot answer both well. Asking "how many
+# degrees?" gets the *presence* of rotation right and the direction wrong — it
+# answers 90 for everything, including the pages that need 270. Asking "which of
+# these reads normally?" gets the direction right. Scored against 33 hand-read
+# pages (every page a detector flagged, plus 12 sampled at random):
+#
+#     3-way "which reads normally", 130k px   16/16 found, 2 false, 3 turned the wrong way
+#     2-way "which reads normally",  65k px   direction 8/8 correct
+#
+# So: the 3-way call on every page to find them, the 2-way call on the ~10% it
+# flags to orient them.
+#
+# Two counterintuitive results, both measured, both worth not re-litigating:
+#
+#   * **Smaller is better.** 65k px beats 260k beats 1M for the 2-way question.
+#     Orientation is a gestalt property; shrink the page until only layout
+#     survives and the model stops being distracted by the content. It also makes
+#     the probe nearly free.
+#   * **Never batch pages into one call.** Six pages per call scored 12/16 with
+#     four false positives; one page per call scored 13/13. Same attention
+#     dilution as `_MAX_IMAGES_PER_REQUEST`.
+#
+# An ink-projection heuristic (no model call at all) was tried first and rejected:
+# 7/16 recall at 70% precision, firing on exception_3511023's dense upright
+# township tables and missing exception_2873123's sideways exhibits entirely.
+# Both questions are answered through this tool, and the wording of the one
+# field is load-bearing: describing it as "the 1-based index of the image that
+# reads normally" instead of the spelled-out list below flipped
+# exception_2696065.pdf (a 41-reference Map of Survey, plainly sideways) from
+# 90 back to 0, reproducibly. Change either string and re-score.
+_TURN_TOOL_NAME = "pick_orientation"
+
+
+def _turn_tool(choices: str) -> dict:
+    return {
+        "toolSpec": {
+            "name": _TURN_TOOL_NAME,
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {"readable": {"type": "integer", "description": choices}},
+                    "required": ["readable"],
+                }
+            },
+        }
+    }
+
+
+_TURN_PROBE_TOOL = _turn_tool("Which image reads normally: 1, 2 or 3")
+_TURN_DIRECTION_TOOL = _turn_tool("1 if the first image reads normally, 2 if the second does")
+_TURN_PROBE_PROMPT = (
+    "Three copies of one scanned page: as supplied, turned anticlockwise, and "
+    "turned clockwise.\n\n"
+    "Exactly one has its printed text the right way up, reading left-to-right. "
+    "Most pages are already correct, so answer 1 unless the text in image 1 "
+    "clearly runs vertically.\n\n"
+    "Say which image reads normally: 1, 2 or 3."
+)
+_TURN_DIRECTION_PROMPT = (
+    "Two copies of the same scanned page, turned opposite ways.\n\n"
+    "Exactly one of them has its printed text the right way up, reading "
+    "left-to-right. The other is upside down: its lines of text are still "
+    "horizontal, but every letter is inverted.\n\n"
+    "Say which image reads normally, 1 or 2."
+)
+
+
+def _thumbnail_bytes(image: Image.Image, max_px: int) -> bytes:
+    """A tiny greyscale JPEG of a whole page, for the orientation questions."""
+    buf = io.BytesIO()
+    _fit(image, max_px).save(buf, format="JPEG", quality=80, optimize=True)
+    return buf.getvalue()
+
+
+def _ask_which_reads(client, model: str, shots: list[bytes]) -> tuple[int, int, int]:
+    """Index of the image the model says reads normally, plus tokens spent."""
+    three_way = len(shots) == 3
+    response = client.converse(
+        modelId=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"text": _TURN_PROBE_PROMPT if three_way else _TURN_DIRECTION_PROMPT},
+                    *({"image": {"format": "jpeg", "source": {"bytes": s}}} for s in shots),
+                ],
+            }
+        ],
+        inferenceConfig={"maxTokens": 512, "temperature": 0},
+        toolConfig={
+            "tools": [_TURN_PROBE_TOOL if three_way else _TURN_DIRECTION_TOOL],
+            "toolChoice": {"tool": {"name": _TURN_TOOL_NAME}},
+        },
+    )
+    usage = response.get("usage", {})
+    tokens = (usage.get("inputTokens", 0), usage.get("outputTokens", 0))
+    for block in response.get("output", {}).get("message", {}).get("content", []):
+        tool_use = block.get("toolUse") or {}
+        if tool_use.get("name") == _TURN_TOOL_NAME:
+            try:
+                pick = int(tool_use.get("input", {}).get("readable", 1))
+            except (TypeError, ValueError):
+                pick = 1
+            return (pick if 1 <= pick <= len(shots) else 1), *tokens
+    return 1, *tokens
+
+
+def _page_turn(client, model: str, raster: Image.Image) -> tuple[int, int, int]:
+    """Degrees to turn this page anticlockwise, plus the tokens it cost to decide.
+
+    0 for the overwhelming majority of pages, which costs one call over a
+    ~360x360 thumbnail. Never raises: a page whose orientation can't be
+    established is read as supplied, exactly as before.
+    """
+    try:
+        upright = _thumbnail_bytes(raster, _TURN_PROBE_MAX_PX)
+        turned = [
+            _thumbnail_bytes(raster.rotate(degrees, expand=True), _TURN_PROBE_MAX_PX)
+            for degrees in (90, 270)
+        ]
+        pick, in_tokens, out_tokens = _ask_which_reads(client, model, [upright, *turned])
+        if pick == 1:
+            return 0, in_tokens, out_tokens
+
+        # It is turned; the probe's own answer for *which way* is unreliable, so
+        # ask the narrower question over a smaller pair.
+        pair = [
+            _thumbnail_bytes(raster.rotate(degrees, expand=True), _TURN_DIRECTION_MAX_PX)
+            for degrees in (90, 270)
+        ]
+        pick, extra_in, extra_out = _ask_which_reads(client, model, pair)
+        return (90 if pick == 1 else 270), in_tokens + extra_in, out_tokens + extra_out
+    except Exception as exc:
+        logger.warning("id_extraction: orientation probe failed, reading page as-is: %s", exc)
+        return 0, 0, 0
 
 
 def _bedrock_client():
@@ -354,7 +572,7 @@ def _read_page(client, model: str, tiles: list[bytes]) -> tuple[list[ExtractedId
             {
                 "role": "user",
                 "content": [
-                    *({"image": {"format": "png", "source": {"bytes": t}}} for t in tiles),
+                    *({"image": {"format": _TILE_FORMAT, "source": {"bytes": t}}} for t in tiles),
                     {"text": _PROMPT},
                 ],
             }
@@ -392,34 +610,84 @@ def _read_page(client, model: str, tiles: list[bytes]) -> tuple[list[ExtractedId
 
 def _extract_with_bedrock(reader: PdfReader, model: str) -> IdExtraction:
     client = _bedrock_client()
+    in_tokens = out_tokens = 0
 
-    batches: list[tuple[int, list[bytes]]] = []
-    for page_no, raster in enumerate(_page_rasters(reader), start=1):
-        tiles = _tiles(raster)
-        logger.info("id_extraction: reading page %d as %d tile(s)", page_no, len(tiles))
-        batches += [
-            (page_no, tiles[start : start + _MAX_IMAGES_PER_REQUEST])
-            for start in range(0, len(tiles), _MAX_IMAGES_PER_REQUEST)
-        ]
+    rasters = list(_page_rasters(reader))
+    turns = list(_pool().map(lambda r: _page_turn(client, model, r), rasters))
 
-    def read(batch: tuple[int, list[bytes]]) -> tuple[list[ExtractedId], int, int]:
-        page_no, tiles = batch
+    # A page the probe flags is read BOTH ways and the better answer kept, rather
+    # than simply turned. The probe's false positive rate is low but not zero
+    # (2 of 18 flags on the hand-read sample), and turning an upright page loses
+    # every reference on it — measured, twice, before this guard existed. The
+    # extra pass is only paid on the ~10% of pages that get flagged, which was
+    # 130 of a 1093-tile property.
+    jobs: list[tuple[tuple[int, int], list[bytes]]] = []
+    for page_no, (raster, (turn, probe_in, probe_out)) in enumerate(
+        zip(rasters, turns, strict=True), start=1
+    ):
+        in_tokens += probe_in
+        out_tokens += probe_out
+        renders = [(0, raster)]
+        if turn:
+            logger.info(
+                "id_extraction: page %d looks turned %d° — reading it both ways", page_no, turn
+            )
+            renders.append((turn, raster.rotate(turn, expand=True)))
+        for degrees, image in renders:
+            tiles = _tiles(image)
+            logger.info(
+                "id_extraction: reading page %d (turned %d°) as %d tile(s)",
+                page_no,
+                degrees,
+                len(tiles),
+            )
+            jobs += [
+                ((page_no, degrees), tiles[start : start + _MAX_IMAGES_PER_REQUEST])
+                for start in range(0, len(tiles), _MAX_IMAGES_PER_REQUEST)
+            ]
+
+    def read(job: tuple[tuple[int, int], list[bytes]]) -> tuple[list[ExtractedId], int, int]:
+        (page_no, degrees), tiles = job
         try:
             return _read_page(client, model, tiles)
         except Exception as exc:
             # One bad page shouldn't lose the pages that did work.
-            logger.warning("id_extraction: Bedrock failed on page %d: %s", page_no, exc)
+            logger.warning(
+                "id_extraction: Bedrock failed on page %d (turned %d°): %s", page_no, degrees, exc
+            )
             return [], 0, 0
 
-    found: list[ExtractedId] = []
-    in_tokens = out_tokens = 0
-    # `map` yields in submission order however the calls interleave, so
-    # `_dedupe`'s "first occurrence wins" still means "the earliest page's
-    # context is the one kept" — the result is identical to reading serially.
-    for page_ids, page_in, page_out in _pool().map(read, batches):
-        found.extend(page_ids)
+    # `map` yields in submission order however the calls interleave, so page
+    # order — and with it `_dedupe`'s "first occurrence wins", which is what
+    # keeps the earliest and best context — is the same as reading serially.
+    renders: dict[tuple[int, int], list[ExtractedId]] = {}
+    for (key, _), (page_ids, page_in, page_out) in zip(jobs, _pool().map(read, jobs), strict=True):
+        renders.setdefault(key, []).extend(page_ids)
         in_tokens += page_in
         out_tokens += page_out
+
+    def labelled(key: tuple[int, int]) -> int:
+        """References that parsed as an actual record citation.
+
+        Counting *all* references instead loses real reception numbers: a
+        wrongly-turned render still emits plenty of free text, and on the 33
+        flagged pages of the R1611986 corpus that junk won the count often
+        enough to cost six corpus-verified receptions (35 -> 34 against a
+        baseline of 4). Junk lands in `_classify`'s "other" bucket, so not
+        counting it is the whole fix.
+        """
+        return sum(1 for item in renders[key] if item.id_type != "other")
+
+    found: list[ExtractedId] = []
+    for page_no in sorted({page for page, _ in renders}):
+        # Most citations wins; a tie goes to the page as supplied.
+        best = max(
+            (key for key in renders if key[0] == page_no),
+            key=lambda key: (labelled(key), -key[1]),
+        )
+        if best[1]:
+            logger.info("id_extraction: page %d read better turned %d°", page_no, best[1])
+        found.extend(renders[best])
 
     return IdExtraction(
         ids=_dedupe(found), source="bedrock", input_tokens=in_tokens, output_tokens=out_tokens
@@ -445,10 +713,13 @@ def make_thumbnail(pdf_path: Path) -> bytes | None:
         return None
     if raster is None:
         return None
-    width, height = raster.size
-    scale = min(1.0, _THUMBNAIL_MAX_WIDTH / max(1, width))
-    if scale < 1.0:
-        raster = raster.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.LANCZOS)
+    # Convert before resizing, for the reason spelled out in `_fit`: these
+    # rasters are bitonal and PIL would otherwise resample them by
+    # nearest-neighbour. It matters more here than for a tile — a thumbnail is a
+    # ~0.04x downscale, so without averaging almost every stroke lands between
+    # samples and the result is noise rather than a shrunken page.
+    raster = raster.convert("L")
+    raster.thumbnail((_THUMBNAIL_MAX_WIDTH, raster.height), Image.LANCZOS)
     buf = io.BytesIO()
     raster.convert("RGB").save(buf, format="JPEG", quality=70)
     return buf.getvalue()
@@ -466,9 +737,17 @@ def cache_fingerprint(model: str | None = None) -> str:
     Tile geometry is in here because it's the quality knob (see
     `_TILE_MAX_NATIVE_PX`): re-tuning it must not keep serving results the old
     settings produced, and bumping it is how you invalidate the cache.
+
+    So is the wire encoding. A render-only change (the bitonal-resize fix in
+    `_tile_bytes`) leaves the geometry untouched but changes what the model
+    actually sees, and serving the old answers would hide the improvement.
+
+    And so is the orientation pass, for the same reason: it changes the answer
+    for a tenth of the pages in the corpus without touching tile geometry.
     """
     model = model or get_settings().id_extraction_model
-    return f"{model}_{_TILE_MAX_NATIVE_PX}_{_TILE_MAX_PX}".replace("/", "_").replace(":", "_")
+    render = f"{_TILE_MAX_NATIVE_PX}_{_TILE_MAX_PX}_{_TILE_FORMAT}{_TILE_QUALITY}"
+    return f"{model}_{render}_turn{_TURN_PROBE_MAX_PX}".replace("/", "_").replace(":", "_")
 
 
 def extract_document_ids(pdf_path: Path, *, model: str | None = None) -> IdExtraction:
