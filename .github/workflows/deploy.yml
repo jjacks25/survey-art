@@ -1,5 +1,12 @@
 name: Deploy
 
+# The bold run title in the Actions list. There's no source-branch field on a push
+# event (only `main`, the branch being pushed *to*) and workflow expressions have no
+# substring/regex to pull just the branch out of the merge commit message — so this
+# leads with "Deploy Prod" for clarity and keeps the full message (which already
+# names the branch, e.g. "Merge pull request #20 from jjacks25/feature/x") after it.
+run-name: "Deploy Prod: ${{ github.event.head_commit.message }}"
+
 on:
   push:
     branches: [main]
