@@ -1,0 +1,34 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+# Runs on GitHub's free-tier runner — no AWS compute (Lambda/CodeBuild) is spun up
+# just to drive the deploy, only to build/push images and run deploy.py's boto3 calls.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required for OIDC (no long-lived AWS keys stored in GitHub)
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      REGION: us-west-2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.REGION }}
+
+      # Same command as a manual full deploy from a laptop — bootstrap/network/ecr
+      # are cheap no-ops via empty change sets when nothing changed, so there's no
+      # need for CD to special-case "what changed" and run a narrower subset.
+      - name: make deploy all
+        run: make deploy all REGION=${{ env.REGION }}

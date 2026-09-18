@@ -1,0 +1,387 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Actions OIDC trust for survey-art CD. Creates the
+  token.actions.githubusercontent.com identity provider (skip this stack if one
+  already exists in the account — an account gets exactly one) and a deploy role
+  GitHub Actions assumes via OIDC, scoped to pushes to main on this repo only.
+  Deployed once via TemplateBody from an operator's own credentials, same as
+  bootstrap.yaml — this is what CI then uses for every subsequent deploy.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: survey-art
+  GitHubOrg:
+    Type: String
+    Default: jjacks25
+  GitHubRepo:
+    Type: String
+    Default: survey-art
+  CreateOidcProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to false if token.actions.githubusercontent.com is already registered
+      in this account (from another repo's CD setup) — IAM only allows one.
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # No ThumbprintList: ACM-issued, AWS verifies GitHub's CA chain automatically.
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-github-deploy'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - MakeProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main'
+      Policies:
+        # ponytail: service-level actions scoped to this project's resource names/ARNs
+        # where CFN supports it; a few list/describe calls that don't support
+        # resource-level scoping are left unrestricted (read-only). Tighten further
+        # if this account ever needs to isolate survey-art from other projects.
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudFormationStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource*
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*/*'
+              - Sid: TemplateBucket
+                # Enumerated bucket-management verbs, not s3:* — this is exactly what
+                # bootstrap.yaml's TemplateBucket/TemplateBucketPolicy resources use
+                # (versioning, encryption, public-access-block, ownership controls,
+                # lifecycle, bucket policy) plus object read/write. Deliberately
+                # excludes ACL actions (PutBucketAcl/PutObjectAcl) and anything
+                # website/logging/replication/notification-related — none of these
+                # buckets use them, so there's no reason to hold the permission.
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:PutBucketVersioning
+                  - s3:GetBucketVersioning
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketOwnershipControls
+                  - s3:GetBucketOwnershipControls
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:PutBucketTagging
+                  - s3:GetBucketTagging
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*-cfn-templates-*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*-cfn-templates-*/*'
+              - Sid: AppBuckets
+                # Same action list as TemplateBucket above (kept as a literal
+                # duplicate, not a YAML alias — deploy.py uploads this file's raw
+                # bytes as TemplateBody/TemplateURL, and CloudFormation's own parser
+                # doesn't resolve YAML anchors/aliases; only `aws cloudformation
+                # package` does that client-side, which this pipeline doesn't use).
+                # backend.yaml's StorageBucket and frontend.yaml's SiteBucket need
+                # the same bucket-management verbs, not s3:*. StorageBucket has no
+                # AWS::S3::BucketPolicy resource at all (see packages/survey_shared/
+                # AGENTS.md — it's the documents/scratch/logs archive, access is via
+                # the app roles' own object-level grants, never a bucket policy), so
+                # PutBucketPolicy here is only ever exercised for SiteBucket in
+                # practice even though the grant can't be narrowed further by ARN
+                # (StorageBucket/SiteBucket names are CloudFormation-autogenerated
+                # under the same ${ProjectName}-* prefix).
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:PutBucketVersioning
+                  - s3:GetBucketVersioning
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketOwnershipControls
+                  - s3:GetBucketOwnershipControls
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:PutBucketTagging
+                  - s3:GetBucketTagging
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
+              - Sid: CloudFrontInvalidate
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetInvalidation
+                Resource: '*'
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrRepo
+                # BatchCheckLayerAvailability..BatchGetImage are build_push.sh's pushes;
+                # CreateRepository..SetRepositoryPolicy are ecr.yaml's CloudFormation calls.
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:BatchGetImage
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
+                  - ecr:PutImageScanningConfiguration
+                  - ecr:PutImageTagMutability
+                  - ecr:PutLifecyclePolicy
+                  - ecr:TagResource
+                  - ecr:UntagResource
+                  - ecr:ListTagsForResource
+                Resource:
+                  - !Sub 'arn:aws:ecr:*:${AWS::AccountId}:repository/${ProjectName}/*'
+              - Sid: DynamoDb
+                Effect: Allow
+                Action: dynamodb:*
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/${ProjectName}-*'
+                  - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/${ProjectName}-*/index/*'
+              - Sid: Sqs
+                Effect: Allow
+                Action: sqs:*
+                Resource: !Sub 'arn:aws:sqs:*:${AWS::AccountId}:${ProjectName}-*'
+              - Sid: SecretsManager
+                Effect: Allow
+                Action: secretsmanager:*
+                Resource: !Sub 'arn:aws:secretsmanager:*:${AWS::AccountId}:secret:${ProjectName}/*'
+              - Sid: CognitoCreate
+                # CreateUserPool has no resource-level permission (nothing exists yet).
+                Effect: Allow
+                Action: cognito-idp:CreateUserPool
+                Resource: '*'
+              - Sid: CognitoManage
+                Effect: Allow
+                Action:
+                  - cognito-idp:*
+                Resource: !Sub 'arn:aws:cognito-idp:*:${AWS::AccountId}:userpool/*'
+              - Sid: EcsCreate
+                # CreateCluster and RegisterTaskDefinition both take the
+                # to-be-created resource's own name/family, so they scope cleanly.
+                Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:RegisterTaskDefinition
+                Resource:
+                  - !Sub 'arn:aws:ecs:*:${AWS::AccountId}:cluster/${ProjectName}-*'
+                  - !Sub 'arn:aws:ecs:*:${AWS::AccountId}:task-definition/${ProjectName}-*:*'
+              - Sid: EcsManage
+                Effect: Allow
+                Action:
+                  - ecs:*
+                Resource:
+                  - !Sub 'arn:aws:ecs:*:${AWS::AccountId}:cluster/${ProjectName}-*'
+                  - !Sub 'arn:aws:ecs:*:${AWS::AccountId}:task-definition/${ProjectName}-*:*'
+                  - !Sub 'arn:aws:ecs:*:${AWS::AccountId}:task/${ProjectName}-*/*'
+              - Sid: EcsDescribe
+                # ecs:Describe*/List* don't support resource-level scoping.
+                Effect: Allow
+                Action:
+                  - ecs:DescribeClusters
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:ListTagsForResource
+                Resource: '*'
+              - Sid: Lambda
+                Effect: Allow
+                Action: lambda:*
+                Resource:
+                  - !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:${ProjectName}-*'
+                  - !Sub 'arn:aws:lambda:*:${AWS::AccountId}:event-source-mapping:*'
+              - Sid: ApiGateway
+                # ApiGatewayV2 ARNs carry no account/project scoping pre-creation
+                # (region + resource-type only) — narrowest useful boundary here.
+                Effect: Allow
+                Action: apigateway:*
+                Resource:
+                  - 'arn:aws:apigateway:*::/apis'
+                  - 'arn:aws:apigateway:*::/apis/*'
+              - Sid: Logs
+                Effect: Allow
+                Action: logs:*
+                Resource:
+                  - !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*:*'
+                  - !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/ecs/${ProjectName}-*:*'
+              - Sid: Ec2Network
+                # network.yaml's resource types (VPC/Subnet/RouteTable/IGW/SecurityGroup/
+                # NetworkAcl+entries) mostly don't support resource-level ARN scoping at
+                # all in EC2's IAM model (true for most VPC-building calls, not a
+                # shortcut) — so the boundary here is an explicit action allowlist
+                # instead of ec2:*, rather than a Resource restriction.
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:CreateVpc
+                  - ec2:DeleteVpc
+                  - ec2:ModifyVpcAttribute
+                  - ec2:DescribeInternetGateways
+                  - ec2:CreateInternetGateway
+                  - ec2:DeleteInternetGateway
+                  - ec2:AttachInternetGateway
+                  - ec2:DetachInternetGateway
+                  - ec2:DescribeSubnets
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:ModifySubnetAttribute
+                  - ec2:DescribeRouteTables
+                  - ec2:CreateRouteTable
+                  - ec2:DeleteRouteTable
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute
+                  - ec2:ReplaceRoute
+                  - ec2:AssociateRouteTable
+                  - ec2:DisassociateRouteTable
+                  - ec2:ReplaceRouteTableAssociation
+                  - ec2:DescribeSecurityGroups
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:DescribeNetworkAcls
+                  - ec2:CreateNetworkAcl
+                  - ec2:DeleteNetworkAcl
+                  - ec2:CreateNetworkAclEntry
+                  - ec2:DeleteNetworkAclEntry
+                  - ec2:ReplaceNetworkAclEntry
+                  - ec2:ReplaceNetworkAclAssociation
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeAccountAttributes
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Sid: IamForAppRoles
+                # ${ProjectName}-* also covers this role's own name
+                # (${ProjectName}-github-deploy) — `make deploy all` (and so CD) runs
+                # --github-oidc too, so this role can read/no-op-update its own stack.
+                # It deliberately CANNOT grant itself more trust or more policy — see
+                # DenySelfEscalation below, which always wins over this Allow. A real
+                # change to this role's trust policy or attached/inline policy has to
+                # be applied with `make deploy github-oidc` from an operator's own
+                # (non-CD) credentials; CD will get AccessDenied on that one resource
+                # and the rest of the stack's no-op parts still succeed.
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:TagRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+              - Sid: DenySelfEscalation
+                # A CI identity that can rewrite its own trust policy or attached/
+                # inline policy is a standing privilege-escalation path: if the
+                # deploy role's credentials are ever used maliciously (a compromised
+                # dependency, a malicious PR that got merged), it could otherwise
+                # widen its own AssumeRolePolicyDocument (e.g. add a different
+                # repo/branch/account as trusted principal) and keep that access even
+                # after the original hole is closed. Explicit Deny always overrides
+                # the Allow above, regardless of what's added to it later.
+                Effect: Deny
+                Action:
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-github-deploy'
+              - Sid: IamOidcProvider
+                Effect: Allow
+                Action:
+                  - iam:GetOpenIDConnectProvider
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:UpdateOpenIDConnectProviderThumbprint
+                  - iam:TagOpenIDConnectProvider
+                  - iam:UntagOpenIDConnectProvider
+                  - iam:ListOpenIDConnectProviderTags
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+              - Sid: CloudFrontDistribution
+                Effect: Allow
+                Action:
+                  - cloudfront:*
+                Resource: '*'
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+    Description: >
+      Set this as the AWS_DEPLOY_ROLE_ARN repo variable
+      (Settings > Secrets and variables > Actions > Variables) for the CD workflow.
