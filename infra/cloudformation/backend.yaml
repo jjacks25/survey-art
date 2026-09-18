@@ -119,6 +119,23 @@ Resources:
         AttributeName: expiresAt
         Enabled: true
 
+  # Permanent record of every property ever searched, keyed on the raw
+  # address/account number (see survey_shared.jobs.save_property()). Deliberately
+  # its own table, not TTL'd, so deleting JobsTable history (DELETE /api/jobs/{id},
+  # DELETE /api/properties) never loses the ability to re-run a property.
+  SavedPropertiesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: propertyKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyKey
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
   JobDLQ:
     Type: AWS::SQS::Queue
     Properties:
@@ -258,6 +275,12 @@ Resources:
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Scan]
                 Resource: !GetAtt JobsTable.Arn
               - Effect: Allow
+                # Backs POST /api/jobs (jobs.save_property()) and
+                # GET /api/saved-properties (jobs.list_saved_properties()) — no
+                # DeleteItem, this table is never pruned by the API.
+                Action: [dynamodb:PutItem, dynamodb:Scan]
+                Resource: !GetAtt SavedPropertiesTable.Arn
+              - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt JobQueue.Arn
               - Effect: Allow
@@ -369,6 +392,7 @@ Resources:
       Environment:
         Variables:
           JOBS_TABLE: !Ref JobsTable
+          SAVED_PROPERTIES_TABLE: !Ref SavedPropertiesTable
           STORAGE_BUCKET: !Ref StorageBucket
           JOB_QUEUE_URL: !Ref JobQueue
           CLUSTER_ARN: !GetAtt EcsCluster.Arn

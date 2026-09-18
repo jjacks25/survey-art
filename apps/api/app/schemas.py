@@ -58,6 +58,21 @@ class JobListResponse(BaseModel):
     jobs: list[JobSummary]
 
 
+class SavedPropertySummary(BaseModel):
+    """A property that's been searched at least once, kept permanently — see
+    `survey_shared.jobs.SavedProperty`. `key`/`address` re-submit the same
+    search via `POST /api/jobs`."""
+
+    key: str
+    address: str
+    county: str
+    savedAt: int
+
+
+class SavedPropertiesResponse(BaseModel):
+    properties: list[SavedPropertySummary]
+
+
 class FileEntry(BaseModel):
     name: str
     size: int

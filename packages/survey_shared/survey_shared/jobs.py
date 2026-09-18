@@ -110,8 +110,34 @@ class Job(BaseModel):
         return cls.model_validate(item)
 
 
+class SavedProperty(BaseModel):
+    """A permanent record that a property has been searched at least once —
+    survives `delete_job()`/`delete_jobs_for_property()` clearing run history,
+    since it lives in its own table rather than the jobs table. Just enough to
+    re-submit the same search (`address` holds whatever was typed — a street
+    address or an account/parcel number, same overload as `Job.address`)."""
+
+    model_config = {"populate_by_name": True}
+
+    key: str = Field(alias="propertyKey")
+    address: str
+    county: str
+    saved_at: int = Field(alias="savedAt")
+
+    def to_item(self) -> dict:
+        return self.model_dump(by_alias=True, exclude_none=True)
+
+    @classmethod
+    def from_item(cls, item: dict) -> SavedProperty:
+        return cls.model_validate(item)
+
+
 def _table():
     return aws.resource("dynamodb").Table(aws.jobs_table_name())
+
+
+def _saved_properties_table():
+    return aws.resource("dynamodb").Table(aws.saved_properties_table_name())
 
 
 def create_job(job_id: str, address: str, county: str) -> Job:
@@ -284,6 +310,28 @@ def delete_job(job_id: str) -> bool:
     whether a record actually existed to delete."""
     resp = _table().delete_item(Key={"jobId": job_id}, ReturnValues="ALL_OLD")
     return "Attributes" in resp
+
+
+def save_property(address: str, county: str) -> None:
+    """Upsert a permanent record that `address` (a street address or
+    account/parcel number, whatever was submitted) has been searched. Keyed on
+    the raw address string — the same fallback `property_key()` uses before a
+    job has a `doc_prefix` — so re-running the same input overwrites the same
+    record's `saved_at` rather than piling up duplicates."""
+    _saved_properties_table().put_item(
+        Item=SavedProperty(
+            key=address, address=address, county=county, saved_at=int(time.time())
+        ).to_item()
+    )
+
+
+def list_saved_properties(limit: int = 200) -> list[SavedProperty]:
+    """Every property ever searched, most-recent-first. Unlike `list_jobs()`,
+    never shrinks when run history is deleted — that's the point."""
+    items = _saved_properties_table().scan().get("Items", [])
+    props = [SavedProperty.from_item(item) for item in items]
+    props.sort(key=lambda p: p.saved_at, reverse=True)
+    return props[:limit]
 
 
 def property_key(job: Job) -> str:

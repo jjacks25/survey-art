@@ -39,3 +39,7 @@ def storage_bucket() -> str:
 
 def jobs_table_name() -> str:
     return get_shared_settings().require_jobs_table()
+
+
+def saved_properties_table_name() -> str:
+    return get_shared_settings().require_saved_properties_table()

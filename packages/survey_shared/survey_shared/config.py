@@ -41,6 +41,7 @@ class SharedSettings(BaseSettings):
     # component needs all of them (the worker doesn't send to SQS, etc.).
     storage_bucket: str = ""
     jobs_table: str = ""
+    saved_properties_table: str = ""
     job_queue_url: str = ""
     cluster_arn: str = ""
 
@@ -61,6 +62,11 @@ class SharedSettings(BaseSettings):
         if not self.jobs_table:
             raise RuntimeError("JOBS_TABLE is not set")
         return self.jobs_table
+
+    def require_saved_properties_table(self) -> str:
+        if not self.saved_properties_table:
+            raise RuntimeError("SAVED_PROPERTIES_TABLE is not set")
+        return self.saved_properties_table
 
     def require_job_queue_url(self) -> str:
         if not self.job_queue_url:

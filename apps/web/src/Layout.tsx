@@ -8,6 +8,7 @@ import {
   Container,
   Group,
   Loader,
+  Divider,
   ScrollArea,
   Stack,
   Text,
@@ -17,7 +18,7 @@ import {
 } from "@mantine/core";
 
 import { AppConfig } from "./config";
-import { ApiClient, JobSummary } from "./api";
+import { ApiClient, JobSummary, SavedProperty } from "./api";
 import { statusColor, formatWhen } from "./utils";
 
 export type LayoutContext = { api: ApiClient; loadHistory: () => void };
@@ -41,6 +42,9 @@ export function Layout({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [savedProperties, setSavedProperties] = useState<SavedProperty[]>([]);
+  const [savedLoading, setSavedLoading] = useState(false);
+  const [rerunningKey, setRerunningKey] = useState<string | null>(null);
   const navigate = useNavigate();
   // Present only on /jobs/:jobId, undefined on the search page — used to
   // highlight the currently-open job in the sidebar.
@@ -103,8 +107,35 @@ export function Layout({
     }
   }
 
+  async function loadSavedProperties() {
+    setSavedLoading(true);
+    try {
+      const { properties } = await api.listSavedProperties();
+      setSavedProperties(properties);
+    } catch {
+      // saved properties are a convenience — a failed fetch just leaves the list empty
+    } finally {
+      setSavedLoading(false);
+    }
+  }
+
+  // Re-runs a saved property's exact search (same address/county it was last
+  // submitted with) and jumps straight to the new job's results, same as
+  // submitting the form fresh from SearchPage.
+  function rerunProperty(p: SavedProperty) {
+    setRerunningKey(p.key);
+    api
+      .createJob(p.address, p.county || undefined)
+      .then(({ jobId }) => {
+        loadHistory();
+        navigate(`/jobs/${jobId}`);
+      })
+      .finally(() => setRerunningKey(null));
+  }
+
   useEffect(() => {
     loadHistory();
+    loadSavedProperties();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -221,6 +252,45 @@ export function Layout({
                   </Box>
                 );
               })}
+            </Stack>
+          </ScrollArea>
+        )}
+
+        <Divider my="sm" />
+
+        <Group justify="space-between" mb="sm">
+          <Text fw={700} size="sm">Saved Properties</Text>
+          <ActionIcon variant="subtle" onClick={loadSavedProperties} aria-label="Refresh saved properties">
+            ↻
+          </ActionIcon>
+        </Group>
+        {savedLoading ? (
+          <Center py="lg"><Loader size="sm" /></Center>
+        ) : savedProperties.length === 0 ? (
+          <Text c="dimmed" size="sm">No saved properties yet.</Text>
+        ) : (
+          <ScrollArea style={{ flex: 1 }}>
+            <Stack gap={4}>
+              {savedProperties.map((p) => (
+                <UnstyledButton
+                  key={p.key}
+                  onClick={() => rerunProperty(p)}
+                  p="xs"
+                  disabled={rerunningKey !== null}
+                  style={{ borderRadius: 8, border: "1px solid transparent" }}
+                >
+                  <Stack gap={2}>
+                    <Text size="sm" fw={500} style={{ wordBreak: "break-word" }}>
+                      {p.address}
+                    </Text>
+                    <Group gap="xs">
+                      <Text size="xs" c="dimmed">
+                        {rerunningKey === p.key ? "Starting..." : `Last run ${formatWhen(p.savedAt)}`}
+                      </Text>
+                    </Group>
+                  </Stack>
+                </UnstyledButton>
+              ))}
             </Stack>
           </ScrollArea>
         )}
