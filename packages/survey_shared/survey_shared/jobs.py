@@ -382,6 +382,25 @@ def upload_documents(prefix: str, files: list[Path]) -> int:
     return count
 
 
+THUMBNAILS_SUBPREFIX = ".thumbnails"
+
+
+def upload_thumbnails(prefix: str, thumbnails: dict[str, bytes]) -> None:
+    """Upload JPEG thumbnails for a subset of the documents at `prefix`, keyed
+    by the document's own filename (see `worker.py`'s thumbnail generation
+    step). Stored under ``documents/{prefix}/.thumbnails/{filename}.jpg`` —
+    same durable prefix and retention as the documents themselves, but a
+    leading-dot subpath `list_result_files()` explicitly skips so a thumbnail
+    never shows up as a document of its own in the Results grid."""
+    if not thumbnails:
+        return
+    s3 = aws.client("s3")
+    bucket = aws.storage_bucket()
+    for filename, jpeg_bytes in thumbnails.items():
+        key = f"{DOCUMENTS_PREFIX}/{prefix}/{THUMBNAILS_SUBPREFIX}/{filename}.jpg"
+        s3.put_object(Bucket=bucket, Key=key, Body=jpeg_bytes, ContentType="image/jpeg")
+
+
 def upload_map_image(job_id: str, path: Path) -> str | None:
     """Upload a scraper-captured property map screenshot and return a presigned
     URL for it. Stored under ``scratch/maps/`` — ephemeral per-job output, not
@@ -417,10 +436,27 @@ def list_result_files(prefix: str) -> list[dict]:
     s3 = aws.client("s3")
     bucket = aws.storage_bucket()
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{DOCUMENTS_PREFIX}/{prefix}/")
+    thumbnail_names = {
+        obj["Key"].rsplit("/", 1)[-1][: -len(".jpg")]
+        for obj in resp.get("Contents", [])
+        if f"/{THUMBNAILS_SUBPREFIX}/" in obj["Key"]
+    }
     files: list[dict] = []
     for obj in resp.get("Contents", []):
         key = obj["Key"]
+        if f"/{THUMBNAILS_SUBPREFIX}/" in key:
+            continue
         name = key.rsplit("/", 1)[-1]
+        thumbnail_url = None
+        if name in thumbnail_names:
+            thumb_key = f"{DOCUMENTS_PREFIX}/{prefix}/{THUMBNAILS_SUBPREFIX}/{name}.jpg"
+            thumbnail_url = _make_browser_reachable(
+                s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": bucket, "Key": thumb_key},
+                    ExpiresIn=PRESIGN_TTL_SECONDS,
+                )
+            )
         url = s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": bucket, "Key": key},
@@ -445,6 +481,7 @@ def list_result_files(prefix: str) -> list[dict]:
                 "size": obj.get("Size", 0),
                 "url": _make_browser_reachable(url),
                 "downloadUrl": _make_browser_reachable(download_url),
+                "thumbnailUrl": thumbnail_url,
             }
         )
     return files

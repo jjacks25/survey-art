@@ -60,12 +60,24 @@ function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void) {
         }}
       >
         <Stack align="center" gap={4} style={{ minWidth: 0, width: "100%" }}>
-          {isPdf(f.name) ? (
+          {f.thumbnailUrl ? (
+            // A real, worker-generated first-page image — no PDF fetch/render
+            // in the browser at all, so this is the fast path (see worker.py's
+            // `_make_thumbnails()`). Falls back to the iframe below only when
+            // no thumbnail was generated (e.g. a vector PDF, not a county scan).
+            <img
+              src={f.thumbnailUrl}
+              alt={f.name}
+              loading="lazy"
+              style={{ width: "100%", height: 90, objectFit: "cover", borderRadius: 4 }}
+            />
+          ) : isPdf(f.name) ? (
             <div style={{ width: "100%", height: 90, overflow: "hidden", borderRadius: 4, pointerEvents: "none" }}>
               <iframe
                 src={`${f.url}#toolbar=0&view=FitH`}
                 title={f.name}
-                style={{ width: "400%", height: 360, border: "none", transform: "scale(0.25)", transformOrigin: "top left" }}
+                loading="lazy"
+                style={{ width: "150%", height: 135, border: "none", transform: "scale(0.667)", transformOrigin: "top left" }}
               />
             </div>
           ) : (

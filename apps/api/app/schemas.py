@@ -65,6 +65,10 @@ class FileEntry(BaseModel):
     # Same object, signed with `Content-Disposition: attachment` so the browser
     # saves it instead of rendering it inline (`url` stays inline for previews).
     downloadUrl: str
+    # Presigned URL for a small first-page JPEG, if one was generated at upload
+    # time (worker.py's `_make_thumbnails()`) — None for non-PDFs or a PDF with
+    # no embedded page raster to thumbnail (e.g. vector, not a county scan).
+    thumbnailUrl: str | None = None
 
 
 class FilesResponse(BaseModel):

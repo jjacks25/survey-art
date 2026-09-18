@@ -36,6 +36,9 @@ export interface FileEntry {
   url: string;
   /** Same object, signed as an attachment so the browser saves it. */
   downloadUrl: string;
+  /** Presigned URL for a small first-page JPEG, if the worker generated one —
+   * absent for non-PDFs or a PDF with no embedded page raster to thumbnail. */
+  thumbnailUrl?: string | null;
 }
 
 export interface JobSummary {
