@@ -100,11 +100,21 @@ no benefit.
   (`aws sso login` or a profile via `--profile`); the OIDC role is CI's identity, not a
   replacement for local access. The **very first** `make deploy github-oidc` (or
   `make deploy all`) after a fresh account still has to run from an operator's own
-  credentials — chicken-and-egg, nothing exists yet for CI to assume — but every run
-  after that, CD keeps the stack itself up to date too, including its own IAM policy
-  (the role's `IamForAppRoles`/`IamOidcProvider` statements cover updating itself).
-  Compute (Lambda/Fargate) still uses its own task/execution roles, never the deploy
-  role.
+  credentials — chicken-and-egg, nothing exists yet for CI to assume. After that, CD
+  runs `--github-oidc` too on every merge (so drift/no-op changes to the stack are
+  caught), but it can never widen its own trust policy or attached/inline policy — an
+  explicit `DenySelfEscalation` statement in `github-oidc.yaml` blocks
+  `iam:UpdateAssumeRolePolicy`/`PutRolePolicy`/`AttachRolePolicy`/`DetachRolePolicy`/
+  `DeleteRolePolicy`/`DeleteRole` on its own role ARN, overriding the broader
+  `IamForAppRoles` Allow (Deny always wins in IAM). A CI identity that can rewrite its
+  own trust policy is a standing privilege-escalation path — if the role's credentials
+  are ever used maliciously, it could otherwise widen its own trust condition (e.g. add
+  another repo/branch as a trusted principal) and keep that access after the original
+  hole is closed. Any real change to the deploy role's trust/policy has to ship via
+  `make deploy github-oidc` from an operator's own (non-CD) credentials — CD will get
+  `AccessDenied` on just that one resource and the rest of the stack's no-op parts
+  still succeed. Compute (Lambda/Fargate) still uses its own task/execution roles,
+  never the deploy role.
 - **Public-subnet Fargate, no NAT Gateway.** The scraper needs heavy egress to
   arbitrary county sites; a public IP with an egress-only SG avoids the ~$32/mo NAT
   Gateway. Trade-off: the task is not in a private subnet (a deliberate cost choice).
