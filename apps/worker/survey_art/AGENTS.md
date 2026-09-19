@@ -62,6 +62,31 @@ ever add another handler to the scraper's logger that talks to a network service
 this same pattern** — never let a handler attached to a logger the scraper actively uses
 perform blocking I/O directly in `emit()`.
 
+## Runaway-spend timeout
+
+`run_job()` wraps the scrape (`run_async(...)`) in `asyncio.wait_for(timeout=_JOB_TIMEOUT_SECONDS)`
+— currently 2 hours. A job still running past that gets cancelled and marked `FAILED`
+with an explanatory error, rather than left to keep burning Bedrock/Fargate time on a
+stuck scrape.
+
+In one-shot (Fargate) mode this is enough on its own to stop the AWS spend: the worker
+process *is* the task, so the process reaching its `sys.exit()` after `run_job()`
+returns stops the task too — no separate `ecs:StopTask` call needed (contrast with the
+user-initiated cancel path, `cancel_job()` in
+[`packages/survey_shared/AGENTS.md`](../../../packages/survey_shared/AGENTS.md), which
+does call `ecs:StopTask` because it fires from the API process, not the task itself).
+
+**This only reaps what asyncio can reach.** `asyncio.wait_for` cancels the coroutine,
+and every `async with`/`finally` in its call chain runs before the timeout is reported —
+so Playwright browser contexts opened with `async with` close normally. But if a scraper
+ever launches a subprocess that isn't attached to the event loop (e.g. an unmanaged
+Chromium process, or anything using `subprocess.Popen` without being awaited/tracked),
+cancellation won't kill it, and it would keep running — and keep costing — inside the
+Fargate task's cgroup until the container itself is torn down. None of today's scrapers
+do this (browser-use and Playwright both manage their own subprocess lifecycle through
+async context managers), but if one starts to, it needs its own explicit cleanup
+(kill the subprocess in a `finally`) rather than relying on cancellation to reach it.
+
 ## `worker.py` — job lifecycle helpers
 
 - `_load_overview(tmp)` — best-effort load of `overview.json` (see `overview.py` and
