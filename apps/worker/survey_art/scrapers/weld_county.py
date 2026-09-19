@@ -70,6 +70,7 @@ from survey_art.document_filter import DEFAULT_FILTER, DocumentFilter
 from survey_art.download import download_dir as make_download_dir
 from survey_art.geocode import GeocodedAddress
 from survey_art.id_extraction import IdExtraction, cache_fingerprint, extract_document_ids
+from survey_art.scrapers.glo_records import fetch_glo_records
 from survey_art.settings import get_settings
 from survey_shared import jobs
 
@@ -2691,6 +2692,40 @@ async def scrape(
                 results = results + survey_refs
                 targets = targets + [(role, doc) for role, doc, _ in survey_refs]
 
+    # --- Phase 4: GLO original survey of record (BLM General Land Office).
+    # Runs regardless of which Phase 3 path fired — the original 6th P.M.
+    # township survey and field notes are the earliest authoritative survey
+    # for the tract, and every later ALTA ties its basis-of-bearings back to
+    # it. Only needs S/T/R, so it can't fail on the Decision Matrix outcome.
+    glo_paths: list[Path] = []
+    if parcel.township and parcel.range_:
+        narration.info(
+            "Looking up the original BLM General Land Office survey of record "
+            f"for Township {parcel.township} Range {parcel.range_}..."
+        )
+        glo_paths, glo_cost, glo_in_tok, glo_out_tok = await fetch_glo_records(
+            state=geocoded.county.state,
+            county=geocoded.county.name,
+            section=parcel.section,
+            township=parcel.township,
+            range_=parcel.range_,
+            dest_dir=dest,
+        )
+        cost += glo_cost
+        in_tok += glo_in_tok
+        out_tok += glo_out_tok
+        if glo_paths:
+            narration.info(f"Found {len(glo_paths)} GLO record(s) for this township.")
+        else:
+            narration.info("No GLO records were found for this township.")
+        ov.set_section(
+            "glo_records",
+            {
+                "section_township_range": parcel.section_township_range(),
+                "files": [str(p) for p in glo_paths],
+            },
+        )
+
     # Record per-target results in overview.json. A target with zero files
     # captured is "failed"; non-zero is "downloaded".
     results_section: list[dict] = []
@@ -2707,26 +2742,45 @@ async def scrape(
         )
         saved_paths.extend(paths)
     ov.merge_section(route_section, {"results": results_section})
+    saved_paths.extend(glo_paths)
+
+    def _glo_doc_type(filename: str) -> str:
+        name = filename.lower()
+        if "fieldnote" in name or "field_note" in name:
+            return "GLO Field Notes"
+        if "patent" in name:
+            return "GLO Land Patent"
+        return "GLO Survey Plat"
 
     # One row per downloaded file, keyed by the filename the Results tab shows,
     # so the frontend can group the grid by category and sort by reception
     # without re-deriving either from the filename. Every route's documents land
     # here — each route writes its own section above, and a surveyor scanning
     # the grid doesn't care which search turned a document up.
+    document_rows = [
+        {
+            "file": path.name,
+            "reception": doc.reception,
+            "doc_type": doc.doc_type,
+            "category": classify(doc.doc_type),
+            "role": role,
+        }
+        for role, doc, paths in results
+        for path in paths
+    ] + [
+        {
+            "file": path.name,
+            "reception": "",
+            "doc_type": _glo_doc_type(path.name),
+            "category": classify(_glo_doc_type(path.name)),
+            "role": "glo_record",
+        }
+        for path in glo_paths
+    ]
     ov.set_section(
         "documents",
         sorted(
-            (
-                {
-                    "file": path.name,
-                    "reception": doc.reception,
-                    "doc_type": doc.doc_type,
-                    "category": classify(doc.doc_type),
-                    "role": role,
-                }
-                for role, doc, paths in results
-                for path in paths
-            ),
+            document_rows,
             key=lambda row: (
                 CATEGORIES.index(row["category"]),
                 reception_sort_key(row["reception"]),
