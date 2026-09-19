@@ -331,6 +331,13 @@ def _upload_map_image(job_id: str, metadata: dict | None) -> None:
         map_section["image_url"] = url
 
 
+# Runaway-spend guard: a property search that's still running after this long gets
+# killed outright rather than left to keep burning Fargate/Bedrock time. In one-shot
+# (Fargate) mode this process exiting IS the task stopping, so no separate ecs:StopTask
+# call is needed.
+_JOB_TIMEOUT_SECONDS = 2 * 60 * 60
+
+
 async def run_job(job_id: str, address: str, county: str | None) -> int:
     """Run one scrape job end-to-end. Returns a process-style exit code."""
     jobs.update_status(job_id, jobs.RUNNING)
@@ -342,9 +349,21 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     start_time = time.time()
     try:
         with tempfile.TemporaryDirectory(prefix=f"job-{job_id}-") as tmp:
-            saved, err, cost, in_tok, out_tok = await run_async(
-                address, tmp_dir=Path(tmp), quiet=True, county_override=county
-            )
+            try:
+                saved, err, cost, in_tok, out_tok = await asyncio.wait_for(
+                    run_async(address, tmp_dir=Path(tmp), quiet=True, county_override=county),
+                    timeout=_JOB_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                jobs.update_status(
+                    job_id,
+                    jobs.FAILED,
+                    error=f"Search exceeded the {_JOB_TIMEOUT_SECONDS // 3600}-hour time limit and was stopped.",
+                    **_cost_fields(start_time, 0.0, 0, 0, log_volume=log_handler.volume),
+                )
+                narration.info("This search took too long and was stopped to avoid runaway cost.")
+                logger.error("Job %s FAILED: timed out after %ss", job_id, _JOB_TIMEOUT_SECONDS)
+                return 1
             if err:
                 jobs.update_status(
                     job_id,
