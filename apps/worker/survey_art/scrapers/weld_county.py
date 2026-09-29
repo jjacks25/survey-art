@@ -303,19 +303,39 @@ def _parse_portal_rows(html: str) -> list[ParcelInfo]:
     return rows
 
 
-@functools.lru_cache(maxsize=8)
+_REPORT_TOKEN_RE = re.compile(r'name="token"[^>]*value="([^"]+)"')
+
+
 def _fetch_property_report_html(account: str) -> str:
-    """Single cached HTTP GET of the property report — backing store for both
-    the field-dict and the document-history parsers, plus Phase 2's
-    'No documents found.' detection.
+    """Cached fetch of the property report — backing store for both the
+    field-dict and the document-history parsers, plus Phase 2's
+    'No documents found.' detection. Returns "" on failure, uncached.
     """
+    try:
+        return _fetch_property_report_html_cached(account)
+    except Exception as exc:
+        logger.warning("Property report fetch failed for %s: %s", account, exc)
+        return ""
+
+
+@functools.lru_cache(maxsize=8)
+def _fetch_property_report_html_cached(account: str) -> str:
+    # Since 2026-09 a plain GET only renders the Account Search form; the
+    # report sections come back from submitting that form with its CSRF token
+    # (same cookie session).
     with httpx.Client(timeout=15.0, headers=_HTTP_HEADERS, follow_redirects=True) as client:
-        try:
-            resp = client.get(_PROPERTY_REPORT_URL, params={"account": account})
+        resp = client.get(_PROPERTY_REPORT_URL, params={"account": account})
+        resp.raise_for_status()
+        token = _REPORT_TOKEN_RE.search(resp.text)
+        if token:
+            resp = client.post(
+                f"{_PROPERTY_REPORT_URL}index.cfm",
+                params={"defaultSection": "acctInfo"},
+                data={"account": account, "token": token.group(1)},
+            )
             resp.raise_for_status()
-        except Exception as exc:
-            logger.warning("Property report fetch failed for %s: %s", account, exc)
-            return ""
+    if "data-label" not in resp.text:
+        raise ValueError("response has no report fields (page layout changed?)")
     return resp.text
 
 
