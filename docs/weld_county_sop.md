@@ -53,10 +53,10 @@ flowchart TD
 
     PathC --> Own["Owner search → vesting deed →\nexemption packet → ROW → ALTA fallback"]
 
-    Sched -.optional, not yet automated.-> P4["Phase 4: GLO original survey of record"]
-    Adv -.optional, not yet automated.-> P4
-    Adv2 -.optional, not yet automated.-> P4
-    Own -.optional, not yet automated.-> P4
+    Sched -.always runs.-> P4["Phase 4: GLO original survey of record"]
+    Adv -.always runs.-> P4
+    Adv2 -.always runs.-> P4
+    Own -.always runs.-> P4
     Sched -.optional, not yet automated.-> P5["Phase 5: County + state road ROW"]
     Adv -.optional, not yet automated.-> P5
     Adv2 -.optional, not yet automated.-> P5
@@ -64,8 +64,8 @@ flowchart TD
 
     classDef implemented fill:#1a5,stroke:#333,color:#fff
     classDef pending fill:#999,stroke:#333,color:#fff
-    class PathA,ALTA,Sched,Adv,PathB,Adv2,PathC,Own implemented
-    class Retry,P4,P5 pending
+    class PathA,ALTA,Sched,Adv,PathB,Adv2,PathC,Own,P4 implemented
+    class Retry,P5 pending
 ```
 
 Green = implemented today. Grey = documented, not yet automated.
@@ -315,13 +315,13 @@ Anything found and not already downloaded this run gets pulled too.
 
 ## Phase 4 — GLO original survey of record
 
-*Not yet automated.* Retrieves the original U.S. cadastral survey for the parcel's
-Section/Township/Range: the BLM General Land Office (GLO) township survey plat, its field
-notes, and any federal land patent(s) — the earliest authoritative documents fixing the
-original section corners, monuments, and meander lines that every later ALTA ties back to.
-Especially valuable when Path C fires (legacy agricultural parcels) or when an ALTA's
-basis-of-bearings cites the original PLSS survey. Weld County sits entirely within the
-**6th Principal Meridian**, which the GLO index requires alongside Township and Range.
+Retrieves the original U.S. cadastral survey for the parcel's Section/Township/Range: the
+BLM General Land Office (GLO) township survey plat, its field notes, and any federal land
+patent(s) — the earliest authoritative documents fixing the original section corners,
+monuments, and meander lines that every later ALTA ties back to. Especially valuable when
+Path C fires (legacy agricultural parcels) or when an ALTA's basis-of-bearings cites the
+original PLSS survey. Weld County sits entirely within the **6th Principal Meridian**, which
+the GLO index requires alongside Township and Range.
 
 The lookup is at `glorecords.blm.gov` → **Search Documents** → **Search Documents By
 Type**, filtered to State = Colorado, County = Weld, and the parcel's Township/Range/
@@ -333,6 +333,17 @@ This overlaps with the "BLM GLO Records" row already tracked in the repo-wide su
 sources table (see [`AGENTS.md`](../AGENTS.md#statewide--supplemental-sources-not-yet-integrated))
 — that table is the general statewide entry point; this section is what a Weld-specific
 integration would actually search on.
+
+> **Implementation.** `scrapers/glo_records.py`'s `fetch_glo_records()`, called
+> unconditionally near the end of `scrape()` whenever `ParcelInfo` has a Township and Range —
+> it doesn't depend on which Decision Matrix route fired. Unlike the rest of this file,
+> `glorecords.blm.gov` has no address or reception-number search and its results are dynamic
+> ASP.NET controls rather than deep-linkable URLs, so this goes through a `browser-use` LLM
+> agent (the same approach as `scrapers/denver_county.py`) instead of direct HTTP. Results
+> land in `overview.json` under `glo_records`; downloaded files are classified by filename
+> keyword (`fieldnote`/`patent`/else-survey-plat) into the `documents` table since the GLO
+> site has no reception number to key off of. The `Patents` search is best-effort — an empty
+> result isn't treated as a failure, since most parcels have no indexed federal patent.
 
 ---
 
@@ -441,14 +452,14 @@ integration would search GLO Township 5N Range 67W and Weld's road-ROW sources a
 
 ## What's not yet automated
 
-1. **Phase 4** (GLO survey of record) — no `glorecords.blm.gov` integration exists.
-2. **Phase 5** (road right-of-way) — no BOCC Laserfiche or CDOT OTIS integration exists.
-3. **Exhibit A cross-reference parsing** (Paths B and C) — prior-deed reception numbers or
+1. **Phase 5** (road right-of-way) — no BOCC Laserfiche or CDOT OTIS integration exists.
+2. **Exhibit A cross-reference parsing** (Paths B and C) — prior-deed reception numbers or
    extra S/T/R values cited inside a vesting/quit-claim deed's legal description aren't
    extracted; would need OCR or a vision LLM since Tyler PDFs are scanned images.
-4. **Output naming/folder structure** — today's files are `{role}_{reception}.pdf` under a
+3. **Output naming/folder structure** — today's files are `{role}_{reception}.pdf` under a
    flat `tmp/{county}/{account}/`. The `Client → Project → Instruments → [Document Type]`
-   hierarchy is a UI/export concern, not something the scraper itself builds.
-5. **Anonymous vs. authenticated recorder access** — see the URL Reference note above.
+   hierarchy is a UI/export concern, not something the scraper itself builds. GLO files
+   (Phase 4) follow the same flat layout, named by whatever `browser-use` saved them as.
+4. **Anonymous vs. authenticated recorder access** — see the URL Reference note above.
 
 These are the natural next slices for extending Weld coverage.

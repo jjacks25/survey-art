@@ -337,9 +337,37 @@ def _upload_map_image(job_id: str, metadata: dict | None) -> None:
 # call is needed.
 _JOB_TIMEOUT_SECONDS = 2 * 60 * 60
 
+# How often a running job checks whether the user cancelled it. On Fargate the API's
+# ecs:StopTask kills the process anyway; the local poll-loop worker has no task to
+# stop, so without this a cancelled job keeps the only worker busy until it finishes.
+_CANCEL_POLL_SECONDS = 10
+
+
+class _JobCancelledError(Exception):
+    pass
+
+
+async def _run_unless_cancelled(job_id: str, coro):
+    task = asyncio.ensure_future(coro)
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=_CANCEL_POLL_SECONDS)
+        if done:
+            return task.result()
+        job = await asyncio.to_thread(jobs.get_job, job_id)
+        if job is not None and job.status == jobs.CANCELLED:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise _JobCancelledError
+
 
 async def run_job(job_id: str, address: str, county: str | None) -> int:
     """Run one scrape job end-to-end. Returns a process-style exit code."""
+    job = jobs.get_job(job_id)
+    if job is None or job.status in jobs.TERMINAL:
+        logger.info(
+            "Job %s skipped: already %s", job_id, job.status if job else "deleted"
+        )
+        return 0
     jobs.update_status(job_id, jobs.RUNNING)
     logger.info("Job %s RUNNING: %s (county=%s)", job_id, address, county or "auto")
     scraper_logger = logging.getLogger("survey_art")
@@ -350,10 +378,17 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     try:
         with tempfile.TemporaryDirectory(prefix=f"job-{job_id}-") as tmp:
             try:
-                saved, err, cost, in_tok, out_tok = await asyncio.wait_for(
-                    run_async(address, tmp_dir=Path(tmp), quiet=True, county_override=county),
-                    timeout=_JOB_TIMEOUT_SECONDS,
+                saved, err, cost, in_tok, out_tok = await _run_unless_cancelled(
+                    job_id,
+                    asyncio.wait_for(
+                        run_async(address, tmp_dir=Path(tmp), quiet=True, county_override=county),
+                        timeout=_JOB_TIMEOUT_SECONDS,
+                    ),
                 )
+            except _JobCancelledError:
+                narration.info("This search was cancelled.")
+                logger.info("Job %s CANCELLED: scrape stopped", job_id)
+                return 0
             except asyncio.TimeoutError:
                 jobs.update_status(
                     job_id,

@@ -281,9 +281,15 @@ read it before modifying scraper logic. Key points:
   nor cross-reference harvesting surfaced still gets downloaded. Deduplicated against
   the whole run's `known_receptions`; results land in `overview.json` under
   `section_township_range_search`, separate from the route's own results section.
-- **GLO original survey of record** and **county + state road right-of-way** — not yet
-  implemented. Both would run independently of which research route fired; see
+- **GLO original survey of record** (implemented): runs unconditionally near the end of
+  `scrape()` whenever the parcel has a Township and Range, independent of which research
+  route fired. Uses a `browser-use` agent against `glorecords.blm.gov` (no address or
+  reception-number search exists there) to pull the original 6th P.M. township survey plat,
+  its field notes, and any indexed federal land patent. See
+  [`scrapers/glo_records.py`](apps/worker/survey_art/scrapers/glo_records.py) and
   [docs/weld_county_sop.md](docs/weld_county_sop.md#phase-4--glo-original-survey-of-record).
+- **County + state road right-of-way** — not yet implemented; see
+  [docs/weld_county_sop.md](docs/weld_county_sop.md#phase-5--county--state-road-right-of-way).
 
 Document type codes (`SURV`, `WD`, `SWD`, `QCD`, `EASE`, `ROW`, etc.) and the
 Decision Matrix routing are defined in the SOP and mirrored in
