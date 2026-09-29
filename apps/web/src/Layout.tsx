@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
 import {
+  AccordionChevron,
   ActionIcon,
   Box,
   Button,
   Center,
+  CloseIcon,
   Container,
   Group,
   Loader,
@@ -166,7 +168,7 @@ export function Layout({
         ) : propertyHistory.length === 0 ? (
           <Text c="dimmed" size="sm">No past searches yet.</Text>
         ) : (
-          <ScrollArea style={{ flex: 1 }}>
+          <ScrollArea style={{ flex: 1 }} offsetScrollbars>
             <Stack gap={4}>
               {propertyHistory.map(({ key, latest, runs }) => {
                 const isExpanded = expanded.has(key);
@@ -203,11 +205,20 @@ export function Layout({
                       </UnstyledButton>
                       {runs.length > 1 && (
                         <ActionIcon
-                          variant="subtle"
+                          variant="light"
+                          size="lg"
+                          style={{ alignSelf: "center" }}
                           onClick={() => toggleExpanded(key)}
                           aria-label={isExpanded ? "Collapse runs" : "Expand runs"}
+                          aria-expanded={isExpanded}
                         >
-                          {isExpanded ? "▾" : "▸"}
+                          <AccordionChevron
+                            size={18}
+                            style={{
+                              transform: isExpanded ? "none" : "rotate(-90deg)",
+                              transition: "transform 150ms ease",
+                            }}
+                          />
                         </ActionIcon>
                       )}
                     </Group>
@@ -236,14 +247,15 @@ export function Layout({
                               </Group>
                             </UnstyledButton>
                             <ActionIcon
-                              variant="subtle"
+                              variant="light"
                               color="red"
-                              size="sm"
+                              size="md"
+                              style={{ alignSelf: "center" }}
                               loading={deletingRunId === r.jobId}
                               onClick={() => deleteRun(r.jobId)}
                               aria-label="Delete this run"
                             >
-                              ×
+                              <CloseIcon size="14" />
                             </ActionIcon>
                           </Group>
                         ))}
@@ -269,7 +281,7 @@ export function Layout({
         ) : savedProperties.length === 0 ? (
           <Text c="dimmed" size="sm">No saved properties yet.</Text>
         ) : (
-          <ScrollArea style={{ flex: 1 }}>
+          <ScrollArea style={{ flex: 1 }} offsetScrollbars>
             <Stack gap={4}>
               {savedProperties.map((p) => (
                 <UnstyledButton
