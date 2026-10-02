@@ -69,6 +69,12 @@ function groupRelatedEntries(entries: [string, unknown][]): [string, unknown][] 
   return entries;
 }
 
+/** A table cell: nested lists/records (a highway's plan sets, Phase 5's
+ * per-source lists) render as their own table rather than a JSON string. */
+function NestedValue({ value }: { value: unknown }) {
+  return value !== null && typeof value === "object" ? <MetadataValue value={value} /> : <CellValue value={value} />;
+}
+
 /** Renders one overview.json value: a list of records as a table, a flat
  * object as a key/value table, anything else as plain text. */
 function MetadataValue({ value }: { value: unknown }) {
@@ -86,7 +92,7 @@ function MetadataValue({ value }: { value: unknown }) {
               {value.map((row, i) => (
                 <Table.Tr key={i}>
                   {keys.map((k) => (
-                    <Table.Td key={k} style={{ minWidth: 120 }}><CellValue value={(row as Record<string, unknown>)[k]} /></Table.Td>
+                    <Table.Td key={k} style={{ minWidth: 120 }}><NestedValue value={(row as Record<string, unknown>)[k]} /></Table.Td>
                   ))}
                 </Table.Tr>
               ))}
@@ -111,7 +117,7 @@ function MetadataValue({ value }: { value: unknown }) {
             {entries.map(([k, v]) => (
               <Table.Tr key={k}>
                 <Table.Td style={{ fontWeight: 500, whiteSpace: "nowrap", verticalAlign: "top" }}>{titleCase(k)}</Table.Td>
-                <Table.Td style={{ minWidth: 160 }}><CellValue value={v} /></Table.Td>
+                <Table.Td style={{ minWidth: 160 }}><NestedValue value={v} /></Table.Td>
               </Table.Tr>
             ))}
           </Table.Tbody>
