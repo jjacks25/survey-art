@@ -77,19 +77,17 @@ pipeline.py         Dispatches to county-specific scraper via COUNTY_SCRAPERS di
 | Module | Purpose |
 |--------|---------|
 | `settings.py` | Pydantic settings — lazy `get_settings()`; LLM model + county portal credentials |
-| `llm.py` | LLM factory for the browser-use scrapers |
+| `llm.py` | Runs browser-use agents on Bedrock and collects what they download |
 | `document_filter.py` | Document types and file formats relevant to land surveying |
 | `geocode.py` | US Census Bureau geocoder → `GeocodedAddress` + `County` |
-| `county_sites.py` | Static registry of supported county URLs |
 | `scrapers/` | County-specific scrape logic |
 | `pipeline.py` | Orchestration: geocode → dispatch → download |
-| `download.py` | Async file downloader with semaphore concurrency |
+| `download.py` | Output-dir layout + async URL downloader with semaphore concurrency |
 | `overview.py` | Incremental `overview.json` writer (per-phase, crash-safe) |
 | `id_extraction.py` | Reads a survey PDF for the record IDs it cites — text layer if there is one, else Bedrock over tiled page images |
 | `worker.py` | AWS job entrypoint (Fargate one-shot or local SQS poll) |
 | `costs.py` | All-in per-run cost estimate (one line per AWS service) for the Run Details tab |
 | `console.py` | Rich terminal UI helpers |
-| `types.py` | Shared dataclasses (`DocumentLink`) |
 
 > Note the two distinct settings accessors: `survey_art.settings.get_settings()` (scraper
 > config: model, county logins) and `survey_shared.config.get_shared_settings()` (AWS
@@ -99,7 +97,7 @@ pipeline.py         Dispatches to county-specific scraper via COUNTY_SCRAPERS di
 
 ## County data sources
 
-Portal URLs live in `county_sites.py`. What's recorded here is the non-obvious part: which
+Portal URLs live as constants at the top of each `scrapers/*.py`. What's recorded here is the non-obvious part: which
 identifier joins the systems together, and which quirks have already bitten us.
 
 ### Weld County
@@ -115,8 +113,7 @@ identifier joins the systems together, and which quirks have already bitten us.
 Notes:
 - **Reception Numbers are the canonical lookup key** — collect them from the property
   report before touching the recorder portal.
-- The old Java eRecording site (`erecording.weld.gov`) was replaced by the Tyler portal;
-  the `WELD_ERECORDING_*` settings are vestigial.
+- The old Java eRecording site (`erecording.weld.gov`) was replaced by the Tyler portal.
 - Tyler owner-name search wants "Last Name, First Name" for individuals, full name for
   businesses.
 - [`docs/weld_county_sop.md`](docs/weld_county_sop.md) is the human-validated spec — read it
@@ -157,7 +154,7 @@ Notes:
 ## Document Types
 
 Document types and accepted file formats are defined centrally in `document_filter.py` as
-`SURVEY_DOCUMENT_TYPES` and `SURVEY_FILE_EXTENSIONS`. `DocumentFilter` turns them into a
+`SURVEY_DOCUMENT_TYPES` and `SURVEY_FILE_EXTENSIONS`. `prompt_fragment()` turns them into a
 prompt fragment injected into every browser-use agent task. To change what gets collected,
 edit those two constants — no scraper code changes needed.
 

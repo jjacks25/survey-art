@@ -17,41 +17,7 @@ from survey_art.scrapers.weld_county import (
 )
 from survey_art.settings import get_settings
 
-
-class _FakePage:
-    """Stands in for the Playwright page driven by _run_advanced_search.
-
-    `rows` is either a flat list (returned for every search) or a callable
-    taking the filled-in form, so a test can vary results by date window.
-    """
-
-    def __init__(self, rows):
-        self._rows = rows
-        self.form: dict[str, str] = {}
-        self.searches: list[dict[str, str]] = []
-        self.clicks: list[str] = []
-        self.url = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
-
-    async def goto(self, *a, **k):
-        pass
-
-    async def click(self, *a, **k):
-        if a and a[0] == "button:has-text('Yes - Continue')":
-            raise Exception("no dialog")
-        self.clicks.append(a[0] if a else "")
-
-    async def fill(self, selector, value, *a, **k):
-        self.form[selector] = value
-
-    async def wait_for_load_state(self, *a, **k):
-        pass
-
-    async def wait_for_timeout(self, *a, **k):
-        pass
-
-    async def evaluate(self, *a, **k):
-        self.searches.append(dict(self.form))
-        return self._rows(self.form) if callable(self._rows) else self._rows
+from .fakes import FakeSearchPage
 
 
 def _rows(*receptions: str, doc_type: str = "WARRANTY DEED") -> list[dict]:
@@ -64,7 +30,7 @@ def _rows(*receptions: str, doc_type: str = "WARRANTY DEED") -> list[dict]:
 @pytest.mark.asyncio
 async def test_returns_unseen_rows_tagged_with_str_role():
     parcel = ParcelInfo(account="R123", section="15", township="5N", range_="67W")
-    page = _FakePage(
+    page = FakeSearchPage(
         [
             {"reception": "1111", "doc_type": "WARRANTY DEED", "rec_date": "01/01/2020"},
             {"reception": "2222", "doc_type": "LIEN", "rec_date": "02/02/2021"},
@@ -90,7 +56,7 @@ async def test_downloads_the_survey_relevant_end_of_a_big_section_first():
     those instead of the section's 8 surveys would be the wrong 250.
     """
     parcel = ParcelInfo(account="R123", section="15", township="5N", range_="67W")
-    page = _FakePage(
+    page = FakeSearchPage(
         _rows("1", "2", doc_type="DEED OF TRUST")
         + _rows("3", doc_type="SURVEY")
         + _rows("4", doc_type="RIGHT OF WAY EASEMENT")
@@ -125,7 +91,7 @@ async def test_a_capped_search_is_split_by_date_until_it_is_not():
             return _rows(*(str(i) for i in range(_RESULT_ROW_CAP)))
         return _rows(f"row{len(calls)}")
 
-    page = _FakePage(rows_for)
+    page = FakeSearchPage(rows_for)
 
     found = await _search_all_rows(page, section="15")
 
@@ -142,7 +108,7 @@ async def test_each_search_clears_the_one_before_it():
     """Criteria live on the server, not in the form, so every search has to
     clear the last one — blank inputs are not enough. Measured: a section search
     after a name search returns 4 rows without the clear and 100 with it."""
-    page = _FakePage([])
+    page = FakeSearchPage([])
 
     await _run_advanced_search(page, search_name="PETROLEUM EXPLORATION & MANAGEMENT LLC")
     await _run_advanced_search(page, section="32", township="5N", range_="65W")
@@ -165,7 +131,7 @@ async def test_each_search_clears_the_one_before_it():
 @pytest.mark.asyncio
 async def test_skips_search_when_str_incomplete():
     parcel = ParcelInfo(account="R123")
-    assert await _section_township_range_search(_FakePage([]), parcel, set()) == ([], [])
+    assert await _section_township_range_search(FakeSearchPage([]), parcel, set()) == ([], [])
 
 
 @pytest.mark.asyncio
@@ -180,7 +146,7 @@ async def test_book_page_citation_only_resolves_to_a_hit_from_the_cited_year():
             {"reception": "2526395", "doc_type": "DEED OF TRUST", "rec_date": "12/26/1996 11:49 AM"}
         ],
     }
-    page = _FakePage(lambda form: by_book.get(form["#field_BookPageID_DOT_Book"], []))
+    page = FakeSearchPage(lambda form: by_book.get(form["#field_BookPageID_DOT_Book"], []))
     items = [
         ExtractedId(
             id="Book 233 Page 185",
@@ -207,7 +173,7 @@ async def test_book_page_citation_only_resolves_to_a_hit_from_the_cited_year():
 async def test_a_repeated_sweep_reuses_the_first_one():
     """The easement scan and the section scan sweep the same S/T/R in one run;
     the second must not re-drive the recorder's form."""
-    page = _FakePage(_rows("1", "2"))
+    page = FakeSearchPage(_rows("1", "2"))
 
     first = await _search_all_rows(page, section="32", township="5N", range_="65W")
     searches = len(page.searches)

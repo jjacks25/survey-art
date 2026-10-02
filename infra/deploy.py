@@ -214,7 +214,11 @@ def _failure_reasons(cfn, stack_name: str) -> list[str]:
 
 
 def deploy_stack(
-    cfn, stack_name: str, template_body: str, parameters: list[dict], capabilities: list[str] | None = None
+    cfn,
+    stack_name: str,
+    template_body: str,
+    parameters: list[dict],
+    capabilities: list[str] | None = None,
 ) -> None:
     """Create-or-update a stack by raw TemplateBody.
 
@@ -359,9 +363,7 @@ def _auto_params(cfn, project: str, name: str) -> dict[str, str]:
     return {"CallbackUrls": f"{cf_url}/", "LogoutUrls": f"{cf_url}/"}
 
 
-def load_params(
-    cfn, name: str, overrides: dict[str, str], project: str
-) -> list[dict]:
+def load_params(cfn, name: str, overrides: dict[str, str], project: str) -> list[dict]:
     """Merge auto-detected values, params/{name}.json (if present), and CLI overrides
     — in that precedence order, so autodetection never fights an explicit choice.
     ProjectName is always set."""
@@ -388,7 +390,9 @@ def deploy_one(
     status = stack_status(cfn, stack_name)
 
     if status in TERMINAL_FAILURE_STATUSES:
-        reasons = "\n    ".join(_failure_reasons(cfn, stack_name)) or "(no resource-level reason found)"
+        reasons = (
+            "\n    ".join(_failure_reasons(cfn, stack_name)) or "(no resource-level reason found)"
+        )
         raise RuntimeError(
             f"[{stack_name}] is stuck in {status} from a previous failed deploy — "
             "CloudFormation can't update a stack in this state.\n"
@@ -397,7 +401,9 @@ def deploy_one(
             f"(`aws cloudformation delete-stack --stack-name {stack_name}`) and re-run."
         )
     if status in IN_PROGRESS_STATUSES:
-        raise RuntimeError(f"[{stack_name}] is currently {status}. Wait for it to settle and re-run.")
+        raise RuntimeError(
+            f"[{stack_name}] is currently {status}. Wait for it to settle and re-run."
+        )
 
     change_set_type = "CREATE" if status in (None, REVIEW_STATUS) else "UPDATE"
 

@@ -14,14 +14,7 @@ from survey_art.scrapers.weld_county import _DocRecord, _expand_cross_references
 
 
 def _doc(reception: str, doc_type: str = "EASEMENT") -> _DocRecord:
-    return _DocRecord(
-        reception=reception,
-        rec_date="",
-        doc_type=doc_type,
-        grantor="",
-        grantee="",
-        url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
-    )
+    return _DocRecord(reception, doc_type=doc_type)
 
 
 class _FakeOverview:
@@ -33,6 +26,17 @@ class _FakeOverview:
 
     def get(self, section: str, default=None):
         return self.sections.get(section, default)
+
+
+def _recording_download(calls: list[list[str]]):
+    """A `_download_documents` stand-in that "saves" every target and records
+    each batch of receptions it was asked for."""
+
+    async def fake_download(targets, dest):
+        calls.append([doc.reception for _, doc in targets])
+        return [(role, doc, [Path(doc.reception)]) for role, doc in targets]
+
+    return fake_download
 
 
 @pytest.fixture(autouse=True)
@@ -60,12 +64,7 @@ async def test_cycle_does_not_infinite_loop_or_double_extract(monkeypatch):
         )
 
     download_calls: list[list[str]] = []
-
-    async def fake_download(address, targets, doc_filter, dest, *, username, password):
-        receptions = [doc.reception for _, doc in targets]
-        download_calls.append(receptions)
-        results = [(role, doc, [Path(doc.reception)]) for role, doc in targets]
-        return results, 0.0, 0, 0
+    fake_download = _recording_download(download_calls)
 
     monkeypatch.setattr("survey_art.scrapers.weld_county.extract_document_ids", fake_extract)
     monkeypatch.setattr("survey_art.scrapers.weld_county._download_documents", fake_download)
@@ -74,9 +73,7 @@ async def test_cycle_does_not_infinite_loop_or_double_extract(monkeypatch):
     initial = [("alta", _doc("1"), [Path("1")])]
     known = {"1"}
 
-    new_results, in_tok, out_tok = await _expand_cross_references(
-        "123 Main St", None, Path("/tmp"), ov, initial, known, username="u", password="p"
-    )
+    new_results, in_tok, out_tok = await _expand_cross_references(Path("/tmp"), ov, initial, known)
 
     # Extracted each of 1, 2, 3 exactly once, in discovery order, even though
     # doc 2 re-cites doc 1.
@@ -108,18 +105,14 @@ async def test_a_whole_depth_level_is_fetched_in_one_call(monkeypatch):
         )
 
     download_calls: list[list[str]] = []
-
-    async def fake_download(address, targets, doc_filter, dest, *, username, password):
-        download_calls.append([doc.reception for _, doc in targets])
-        return [(role, doc, [Path(doc.reception)]) for role, doc in targets], 0.0, 0, 0
+    fake_download = _recording_download(download_calls)
 
     monkeypatch.setattr("survey_art.scrapers.weld_county.extract_document_ids", fake_extract)
     monkeypatch.setattr("survey_art.scrapers.weld_county._download_documents", fake_download)
 
     initial = [("alta", _doc("a"), [Path("a")]), ("vesting_deed", _doc("b"), [Path("b")])]
     new_results, _in_tok, _out_tok = await _expand_cross_references(
-        "123 Main St", None, Path("/tmp"), _FakeOverview(), initial, {"a", "b"},
-        username="u", password="p",
+        Path("/tmp"), _FakeOverview(), initial, {"a", "b"}
     )
 
     assert download_calls == [["c", "d"]]
@@ -138,19 +131,13 @@ async def test_stops_fetching_at_the_depth_limit(monkeypatch):
         )
 
     levels: list[list[str]] = []
-
-    async def fake_download(address, targets, doc_filter, dest, *, username, password):
-        levels.append([doc.reception for _, doc in targets])
-        return [(role, doc, [Path(doc.reception)]) for role, doc in targets], 0.0, 0, 0
+    fake_download = _recording_download(levels)
 
     monkeypatch.setattr("survey_art.scrapers.weld_county.extract_document_ids", fake_extract)
     monkeypatch.setattr("survey_art.scrapers.weld_county._download_documents", fake_download)
 
     ov = _FakeOverview()
-    await _expand_cross_references(
-        "123 Main St", None, Path("/tmp"), ov, [("alta", _doc("0"), [Path("0")])], {"0"},
-        username="u", password="p",
-    )
+    await _expand_cross_references(Path("/tmp"), ov, [("alta", _doc("0"), [Path("0")])], {"0"})
 
     assert len(levels) == weld_county._MAX_CROSS_REFERENCE_DEPTH
     assert ov.sections["limits"] == {"cross_reference_depth_limit": True}
@@ -170,9 +157,7 @@ async def test_skips_extraction_for_failed_downloads(monkeypatch):
     ov = _FakeOverview()
     initial = [("exception", _doc("9"), [])]  # failed download: no paths
 
-    new_results, in_tok, out_tok = await _expand_cross_references(
-        "123 Main St", None, Path("/tmp"), ov, initial, {"9"}, username="u", password="p"
-    )
+    new_results, in_tok, out_tok = await _expand_cross_references(Path("/tmp"), ov, initial, {"9"})
 
     assert extract_calls == []
     assert new_results == []

@@ -53,30 +53,12 @@ class SharedSettings(BaseSettings):
     def public_endpoint_url(self) -> str | None:
         return self.aws_public_endpoint_url or None
 
-    def require_storage_bucket(self) -> str:
-        if not self.storage_bucket:
-            raise RuntimeError("STORAGE_BUCKET is not set")
-        return self.storage_bucket
-
-    def require_jobs_table(self) -> str:
-        if not self.jobs_table:
-            raise RuntimeError("JOBS_TABLE is not set")
-        return self.jobs_table
-
-    def require_saved_properties_table(self) -> str:
-        if not self.saved_properties_table:
-            raise RuntimeError("SAVED_PROPERTIES_TABLE is not set")
-        return self.saved_properties_table
-
-    def require_job_queue_url(self) -> str:
-        if not self.job_queue_url:
-            raise RuntimeError("JOB_QUEUE_URL is not set")
-        return self.job_queue_url
-
-    def require_cluster_arn(self) -> str:
-        if not self.cluster_arn:
-            raise RuntimeError("CLUSTER_ARN is not set")
-        return self.cluster_arn
+    def require(self, name: str) -> str:
+        """The value of setting `name`, failing fast if this component needs it unset."""
+        value = getattr(self, name)
+        if not value:
+            raise RuntimeError(f"{name.upper()} is not set")
+        return value
 
 
 @lru_cache(maxsize=1)

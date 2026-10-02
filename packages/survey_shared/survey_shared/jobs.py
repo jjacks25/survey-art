@@ -2,8 +2,8 @@
 
 The jobs table is a single-key table (partition key ``jobId``). Status transitions:
 ``PENDING`` (created by the API) → ``RUNNING`` → ``COMPLETED`` | ``FAILED`` (worker).
-Result documents are stored in S3 under ``{jobId}/`` and surfaced to the UI as
-presigned GET URLs by the API.
+Result documents are stored in S3 under ``documents/{state}/{county}/{property}/``
+(see ``upload_documents()``) and surfaced to the UI as presigned GET URLs by the API.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from botocore.exceptions import ClientError
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from survey_shared import aws
 from survey_shared.config import get_shared_settings
@@ -97,33 +97,13 @@ class Job(BaseModel):
     # item cap on its own. get_job() resolves this into `metadata` for
     # callers; from_item()/to_item() otherwise treat it as an opaque field.
     metadata_key: str | None = Field(default=None, alias="metadataKey")
-    location: dict | None = None
+    location: dict[str, float] | None = None
     doc_prefix: str | None = Field(default=None, alias="docPrefix")
-    # Estimated cost breakdown for this run (see worker.py:run_job) — Bedrock is a real
-    # dollar figure from browser-use's usage accounting; Fargate is estimated from wall
-    # clock time against the task definition's known vCPU/memory and a flat on-demand
-    # rate (no AWS Cost Explorer integration — that lags 24-48h and can't back a live UI).
-    bedrock_cost_usd: float | None = Field(default=None, alias="bedrockCostUsd")
-    bedrock_input_tokens: int | None = Field(default=None, alias="bedrockInputTokens")
-    bedrock_output_tokens: int | None = Field(default=None, alias="bedrockOutputTokens")
-    fargate_cost_usd: float | None = Field(default=None, alias="fargateCostUsd")
+    # Wall-clock task runtime, which the Run Details tab also shows as run time.
     fargate_seconds: float | None = Field(default=None, alias="fargateSeconds")
-    # The full per-service breakdown (see apps/worker/survey_art/costs.py). The four
-    # fields above stay because job records written before this existed still carry
-    # them and nothing migrates DynamoDB items — the frontend prefers `costs` and
-    # falls back to them. `usd` is typed, so DynamoDB's Decimals coerce back to float
-    # on read rather than reaching the JSON encoder.
+    # The per-service cost breakdown (see apps/worker/survey_art/costs.py). `usd`
+    # is typed, so DynamoDB's Decimals coerce back to float on read.
     costs: list[CostLine] = Field(default_factory=list)
-
-    @field_validator("logs", mode="before")
-    @classmethod
-    def _coerce_legacy_logs(cls, v):
-        # Job records written before `logs` carried a `kind` are plain strings
-        # (DynamoDB items don't migrate themselves) — wrap them as "detail" so
-        # an old, still-live job record keeps loading instead of 500ing.
-        if not v:
-            return v
-        return [{"message": item} if isinstance(item, str) else item for item in v]
 
     def to_item(self) -> dict:
         # Alias keys for DynamoDB; drop error when unset rather than storing null.
@@ -157,11 +137,11 @@ class SavedProperty(BaseModel):
 
 
 def _table():
-    return aws.resource("dynamodb").Table(aws.jobs_table_name())
+    return aws.resource("dynamodb").Table(get_shared_settings().require("jobs_table"))
 
 
 def _saved_properties_table():
-    return aws.resource("dynamodb").Table(aws.saved_properties_table_name())
+    return aws.resource("dynamodb").Table(get_shared_settings().require("saved_properties_table"))
 
 
 def create_job(job_id: str, address: str, county: str) -> Job:
@@ -201,72 +181,39 @@ def list_jobs(limit: int = 100) -> list[Job]:
     return jobs_[:limit]
 
 
-def update_status(
-    job_id: str,
-    status: str,
-    *,
-    error: str | None = None,
-    file_count: int | None = None,
-    metadata: dict | None = None,
-    location: dict | None = None,
-    doc_prefix: str | None = None,
-    bedrock_cost_usd: float | None = None,
-    bedrock_input_tokens: int | None = None,
-    bedrock_output_tokens: int | None = None,
-    fargate_cost_usd: float | None = None,
-    fargate_seconds: float | None = None,
-    costs: list[dict] | None = None,
-) -> None:
-    """Set status, unless the job was already cancelled — a cancel wins over a
-    worker that finishes (or fails) after the user gave up on it."""
-    expr = ["#s = :s", "updatedAt = :u"]
-    names = {"#s": "status"}
-    values: dict = {":s": status, ":u": int(time.time())}
-    if error is not None:
-        expr.append("#e = :e")
-        names["#e"] = "error"
-        values[":e"] = error
-    if file_count is not None:
-        expr.append("fileCount = :fc")
-        values[":fc"] = file_count
-    if metadata is not None:
-        expr.append("metadataKey = :mk")
-        values[":mk"] = upload_metadata(job_id, metadata)
-    if location is not None:
-        expr.append("#l2 = :loc")
-        names["#l2"] = "location"
-        values[":loc"] = location
-    if doc_prefix is not None:
-        expr.append("docPrefix = :dp")
-        values[":dp"] = doc_prefix
-    if bedrock_cost_usd is not None:
-        expr.append("bedrockCostUsd = :bcu")
-        values[":bcu"] = Decimal(str(bedrock_cost_usd))
-    if bedrock_input_tokens is not None:
-        expr.append("bedrockInputTokens = :bit")
-        values[":bit"] = bedrock_input_tokens
-    if bedrock_output_tokens is not None:
-        expr.append("bedrockOutputTokens = :bot")
-        values[":bot"] = bedrock_output_tokens
-    if fargate_cost_usd is not None:
-        expr.append("fargateCostUsd = :fcu")
-        values[":fcu"] = Decimal(str(fargate_cost_usd))
-    if fargate_seconds is not None:
-        expr.append("fargateSeconds = :fs")
-        values[":fs"] = Decimal(str(fargate_seconds))
-    if costs is not None:
-        # `costs` is aliased like `status`/`error`/`location` above — cheaper than
-        # checking DynamoDB's reserved-word list every time this attribute is touched.
-        expr.append("#c = :c")
-        names["#c"] = "costs"
-        # DynamoDB rejects native floats; go through str() so the decimal value is
-        # what was computed, not its binary-float neighbour (same rule as `location`).
-        values[":c"] = [{**line, "usd": Decimal(str(line["usd"]))} for line in costs]
+def _dynamo_value(value):
+    """DynamoDB rejects native floats; go through str() so the stored decimal is
+    what was computed, not its binary-float neighbour."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, list):
+        return [_dynamo_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _dynamo_value(v) for k, v in value.items()}
+    return value
+
+
+def update_status(job_id: str, status: str, **fields) -> None:
+    """Set status plus any other `Job` fields given by their Python names
+    (`file_count=3`, `costs=[...]`), unless the job was already cancelled — a
+    cancel wins over a worker that finishes (or fails) after the user gave up
+    on it. `metadata` is uploaded to S3 and stored as `metadataKey` instead
+    (see `upload_metadata()`)."""
+    if (metadata := fields.pop("metadata", None)) is not None:
+        fields["metadata_key"] = upload_metadata(job_id, metadata)
+    fields = {"status": status, "updated_at": int(time.time()), **fields}
+    # Every attribute goes through a name placeholder, so DynamoDB's reserved
+    # words (status, error, location, costs, ...) never need special-casing.
+    names, values, sets = {}, {}, []
+    for i, (name, value) in enumerate(f for f in fields.items() if f[1] is not None):
+        names[f"#a{i}"] = Job.model_fields[name].alias or name
+        values[f":v{i}"] = _dynamo_value(value)
+        sets.append(f"#a{i} = :v{i}")
     try:
         _table().update_item(
             Key={"jobId": job_id},
-            UpdateExpression="SET " + ", ".join(expr),
-            ConditionExpression="attribute_not_exists(#s) OR #s <> :cancelled",
+            UpdateExpression="SET " + ", ".join(sets),
+            ConditionExpression="attribute_not_exists(#a0) OR #a0 <> :cancelled",
             ExpressionAttributeNames=names,
             ExpressionAttributeValues={**values, ":cancelled": CANCELLED},
         )
@@ -293,14 +240,6 @@ def append_log(
         )
     except ClientError:
         pass
-
-
-def set_task_arn(job_id: str, task_arn: str) -> None:
-    _table().update_item(
-        Key={"jobId": job_id},
-        UpdateExpression="SET taskArn = :t",
-        ExpressionAttributeValues={":t": task_arn},
-    )
 
 
 def cancel_job(job_id: str, *, _attempts: int = 3) -> Job | None:
@@ -568,10 +507,7 @@ def upload_map_image(job_id: str, path: Path) -> str | None:
     bucket = aws.storage_bucket()
     key = f"{SCRATCH_PREFIX}/maps/{job_id}.png"
     s3.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": "image/png"})
-    url = s3.generate_presigned_url(
-        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=PRESIGN_TTL_SECONDS
-    )
-    return _make_browser_reachable(url)
+    return _presign(key)
 
 
 def _make_browser_reachable(url: str) -> str:
@@ -586,58 +522,47 @@ def _make_browser_reachable(url: str) -> str:
     return urlunsplit((target.scheme, target.netloc, signed.path, signed.query, signed.fragment))
 
 
+def _presign(key: str, **params) -> str:
+    url = aws.client("s3").generate_presigned_url(
+        "get_object",
+        Params={"Bucket": aws.storage_bucket(), "Key": key, **params},
+        ExpiresIn=PRESIGN_TTL_SECONDS,
+    )
+    return _make_browser_reachable(url)
+
+
 def list_result_files(prefix: str) -> list[dict]:
     """Return presigned download URLs for a property's documents (see
     ``Job.doc_prefix`` / ``upload_documents()``)."""
-    s3 = aws.client("s3")
-    bucket = aws.storage_bucket()
-    resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{DOCUMENTS_PREFIX}/{prefix}/")
-    thumbnail_names = {
-        obj["Key"].rsplit("/", 1)[-1][: -len(".jpg")]
-        for obj in resp.get("Contents", [])
-        if f"/{THUMBNAILS_SUBPREFIX}/" in obj["Key"]
-    }
+    base = f"{DOCUMENTS_PREFIX}/{prefix}/"
+    thumbs = f"{base}{THUMBNAILS_SUBPREFIX}/"
+    pages = (
+        aws.client("s3")
+        .get_paginator("list_objects_v2")
+        .paginate(Bucket=aws.storage_bucket(), Prefix=base)
+    )
+    objects = [obj for page in pages for obj in page.get("Contents", [])]
+    thumbnail_keys = {obj["Key"] for obj in objects if obj["Key"].startswith(thumbs)}
     files: list[dict] = []
-    for obj in resp.get("Contents", []):
+    for obj in objects:
         key = obj["Key"]
-        if f"/{THUMBNAILS_SUBPREFIX}/" in key:
+        if key.startswith(thumbs):
             continue
         name = key.rsplit("/", 1)[-1]
-        thumbnail_url = None
-        if name in thumbnail_names:
-            thumb_key = f"{DOCUMENTS_PREFIX}/{prefix}/{THUMBNAILS_SUBPREFIX}/{name}.jpg"
-            thumbnail_url = _make_browser_reachable(
-                s3.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": bucket, "Key": thumb_key},
-                    ExpiresIn=PRESIGN_TTL_SECONDS,
-                )
-            )
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": key},
-            ExpiresIn=PRESIGN_TTL_SECONDS,
-        )
-        # Same object, signed a second time with an attachment disposition. The
-        # plain `url` has to stay inline — the Results tab previews PDFs in an
-        # iframe — so the download button needs its own URL rather than a flag on
-        # this one. `filename` keeps S3's key out of the saved file's name.
-        download_url = s3.generate_presigned_url(
-            "get_object",
-            Params={
-                "Bucket": bucket,
-                "Key": key,
-                "ResponseContentDisposition": f'attachment; filename="{name}"',
-            },
-            ExpiresIn=PRESIGN_TTL_SECONDS,
-        )
+        thumb_key = f"{thumbs}{name}.jpg"
         files.append(
             {
                 "name": name,
                 "size": obj.get("Size", 0),
-                "url": _make_browser_reachable(url),
-                "downloadUrl": _make_browser_reachable(download_url),
-                "thumbnailUrl": thumbnail_url,
+                "url": _presign(key),
+                # Same object, signed a second time with an attachment
+                # disposition. The plain `url` has to stay inline — the Results
+                # tab previews PDFs in an iframe — so the download button needs
+                # its own URL. `filename` keeps S3's key out of the saved name.
+                "downloadUrl": _presign(
+                    key, ResponseContentDisposition=f'attachment; filename="{name}"'
+                ),
+                "thumbnailUrl": _presign(thumb_key) if thumb_key in thumbnail_keys else None,
             }
         )
     return files

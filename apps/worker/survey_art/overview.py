@@ -56,33 +56,6 @@ class Overview:
         self._touch()
         self.save()
 
-    def append_to(self, section: str, value: dict) -> None:
-        """Append `value` to a list section (creating the list if needed)."""
-        existing = self.data.setdefault(section, [])
-        if not isinstance(existing, list):
-            raise TypeError(f"Cannot append to non-list section {section!r}")
-        existing.append(value)
-        self._touch()
-        self.save()
-
-    def update_list_item(
-        self, section: str, match_key: str, match_value: str, updates: dict
-    ) -> bool:
-        """Find the dict in list `section` where `match_key == match_value` and merge `updates` into it.
-
-        Returns True if a match was found and updated.
-        """
-        items = self.data.get(section, [])
-        if not isinstance(items, list):
-            return False
-        for item in items:
-            if isinstance(item, dict) and item.get(match_key) == match_value:
-                item.update(updates)
-                self._touch()
-                self.save()
-                return True
-        return False
-
     def get(self, section: str, default: Any = None) -> Any:
         return self.data.get(section, default)
 

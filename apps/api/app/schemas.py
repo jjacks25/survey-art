@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from survey_shared.jobs import LogEntry
+from survey_shared.jobs import Job
 
 
 class CreateJobRequest(BaseModel):
@@ -31,24 +31,15 @@ class KmzIdentifyResponse(BaseModel):
     parcels: list[KmzParcel] = []
 
 
-class JobResponse(BaseModel):
-    jobId: str
-    address: str
-    county: str
-    status: str
-    createdAt: int
-    updatedAt: int
-    fileCount: int
-    error: str | None = None
-    logs: list[LogEntry] = []
-    metadata: dict | None = None
-    location: dict | None = None
-    docPrefix: str | None = None
-    bedrockCostUsd: float | None = None
-    bedrockInputTokens: int | None = None
-    bedrockOutputTokens: int | None = None
-    fargateCostUsd: float | None = None
-    fargateSeconds: float | None = None
+class JobResponse(Job):
+    """A full job record, serialized by its DynamoDB/JSON aliases (`jobId`,
+    `createdAt`, ...) — the model *is* `survey_shared.jobs.Job`, so a field added
+    there reaches the frontend without a second copy here. Internal storage
+    details are excluded from the response."""
+
+    metadata_key: str | None = Field(default=None, alias="metadataKey", exclude=True)
+    task_arn: str | None = Field(default=None, alias="taskArn", exclude=True)
+    expires_at: int | None = Field(default=None, alias="expiresAt", exclude=True)
 
 
 class JobSummary(BaseModel):

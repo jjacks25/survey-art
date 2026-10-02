@@ -274,39 +274,22 @@ The two inputs feeding the biggest lines:
 
 - **Bedrock cost — a real dollar figure.** `run_async()` (`pipeline.py`) returns
   `(saved, err, cost, in_tok, out_tok)` all the way up from whichever scraper ran —
-  every county scraper's `scrape()` sums `llm.agent_cost()` (browser-use's own
+  every county scraper's `scrape()` sums what `llm.run_agent()` reports (browser-use's own
   `agent.history.usage`, real per-call Bedrock pricing) across every LLM call it makes,
   plus, for Weld, `id_extraction.py`'s raw `bedrock-runtime.converse()` token counts for
   cross-reference ID extraction. This number needs no maintenance when infra changes —
   it comes from the model provider's own usage accounting, not a local estimate.
 - **Fargate cost — an estimate, not billed usage.** There is deliberately no AWS Cost
   Explorer/CUR integration here: tag-based cost allocation reports lag 24-48h, which
-  can't back a same-run UI. Instead, `_cost_fields()` in `worker.py` takes the task's own
-  wall-clock runtime (`time.time()` at the top of `run_job()` to the moment the job
-  reaches a terminal state) and multiplies by a **hardcoded flat on-demand rate**:
-
-  ```python
-  _FARGATE_VCPU_HOUR_USD = 0.04048   # us-west-2, Linux/x86, on-demand
-  _FARGATE_GB_HOUR_USD = 0.004445    # us-west-2, Linux/x86, on-demand
-  _FARGATE_VCPUS = 1                 # WorkerTaskDefinition: Cpu: '1024'
-  _FARGATE_MEM_GB = 4                # WorkerTaskDefinition: Memory: '4096'
-  ```
-
-  **If you change the worker's Fargate sizing or region, update these four constants to
-  match** — nothing re-derives them automatically:
-  - `WorkerTaskDefinition.Cpu`/`Memory` in `infra/cloudformation/backend.yaml` changes →
-    update `_FARGATE_VCPUS`/`_FARGATE_MEM_GB` (they're `Cpu`/1024 and `Memory`/1024).
-  - Deploying somewhere other than `us-west-2` (`infra/deploy.py`'s `DEFAULT_REGION`) →
-    look up that region's Fargate on-demand rate and update
-    `_FARGATE_VCPU_HOUR_USD`/`_FARGATE_GB_HOUR_USD` (AWS Pricing page, "Fargate", Linux/x86).
-  - Switching to Fargate Spot, ARM/Graviton, or a different launch type entirely → these
-    four constants aren't enough on their own; revisit `_cost_fields()`'s formula, not
-    just the numbers.
-
-  `Job.fargate_seconds`/`Job.fargate_cost_usd` (`packages/survey_shared/survey_shared/jobs.py`)
-  round-trip these once computed; there's no separate "recompute later" path, so a rate
-  change only affects jobs run after the deploy — historical job records keep whatever
-  rate was in effect when they ran.
+  can't back a same-run UI. Instead, `costs.estimate()` takes the task's own wall-clock
+  runtime (`time.time()` at the top of `run_job()` to the moment the job reaches a
+  terminal state) and multiplies by a **hardcoded flat on-demand rate** —
+  `_FARGATE_VCPU_HOUR`/`_FARGATE_GB_HOUR` (us-west-2, Linux/x86) times
+  `_FARGATE_VCPUS`/`_FARGATE_MEM_GB` (the `WorkerTaskDefinition`'s `Cpu`/1024 and
+  `Memory`/1024). **Nothing re-derives these** — change the task's sizing in
+  `infra/cloudformation/backend.yaml`, deploy outside us-west-2, or switch to Spot/ARM,
+  and they need updating by hand in `costs.py`. A rate change only affects jobs run
+  after the deploy; there's no "recompute later" path.
 
 - **Run time.** The frontend derives everything else from three fields the job record
   already carries — no separate timing plumbing: `fargateSeconds` (the task's own

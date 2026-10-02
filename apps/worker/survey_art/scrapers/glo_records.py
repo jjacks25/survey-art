@@ -16,18 +16,13 @@ from __future__ import annotations
 
 import logging
 import re
-import shutil
 from pathlib import Path
 
-from browser_use import Agent
-
-from survey_art.llm import agent_cost, get_llm
+from survey_art.llm import run_download_agent
 
 logger = logging.getLogger(__name__)
 
 _GLO_URL = "https://glorecords.blm.gov/default.aspx"
-
-_VALID_SUFFIXES = {".pdf", ".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 
 
 def _split_township_or_range(value: str) -> tuple[str, str]:
@@ -73,9 +68,7 @@ async def fetch_glo_records(
         f"  Use the 'Search Documents By Type' tab. Select category 'Surveys'.\n"
         f"  Under Location enter State='{state}', County='{county}'.\n"
         f"  Under Land Description enter Township='{township_label}', Range='{range_label}', "
-        f"Meridian='{meridian}'"
-        + (f", Section='{section}'" if section else "")
-        + ".\n"
+        f"Meridian='{meridian}'" + (f", Section='{section}'" if section else "") + ".\n"
         f"  Click Search. In the results, open the 'Original Survey' row for this "
         f"Township/Range.\n"
         f"  On the Survey Details page, open the 'Plat Image' tab. Use the Full Screen "
@@ -98,23 +91,4 @@ async def fetch_glo_records(
         f"and N_patents patent(s).'"
     )
 
-    agent = Agent(task=task, llm=get_llm(), use_thinking=False, calculate_cost=True)
-    await agent.run()
-    cost, in_tok, out_tok = agent_cost(agent)
-
-    local_paths = [
-        Path(p)
-        for p in (agent.available_file_paths or [])
-        if Path(p).suffix.lower() in _VALID_SUFFIXES and Path(p).exists()
-    ]
-    logger.info("GLO records: browser downloaded %d file(s)", len(local_paths))
-
-    saved: list[Path] = []
-    if local_paths:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        for src in local_paths:
-            dst = dest_dir / src.name
-            shutil.copy(src, dst)
-            saved.append(dst)
-
-    return saved, cost, in_tok, out_tok
+    return await run_download_agent(task, dest_dir)

@@ -28,23 +28,31 @@ from __future__ import annotations
 
 import logging
 import re
-import shutil
 from pathlib import Path
 
-from browser_use import Agent
-
-from survey_art.county_sites import SUPPORTED_COUNTIES
-from survey_art.document_filter import DEFAULT_FILTER, DocumentFilter
-from survey_art.download import download_dir as make_download_dir
+from survey_art.document_filter import prompt_fragment
+from survey_art.download import download_dir
 from survey_art.geocode import GeocodedAddress
-from survey_art.llm import agent_cost, get_llm
+from survey_art.llm import run_agent, run_download_agent
 from survey_art.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-_ENTRY = next(e for e in SUPPORTED_COUNTIES if e["county"] == "Denver")
-_KOFILE_LOGIN_URL = _ENTRY["urls"]["recorder"]
-_SPATIALEST_URL = _ENTRY["urls"]["assessor"]
+_KOFILE_LOGIN_URL = (
+    "https://countyfusion3.kofiletech.us/countyweb/loginDisplay.action?countyname=Denver"
+)
+_SPATIALEST_URL = "https://property.spatialest.com/co/denver"
+
+# PDFs browser-use generates itself when it intercepts print events on Kofile
+# pages (disclaimer, search results, etc.) — named after the page URL.
+_KOFILE_PAGE_FRAGMENTS = (
+    "countyfusion",
+    "kofiletech",
+    "disclaimer",
+    "searchentry",
+    "logindisplay",
+    "countyweb",
+)
 
 # Words that are too generic to use alone as a Kofile Names search term.
 # If the owner name consists only of these words the full name is used instead.
@@ -133,16 +141,13 @@ async def _get_owner_info(address: str) -> tuple[dict | None, float, int, int]:
         f"  SCHEDULE: [the account number or schedule number shown on the page]\n"
         f"  OWNER: [the current owner name shown on the page]\n"
         f"  LEGAL: [the full legal description shown on the page]\n"
-        f"  PREV_OWNER: [the previous/prior owner name if shown in sale/transfer history, else blank]\n"
+        f"  PREV_OWNER: [the previous/prior owner name if shown in sale/transfer history, "
+        f"else blank]\n"
         f"  RECEPTIONS: [any reception numbers or document numbers visible on the page,\n"
         f"               comma-separated; else blank]\n\n"
         f"Return only those five lines. No explanation, no extra text."
     )
-    agent = Agent(task=task, llm=get_llm(), use_thinking=False, calculate_cost=True)
-    result = await agent.run()
-    cost, in_tok, out_tok = agent_cost(agent)
-
-    text = str(result).strip()
+    _, text, (cost, in_tok, out_tok) = await run_agent(task)
     logger.debug("Spatialest agent raw result: %s", text)
 
     info: dict = {"schedule": "", "owner": "", "legal": "", "prev_owner": "", "receptions": ""}
@@ -181,7 +186,6 @@ async def _get_owner_info(address: str) -> tuple[dict | None, float, int, int]:
 async def _download_documents(
     address: str,
     owner_info: dict | None,
-    doc_filter: DocumentFilter,
     dest_dir: Path,
     username: str,
     password: str,
@@ -271,7 +275,6 @@ async def _download_documents(
             f"{reception_step}"
             f"{prev_owner_step}"
         )
-        dl_step = "STEP 5"
     else:
         owner = ""
         owner_block = ""
@@ -289,7 +292,6 @@ async def _download_documents(
             f"  IMPORTANT: Kofile searches party names — do NOT search by street address\n"
             f"  or street name; those searches will return unrelated results.\n\n"
         )
-        dl_step = "STEP 5"
 
     task = (
         f"You are researching property records for a professional land surveying firm.\n"
@@ -307,8 +309,8 @@ async def _download_documents(
         f"  Note which search types are available (Names, Reception Number, Book/Page, etc.).\n"
         f"  You will perform multiple searches — do NOT stop after the first one.\n\n"
         f"{search_steps}"
-        f"{dl_step} — Download ALL matching documents found across all searches:\n"
-        f"  {doc_filter.to_prompt_fragment()}\n"
+        f"STEP 5 — Download ALL matching documents found across all searches:\n"
+        f"  {prompt_fragment()}\n"
         f"  Priority order (highest first):\n"
         f"    1. Improvement Survey Plat (ISP) — document type PLAT MAP or SURVEY\n"
         f"    2. ALTA/NSPS Land Title Survey — document type SURVEY\n"
@@ -332,53 +334,19 @@ async def _download_documents(
         f"When all downloads are complete, say 'Done — downloaded N files.'"
     )
 
-    agent = Agent(task=task, llm=get_llm(), use_thinking=False, calculate_cost=True)
-    await agent.run()
-
-    _VALID_SUFFIXES = {".pdf", ".tif", ".tiff", ".jpg", ".jpeg", ".png"}
-    # Exclude URL-derived PDFs that browser-use generates when it intercepts
-    # print events on Kofile pages (disclaimer, search results, etc.)
-    _KOFILE_URL_FRAGMENTS = (
-        "countyfusion",
-        "kofiletech",
-        "disclaimer",
-        "searchentry",
-        "logindisplay",
-        "countyweb",
-    )
-    local_paths = [
-        Path(p)
-        for p in (agent.available_file_paths or [])
-        if Path(p).suffix.lower() in _VALID_SUFFIXES
-        and Path(p).exists()
-        and not any(frag in Path(p).stem.lower() for frag in _KOFILE_URL_FRAGMENTS)
-    ]
-    logger.info("Denver County: browser downloaded %d file(s)", len(local_paths))
-
-    saved: list[Path] = []
-    if local_paths:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        for src in local_paths:
-            dst = dest_dir / src.name
-            shutil.copy(src, dst)
-            saved.append(dst)
-
-    cost, in_tok, out_tok = agent_cost(agent)
-    return saved, cost, in_tok, out_tok
+    return await run_download_agent(task, dest_dir, exclude_stems=_KOFILE_PAGE_FRAGMENTS)
 
 
 async def scrape(
     geocoded: GeocodedAddress,
     tmp_dir: Path,
-    doc_filter: DocumentFilter = DEFAULT_FILTER,
 ) -> tuple[list[Path], str | None, float, int, int]:
     """Scrape Denver County property records for the given address."""
     address = geocoded.one_line()
     logger.info("Denver County scraper starting for: %s", address)
 
     s = get_settings()
-    username = s.co_denver_username
-    password = s.co_denver_password
+    username, password = s.co_denver_username, s.co_denver_password
     if not username or not password:
         return (
             [],
@@ -395,22 +363,11 @@ async def scrape(
     owner_info, cost1, in1, out1 = await _get_owner_info(address)
 
     # Phase 2: log into Kofile and download documents
-    dest = make_download_dir(geocoded.county, address, base=tmp_dir)
+    dest = download_dir(geocoded.county, address, tmp_dir)
     saved, cost2, in2, out2 = await _download_documents(
-        address, owner_info, doc_filter, dest, username, password
+        address, owner_info, dest, username, password
     )
 
-    total_cost = cost1 + cost2
-    total_in = in1 + in2
-    total_out = out1 + out2
-
-    if not saved:
-        return (
-            [],
-            f"No documents found for {address} in Denver County.",
-            total_cost,
-            total_in,
-            total_out,
-        )
-
-    return saved, None, total_cost, total_in, total_out
+    cost, in_tok, out_tok = cost1 + cost2, in1 + in2, out1 + out2
+    err = None if saved else f"No documents found for {address} in Denver County."
+    return saved, err, cost, in_tok, out_tok

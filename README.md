@@ -78,10 +78,7 @@ WELD_HEADED=1 uv run survey-art "R1611986" --county CO_weld --sop-strict
 # 8. Custom output directory
 uv run survey-art "R1611986" --county CO_weld -t ./output
 
-# 9. Re-download files that already exist
-uv run survey-art "R1611986" --county CO_weld --no-skip-existing
-
-# 10. Suppress progress UI (CI-friendly)
+# 9. Suppress progress UI (CI-friendly)
 uv run survey-art "R1611986" --county CO_weld --quiet
 ```
 
@@ -120,7 +117,6 @@ the worker talks to real AWS for that one client and to LocalStack for everythin
 | (positional) | All | — | Address, account, parcel ID, or any string to dispatch from |
 | `-t / --tmp PATH` | All | `./tmp` | Output directory root |
 | `--county KEY` | All | (geocode) | Override county dispatch (e.g. `CO_weld`). Required when query isn't an address. |
-| `--no-skip-existing` | All | (skip) | Re-download files even if they're already on disk |
 | `--quiet` | All | (verbose) | Suppress Rich progress panels |
 | `--str S,T,R` | Weld | — | PLSS lookup, comma-separated (e.g. `15,5N,67W`). Requires `--sop-strict`. |
 | `--owner NAME` | Weld | — | Owner-name lookup (SOP Priority 4) |
@@ -478,32 +474,31 @@ under `apps/worker/survey_art/scrapers/`.
 
 ## Adding a new county
 
-1. Add an entry to `SUPPORTED_COUNTIES` in
-   [county_sites.py](apps/worker/survey_art/county_sites.py) with the county name,
-   state, scraper key, and relevant URLs.
-2. Create `scrapers/{state}_{county}.py` exposing:
+1. Create `apps/worker/survey_art/scrapers/{county}_county.py` with the county's
+   portal URLs as module constants, exposing:
 
    ```python
    async def scrape(
        geocoded: GeocodedAddress,
        tmp_dir: Path,
-       doc_filter: DocumentFilter = DEFAULT_FILTER,
-       **kwargs,
    ) -> tuple[list[Path], str | None, float, int, int]: ...
    ```
 
-3. Register it in `COUNTY_SCRAPERS` in [pipeline.py](apps/worker/survey_art/pipeline.py).
-4. Add tests in `tests/test_{county}_scraper.py`.
+   A browser-agent county is a prompt plus `llm.run_download_agent()` (see
+   `jefferson_county.py`); `document_filter.prompt_fragment()` tells the agent
+   what to collect.
+2. Register it in `COUNTY_SCRAPERS` in [pipeline.py](apps/worker/survey_art/pipeline.py).
+3. Add tests in `apps/worker/tests/`.
 
 ---
 
 ## Development
 
 ```bash
-uv run pytest --cov=src tests/    # tests with coverage
-uv run ruff check src tests       # lint
-uv run ruff format src tests      # format
-make build                        # rebuild Docker image after dependency changes
+make test     # full suite, incl. the API -> SQS -> worker end-to-end test (test_end_to_end.py)
+make lint     # ruff check + format --check
+make fmt      # ruff format
+make restart  # rebuild the local stack after dependency changes
 ```
 
 `AGENTS.md` (which `CLAUDE.md` symlinks to) is the developer/agent guide. Keep it

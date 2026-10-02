@@ -25,7 +25,7 @@ import {
   UnstyledButton,
 } from "@mantine/core";
 
-import { CostLine, FileEntry, Job } from "./api";
+import { FileEntry, Job } from "./api";
 import { LayoutContext } from "./Layout";
 import { MetadataView, PropertyMap } from "./MetadataView";
 import { TERMINAL, statusColor, fileIcon, isPdf } from "./utils";
@@ -135,32 +135,6 @@ function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void, info?: 
   );
 }
 
-/** Every AWS service this run touched, itemised and totalled. `job.costs` comes
- * from the worker's `costs.py`, which owns the rates and the arithmetic — this
- * just renders whatever lines it produced, so adding a service there needs no
- * change here. Older job records predate `costs` and carry only the two scalar
- * fields, so those are synthesised into the same shape rather than branching the
- * render path. */
-function costLines(job: Job): CostLine[] {
-  if (job.costs?.length) return job.costs;
-  return [
-    {
-      key: "bedrock",
-      label: "Bedrock / LLM",
-      usd: job.bedrockCostUsd ?? 0,
-      detail: `${(job.bedrockInputTokens ?? 0).toLocaleString()} in / ${(job.bedrockOutputTokens ?? 0).toLocaleString()} out tokens`,
-      basis: "measured",
-    },
-    {
-      key: "fargate",
-      label: "ECS / Fargate",
-      usd: job.fargateCostUsd ?? 0,
-      detail: `${(job.fargateSeconds ?? 0).toFixed(0)}s runtime`,
-      basis: "estimated",
-    },
-  ];
-}
-
 /** Sub-cent lines would all render as "$0.0000" at the total's precision, which
  * reads as "free" rather than "small". Give them enough digits to stay distinct. */
 function formatUsd(n: number): string {
@@ -170,14 +144,17 @@ function formatUsd(n: number): string {
 }
 
 function RunCost({ job }: { job: Job }) {
-  if (job.bedrockCostUsd == null && job.fargateCostUsd == null && !job.costs?.length) {
+  // Every AWS service this run touched, itemised by the worker's `costs.py`,
+  // which owns the rates and the arithmetic — adding a service there needs no
+  // change here.
+  const lines = job.costs ?? [];
+  if (!lines.length) {
     return (
       <Text c="dimmed" size="sm">
         Cost will appear here once the job finishes.
       </Text>
     );
   }
-  const lines = costLines(job);
   const total = lines.reduce((sum, line) => sum + line.usd, 0);
   return (
     <Stack gap="sm">

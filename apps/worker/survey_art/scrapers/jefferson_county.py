@@ -22,21 +22,17 @@ Workflow
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 
 import httpx
-from browser_use import Agent
 
-from survey_art.county_sites import SUPPORTED_COUNTIES
-from survey_art.document_filter import DEFAULT_FILTER, DocumentFilter
-from survey_art.download import download_dir as make_download_dir
+from survey_art.document_filter import prompt_fragment
+from survey_art.download import download_dir
 from survey_art.geocode import GeocodedAddress
-from survey_art.llm import agent_cost, get_llm
+from survey_art.llm import run_download_agent
 
 logger = logging.getLogger(__name__)
 
-_ENTRY = next(e for e in SUPPORTED_COUNTIES if e["county"] == "Jefferson")
 _RECORDS_URL = "https://landrecords.co.jefferson.co.us/RealEstate/SearchEntry.aspx"
 _ASSESSOR_API = "https://propertysearch.jeffco.us/api"
 
@@ -118,7 +114,8 @@ async def _get_parcel_info(house_number: str, street_fragment: str) -> dict | No
 
         if prop is None:
             logger.warning(
-                "Assessor: no property starting with house number '%s' found — skipping parcel lookup",
+                "Assessor: no property starting with house number '%s' found — "
+                "skipping parcel lookup",
                 house_number,
             )
             return None
@@ -165,7 +162,8 @@ async def _get_parcel_info(house_number: str, street_fragment: str) -> dict | No
             except Exception as exc:
                 logger.warning("Property detail lookup failed: %s", exc)
 
-    # Strip leading numeric code from subdivision (e.g. "693499 SOLTERRA SUB FLG NO 17" → "SOLTERRA SUB FLG NO 17")
+    # Strip leading numeric code from subdivision
+    # (e.g. "693499 SOLTERRA SUB FLG NO 17" → "SOLTERRA SUB FLG NO 17")
     parts = subdivision.split(" ", 1)
     if parts and parts[0].isdigit():
         subdivision = parts[1] if len(parts) > 1 else subdivision
@@ -184,7 +182,6 @@ async def _get_parcel_info(house_number: str, street_fragment: str) -> dict | No
 async def _download_documents(
     address: str,
     parcel: dict | None,
-    doc_filter: DocumentFilter,
     dest_dir: Path,
 ) -> tuple[list[Path], float, int, int]:
     """Browser agent: search Jefferson County Land Records and download documents.
@@ -204,18 +201,24 @@ async def _download_documents(
         # Build subdivision-dependent steps only when we have a subdivision name
         if subdivision:
             subdiv_steps = (
-                f"STEP 1 — Search by legal description (finds ISPs, ILCs, easements, deeds for this lot):\n"
+                f"STEP 1 — Search by legal description "
+                f"(finds ISPs, ILCs, easements, deeds for this lot):\n"
                 f"  Navigate to {_RECORDS_URL}\n"
                 f"  The Subdivision field is likely an autocomplete. To fill it:\n"
-                f"    - Click the Subdivision field and type the first word only: '{subdiv_keyword}'\n"
+                f"    - Click the Subdivision field and type the first word only: "
+                f"'{subdiv_keyword}'\n"
                 f"    - Wait 1–2 seconds for a dropdown list to appear\n"
                 f"    - Select the entry that most closely matches '{subdivision}'\n"
                 f"    - If no dropdown appears, clear the field and leave it blank\n"
                 f"  Fill in Block='{block}' and Lot='{lot}', then click Search.\n\n"
-                f"STEP 2 — Search by subdivision name only (finds the recorded subdivision plat):\n"
-                f"  Clear the form. The subdivision plat is filed for the whole subdivision and will NOT\n"
-                f"  appear in a block/lot search — you must search by subdivision name with Block and Lot blank.\n"
-                f"  Fill in the Subdivision field using the same autocomplete technique above (type '{subdiv_keyword}',\n"
+                f"STEP 2 — Search by subdivision name only "
+                f"(finds the recorded subdivision plat):\n"
+                f"  Clear the form. The subdivision plat is filed for the whole subdivision "
+                f"and will NOT\n"
+                f"  appear in a block/lot search — you must search by subdivision name "
+                f"with Block and Lot blank.\n"
+                f"  Fill in the Subdivision field using the same autocomplete technique above "
+                f"(type '{subdiv_keyword}',\n"
                 f"  wait for dropdown, select the entry matching '{subdivision}').\n"
                 f"  Leave Block and Lot blank. Click Search.\n\n"
             )
@@ -224,7 +227,8 @@ async def _download_documents(
             subdiv_steps = (
                 f"STEP 1 — Search by block and lot:\n"
                 f"  Navigate to {_RECORDS_URL}\n"
-                f"  Fill in Block='{block}' and Lot='{lot}' (no subdivision available), then click Search.\n\n"
+                f"  Fill in Block='{block}' and Lot='{lot}' (no subdivision available), "
+                f"then click Search.\n\n"
             )
             next_step = "STEP 2"
 
@@ -250,7 +254,7 @@ async def _download_documents(
         f"Property address: {address}\n\n"
         f"{search_instructions}"
         f"FINAL STEP — Download ALL matching documents found across all searches above:\n"
-        f"  {doc_filter.to_prompt_fragment()}\n"
+        f"  {prompt_fragment()}\n"
         "  IMPORTANT: Survey plats (Land Survey Plat, Subdivision Plat, Improvement Survey Plat) "
         "  are the highest priority — download these even if you also found deeds.\n"
         "  For each matching document, click the row to open the document viewer. "
@@ -258,36 +262,12 @@ async def _download_documents(
         "  in the PDF viewer to download the file. Handle modals and new tabs as needed.\n\n"
         "After all downloads are complete, say 'Done' and report how many files were downloaded."
     )
-    agent = Agent(task=task, llm=get_llm(), use_thinking=False, calculate_cost=True)
-    await agent.run()
-
-    # browser-use tracks all downloaded files in agent.available_file_paths
-    _VALID_SUFFIXES = {".pdf", ".tif", ".tiff", ".jpg", ".jpeg", ".png"}
-    local_paths = [
-        Path(p)
-        for p in (agent.available_file_paths or [])
-        if Path(p).suffix.lower() in _VALID_SUFFIXES and Path(p).exists()
-    ]
-
-    logger.info("Jefferson County: browser downloaded %d file(s)", len(local_paths))
-
-    # Copy from browser-use temp dir to our destination
-    saved: list[Path] = []
-    if local_paths:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        for src in local_paths:
-            dst = dest_dir / src.name
-            shutil.copy(src, dst)
-            saved.append(dst)
-
-    cost, in_tok, out_tok = agent_cost(agent)
-    return saved, cost, in_tok, out_tok
+    return await run_download_agent(task, dest_dir)
 
 
 async def scrape(
     geocoded: GeocodedAddress,
     tmp_dir: Path,
-    doc_filter: DocumentFilter = DEFAULT_FILTER,
 ) -> tuple[list[Path], str | None, float, int, int]:
     """Scrape Jefferson County property records for the given address."""
     address = geocoded.one_line()
@@ -316,17 +296,7 @@ async def scrape(
             "Could not retrieve parcel info from assessor — falling back to address search"
         )
 
-    dest = make_download_dir(geocoded.county, address, base=tmp_dir)
-    saved, total_cost, total_in, total_out = await _download_documents(
-        address, parcel, doc_filter, dest
-    )
-    if not saved:
-        return (
-            [],
-            f"No documents found for {address} in Jefferson County.",
-            total_cost,
-            total_in,
-            total_out,
-        )
-
-    return saved, None, total_cost, total_in, total_out
+    dest = download_dir(geocoded.county, address, tmp_dir)
+    saved, total_cost, total_in, total_out = await _download_documents(address, parcel, dest)
+    err = None if saved else f"No documents found for {address} in Jefferson County."
+    return saved, err, total_cost, total_in, total_out

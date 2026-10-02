@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { type KeyboardEvent, useState } from "react";
 import { useNavigate, useOutletContext } from "react-router-dom";
 import {
   Alert,
@@ -113,6 +113,19 @@ export function SearchPage() {
     }
   }
 
+  const submitOnEnter = (e: KeyboardEvent) => {
+    if (e.key === "Enter" && canSubmit) submit();
+  };
+  const countySelect = (
+    <Select
+      label="County"
+      placeholder="Select a county"
+      data={COUNTIES}
+      value={county}
+      onChange={setCounty}
+    />
+  );
+
   return (
     <Stack>
       <Tabs value={mode} onChange={(v) => v && setMode(v)}>
@@ -124,19 +137,13 @@ export function SearchPage() {
 
         <Tabs.Panel value="account" pt="sm">
           <Stack gap="sm">
-            <Select
-              label="County"
-              placeholder="Select a county"
-              data={COUNTIES}
-              value={county}
-              onChange={setCounty}
-            />
+            {countySelect}
             <TextInput
               label="Account / parcel number"
               placeholder="R1611986"
               value={account}
               onChange={(e) => setAccount(e.currentTarget.value)}
-              onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
+              onKeyDown={submitOnEnter}
             />
           </Stack>
         </Tabs.Panel>
@@ -147,19 +154,13 @@ export function SearchPage() {
             placeholder="123 Main St, Greeley, CO 80631"
             value={address}
             onChange={(e) => setAddress(e.currentTarget.value)}
-            onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
+            onKeyDown={submitOnEnter}
           />
         </Tabs.Panel>
 
         <Tabs.Panel value="kmz" pt="sm">
           <Stack gap="sm">
-            <Select
-              label="County"
-              placeholder="Select a county"
-              data={COUNTIES}
-              value={county}
-              onChange={setCounty}
-            />
+            {countySelect}
             <FileInput
               label="KMZ"
               description="A parcel exported from the county GIS site, or any drawn route or area"
@@ -181,7 +182,7 @@ export function SearchPage() {
                 label="Account / parcel number found"
                 value={kmzAccount}
                 onChange={(e) => setKmzAccount(e.currentTarget.value)}
-                onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
+                onKeyDown={submitOnEnter}
               />
             )}
             {kmzParcels.length > 0 && (

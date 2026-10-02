@@ -4,7 +4,7 @@
 
 // "milestone" = a plain-English progress step for a non-technical surveyor;
 // "detail" = a verbose developer diagnostic. See survey_shared.jobs.LogEntry.
-export interface LogEntry {
+interface LogEntry {
   message: string;
   kind: "milestone" | "detail";
 }
@@ -22,10 +22,6 @@ export interface Job {
   metadata?: Record<string, unknown> | null;
   location?: { lat: number; lon: number } | null;
   docPrefix?: string | null;
-  bedrockCostUsd?: number | null;
-  bedrockInputTokens?: number | null;
-  bedrockOutputTokens?: number | null;
-  fargateCostUsd?: number | null;
   fargateSeconds?: number | null;
   /** Full per-service cost breakdown, biggest line first (worker's costs.py).
    * Absent on job records written before it existed — RunCost falls back to the
@@ -33,7 +29,7 @@ export interface Job {
   costs?: CostLine[] | null;
 }
 
-export interface CostLine {
+interface CostLine {
   key: string;
   label: string;
   usd: number;

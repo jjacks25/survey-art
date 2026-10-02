@@ -343,9 +343,7 @@ class TestExtractDocumentIds:
 
         assert result.receptions() == ["2786305"]
 
-    def test_a_page_the_probe_flags_is_read_both_ways_and_the_better_one_kept(
-        self, tmp_path: Path
-    ):
+    def test_a_page_the_probe_flags_is_read_both_ways_and_the_better_one_kept(self, tmp_path: Path):
         """Turning a flagged page outright is not safe — the probe has a real
         false-positive rate, and turning an upright page loses every reference
         on it. So both renders are read and the fuller answer wins.

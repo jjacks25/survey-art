@@ -62,6 +62,9 @@ disabled.
 
 - **Use pydantic** for all request/response models (`app/schemas.py`) — data-model
   enforcement lives at the edge.
+  `JobResponse` *subclasses* `survey_shared.jobs.Job` rather than restating its fields —
+  a hand-kept copy once silently dropped `costs` and served `location` as strings. Add
+  job fields to `Job`; exclude internal ones in `JobResponse`.
 - Config (queue URL, table, bucket) comes from `survey_shared.config` (pydantic-settings),
   not raw `os.environ`, and fails fast if a required value is missing.
 - IAM scope (backend stack): DynamoDB RW on the jobs table, `sqs:SendMessage`,
