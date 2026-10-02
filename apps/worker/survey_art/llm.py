@@ -45,8 +45,9 @@ async def run_agent(task: str) -> tuple[Agent, str, tuple[float, int, int]]:
         use_thinking=False,
         calculate_cost=True,
     )
-    result = await agent.run()
-    return agent, str(result).strip(), agent_cost(agent)
+    history = await agent.run()
+    # `str(history)` is the whole action log, not the agent's answer.
+    return agent, (history.final_result() or "").strip(), agent_cost(agent)
 
 
 def copy_agent_downloads(

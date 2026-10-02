@@ -352,9 +352,9 @@ async def fetch_road_row(
                 for record in records[:_MAX_BOCC_RECORDS]:
                     pdf = await _bocc_pdf(client, record)
                     if pdf:
-                        path = dest_dir / f"county_road_row_{record['name']}.pdf"
+                        path = dest_dir / f"county_road_row_{_safe(record['name'])}.pdf"
                         path.write_bytes(pdf)
-                        record["file"] = str(path)
+                        record["file"] = path.name
                         saved.append((path, f"County Road Right of Way — {record['doc_type']}"))
                 log["bocc_road_records"] = records
             except Exception as exc:
@@ -384,7 +384,7 @@ async def fetch_road_row(
             if plan["url"] in pdfs:
                 path = dest_dir / f"state_highway_row_{hw['route']}_{_safe(plan['project'])}.pdf"
                 path.write_bytes(pdfs[plan["url"]])
-                plan["file"] = str(path)
+                plan["file"] = path.name
                 saved.append(
                     (path, f"State Highway Right of Way Plan — {hw['highway']} {plan['project']}")
                 )

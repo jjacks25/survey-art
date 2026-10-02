@@ -1437,7 +1437,7 @@ _sweep_cache: dict[tuple, list[dict]] = {}
 
 
 @asynccontextmanager
-async def _recorder_search_session(username: str, password: str):
+async def _recorder_search_session():
     """Open an authenticated Playwright page for driving Advanced Search.
 
     Shared by the partial-history search, the owner-name search, and the
@@ -1448,6 +1448,8 @@ async def _recorder_search_session(username: str, password: str):
     """
     from playwright.async_api import async_playwright
 
+    s = get_settings()
+    username, password = s.weld_recorder_username, s.weld_recorder_password
     if not (username and password):
         logger.warning(
             "Advanced Search: WELD_RECORDER_USERNAME/PASSWORD not set — "
@@ -2523,22 +2525,16 @@ async def scrape(
     # it. Only needs S/T/R, so it can't fail on the Decision Matrix outcome.
     await record_map()
     cost = 0.0
-    glo_paths: list[Path] = []
+    glo_files: list[tuple[Path, str]] = []
     if glo_task:
-        glo_paths, cost, glo_in_tok, glo_out_tok = await glo_task
+        glo_files, glo_log, cost, glo_in_tok, glo_out_tok = await glo_task
         in_tok += glo_in_tok
         out_tok += glo_out_tok
-        if glo_paths:
-            narration.info(f"Found {len(glo_paths)} GLO record(s) for this township.")
+        if glo_files:
+            narration.info(f"Found {len(glo_files)} GLO record(s) for this township.")
         else:
             narration.info("No GLO records were found for this township.")
-        ov.set_section(
-            "glo_records",
-            {
-                "section_township_range": parcel.section_township_range(),
-                "files": [str(p) for p in glo_paths],
-            },
-        )
+        ov.set_section("glo_records", glo_log)
 
     # --- Phase 5: state & county road right-of-way packet. Also independent of
     # the Phase 3 path. The Schedule B-2 road exceptions it starts from were
@@ -2551,6 +2547,35 @@ async def scrape(
         ov.get("extracted_ids", []), ov.get("book_page_resolutions", {}), downloaded
     )
     ov.set_section("road_right_of_way", row_log)
+
+    # Step 5.3 — a road petition or vacation cites the Clerk & Recorder's own
+    # Book/Page for its deeds ("see Book 11 page 106"); read the BOCC files
+    # for those and fetch them like any other citation.
+    bocc_results = [
+        (
+            "county_road_row",
+            _DocRecord(f"BOCC-{r['entry_id']}", doc_type=r["doc_type"]),
+            [dest / r["file"]],
+        )
+        for r in row_log["bocc_road_records"]
+        if r.get("file")
+    ]
+    if bocc_results:
+        narration.info(
+            f"Reading {len(bocc_results)} county road record(s) for the deeds they cite..."
+        )
+        bocc_refs, b_in_tok, b_out_tok = await _expand_cross_references(
+            dest, ov, bocc_results, {doc.reception for _, doc in targets}
+        )
+        in_tok += b_in_tok
+        out_tok += b_out_tok
+        if bocc_refs:
+            results += bocc_refs
+            targets += [(role, doc) for role, doc, _ in bocc_refs]
+            ov.set_section(
+                "road_right_of_way_citations",
+                {"targets": _target_rows(bocc_refs), "results": _result_rows(bocc_refs)},
+            )
     missing = [r for r in row_log["schedule_b_road_exceptions"] if r["status"] != "downloaded"]
     narration.info(
         f"Found {len(row_files)} road right-of-way record(s) and plan set(s)"
@@ -2565,7 +2590,7 @@ async def scrape(
     # Record per-target results in overview.json.
     ov.merge_section(route_section, {"results": _result_rows(results)})
     saved_paths = [p for _, _, paths in results for p in paths]
-    saved_paths += glo_paths
+    saved_paths += [path for path, _ in glo_files]
     saved_paths += [path for path, _ in row_files]
 
     # One row per downloaded file, keyed by the filename the Results tab shows,
@@ -2579,7 +2604,7 @@ async def scrape(
             for role, doc, paths in results
             for p in paths
         ),
-        *((p.name, "", _glo_doc_type(p.name), "glo_record") for p in glo_paths),
+        *((p.name, "", doc_type, "glo_record") for p, doc_type in glo_files),
         *((p.name, "", doc_type, "road_row") for p, doc_type in row_files),
     ]
     document_rows = [
@@ -2605,12 +2630,3 @@ async def scrape(
             out_tok,
         )
     return saved_paths, None, cost, in_tok, out_tok
-
-
-def _glo_doc_type(filename: str) -> str:
-    name = filename.lower()
-    if "fieldnote" in name or "field_note" in name:
-        return "GLO Field Notes"
-    if "patent" in name:
-        return "GLO Land Patent"
-    return "GLO Survey Plat"

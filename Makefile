@@ -70,7 +70,7 @@ sh-localstack: ## Local | Bash into the running localstack container
 
 # ---------------- Quality ----------------
 test: ## Quality | Run the Python test suite (pytest, in a container)
-	$(UV) run --group dev pytest
+	$(UV) run --group dev pytest -n auto
 
 lint: ## Quality | Lint Python sources with ruff (check + format --check)
 	$(UV) run --group dev ruff check apps/worker apps/api packages infra

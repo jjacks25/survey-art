@@ -45,6 +45,7 @@ make restart                      # rebuild + restart the local stack (down + up
                                    # pulling/editing api or worker code; those containers don't
                                    # hot-reload like web's mounted Vite dev server does
 make test / make lint / make lock # quality (run in containers; host needs no uv)
+                                   # CI (.github/workflows/ci.yml) runs the same on every PR to main
 make build-push                   # build + push api/worker images to ECR
 make deploy                       # AWS deploy entrypoint — `make deploy help` lists targets
                                    # (bootstrap, network, ecr, backend, frontend, all, web, diff, destroy)
