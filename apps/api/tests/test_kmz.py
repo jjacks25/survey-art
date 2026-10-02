@@ -51,3 +51,35 @@ def test_returns_none_when_no_identifier_present():
 
 def test_returns_none_for_non_zip_garbage():
     assert kmz.extract_identifier(b"not a zip file") is None
+
+
+PIPELINE = Path(__file__).parent / "fixtures" / "greeley_west_pipeline.kmz"
+
+
+def test_drawn_route_names_no_account():
+    assert kmz.extract_identifier(PIPELINE.read_bytes()) is None
+
+
+def test_drawn_route_is_sent_as_one_polyline(monkeypatch):
+    """A surveyor's own drawing has only geometry — the parcels come from asking
+    the county's parcel layer what it crosses."""
+    sent = []
+
+    class _Resp(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    def fake_urlopen(url, body, timeout):
+        sent.append(dict(kmz.urllib.parse.parse_qsl(body.decode())))
+        rows = [{"attributes": {"ACCOUNTNO": a, "NAME": "X"}} for a in ("R1611986", "R0331894")]
+        return _Resp(kmz.json.dumps({"features": rows}).encode())
+
+    monkeypatch.setattr(kmz.urllib.request, "urlopen", fake_urlopen)
+    parcels = kmz.parcels_for_geometry(PIPELINE.read_bytes())
+
+    assert [p["account"] for p in parcels] == ["R0331894", "R1611986"]
+    assert len(sent) == 1 and sent[0]["geometryType"] == "esriGeometryPolyline"
+    assert len(kmz.json.loads(sent[0]["geometry"])["paths"][0]) == 3

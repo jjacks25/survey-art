@@ -1,16 +1,23 @@
-"""Pull a Weld-style account/parcel number out of an uploaded KMZ.
+"""Turn an uploaded KMZ into the Weld account numbers it covers.
 
-County GIS hubs (Weld's included — see gishub.weldgov.com) export parcel selections as
-KMZ: a zipped KML with the parcel polygon plus its attribute table in each
-Placemark's <ExtendedData>. We don't need the geometry — the account/parcel number
-already routes through the exact same lookup the Account/Parcel # search box does
-(see `_resolve_parcel()` in `survey_art/scrapers/weld_county.py`), so all this does is
-find that field and hand back a string.
+Two kinds of KMZ come in:
+
+* A county GIS export of a parcel selection: the parcel polygon plus its attribute
+  table in each Placemark's <ExtendedData>. The account/parcel number is right there
+  (`extract_identifier`), and routes through the same lookup the Account/Parcel #
+  search box does (`_resolve_parcel()` in `survey_art/scrapers/weld_county.py`).
+* A surveyor's own drawing — a pipeline route, a boundary sketched in Google Earth —
+  which is only geometry. `parcels_for_geometry` asks Weld's public parcel layer
+  which parcels it touches. The "Greeley West Pipeline" sample is a 3-point line
+  that crosses 5 parcels, none of which the file names.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import urllib.parse
+import urllib.request
 import zipfile
 from io import BytesIO
 
@@ -80,3 +87,86 @@ def extract_identifier(data: bytes) -> str | None:
             return name.upper()
 
     return None
+
+
+# Weld's public parcel layer — the same one the account map page
+# (maps.weld.gov/mapanaccount) draws from. No key needed.
+_PARCELS_QUERY_URL = (
+    "https://services.arcgis.com/ewjSqmSyHJnkfBLL/arcgis/rest/services/"
+    "Parcels_open_data/FeatureServer/0/query"
+)
+# Parcels a single upload may expand to. A route across the county can touch
+# hundreds; each is its own job, so cap it rather than queue a surprise bill.
+MAX_PARCELS = 50
+
+
+def _geometries(root) -> list[tuple[str, list[list[float]]]]:
+    """Every Point / LineString / Polygon outer ring as (kind, [[lon, lat], ...])."""
+    found = []
+    for kind, tag in (
+        ("point", "Point"),
+        ("line", "LineString"),
+        ("polygon", "outerBoundaryIs"),
+    ):
+        for el in root.iter(f"{_KML_NS}{tag}"):
+            coords_el = el.find(f".//{_KML_NS}coordinates")
+            if coords_el is None or not coords_el.text:
+                continue
+            pts = [[float(v) for v in c.split(",")[:2]] for c in coords_el.text.split() if "," in c]
+            if pts:
+                found.append((kind, pts))
+    return found
+
+
+def _esri_geometry(kind: str, pts: list[list[float]]) -> tuple[str, dict]:
+    sr = {"wkid": 4326}
+    if kind == "point" or len(pts) == 1:
+        return "esriGeometryPoint", {"x": pts[0][0], "y": pts[0][1], "spatialReference": sr}
+    if kind == "polygon":
+        return "esriGeometryPolygon", {"rings": [pts], "spatialReference": sr}
+    return "esriGeometryPolyline", {"paths": [pts], "spatialReference": sr}
+
+
+def parcels_for_geometry(data: bytes) -> list[dict]:
+    """Every Weld parcel the KMZ's drawn geometry touches, as
+    `{account, owner, situs, str_code}` rows sorted by account. Empty when the file has
+    no geometry, can't be read, or the county's service is unreachable."""
+    try:
+        root = ElementTree.fromstring(_kml_bytes_from_kmz(data))
+        shapes = _geometries(root)
+    except (zipfile.BadZipFile, ValueError, ElementTree.ParseError, DefusedXmlException):
+        return []
+
+    by_account: dict[str, dict] = {}
+    for kind, pts in shapes:
+        geometry_type, geometry = _esri_geometry(kind, pts)
+        body = urllib.parse.urlencode(
+            {
+                "geometry": json.dumps(geometry),
+                "geometryType": geometry_type,
+                "inSR": 4326,
+                "spatialRel": "esriSpatialRelIntersects",
+                "outFields": "ACCOUNTNO,NAME,SITUS,STR",
+                "returnGeometry": "false",
+                "f": "json",
+            }
+        ).encode()
+        try:
+            with urllib.request.urlopen(_PARCELS_QUERY_URL, body, timeout=15) as resp:
+                features = json.load(resp).get("features", [])
+        except (OSError, ValueError):
+            continue
+        for f in features:
+            a = f.get("attributes", {})
+            account = (a.get("ACCOUNTNO") or "").strip().upper()
+            if _ACCOUNT_RE.match(account):
+                by_account.setdefault(
+                    account,
+                    {
+                        "account": account,
+                        "owner": (a.get("NAME") or "").strip(),
+                        "situs": (a.get("SITUS") or "").strip(),
+                        "str_code": (a.get("STR") or "").strip(),
+                    },
+                )
+    return sorted(by_account.values(), key=lambda r: r["account"])[:MAX_PARCELS]

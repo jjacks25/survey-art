@@ -91,7 +91,10 @@ these two rather than reordering existing tabs out from under muscle memory — 
 `POST /api/kmz/identify` (see [`apps/api/AGENTS.md`](../api/AGENTS.md)) purely to
 populate `kmzAccount`, which the user can review/edit before `submit()` sends it
 through the exact same `api.createJob(identifier, county)` call as the Account/Parcel #
-tab. If you add another upload-derived input, follow this pattern (extract → editable
+tab. A KMZ that's only a drawing comes back with `parcels` instead: they're shown as a
+checklist (all checked), and submit calls that same `api.createJob()` once per checked
+parcel, then opens the first job — the rest are in the history sidebar.
+If you add another upload-derived input, follow this pattern (extract → editable
 text field → same submit path) rather than growing a parallel job-creation branch.
 
 ## Search history: permanent left-hand panel

@@ -11,6 +11,7 @@ so requests reaching here are already authenticated. For local development
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -75,7 +76,12 @@ async def identify_kmz(file: UploadFile) -> KmzIdentifyResponse:
     data = await file.read(_MAX_KMZ_BYTES + 1)
     if len(data) > _MAX_KMZ_BYTES:
         raise HTTPException(status_code=413, detail="KMZ file too large (10MB max)")
-    return KmzIdentifyResponse(identifier=kmz.extract_identifier(data))
+    identifier = kmz.extract_identifier(data)
+    if identifier:
+        return KmzIdentifyResponse(identifier=identifier)
+    return KmzIdentifyResponse(
+        identifier=None, parcels=await asyncio.to_thread(kmz.parcels_for_geometry, data)
+    )
 
 
 @app.get("/api/jobs", response_model=JobListResponse)
