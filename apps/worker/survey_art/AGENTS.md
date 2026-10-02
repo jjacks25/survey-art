@@ -289,7 +289,7 @@ The two inputs feeding the biggest lines:
   _FARGATE_VCPU_HOUR_USD = 0.04048   # us-west-2, Linux/x86, on-demand
   _FARGATE_GB_HOUR_USD = 0.004445    # us-west-2, Linux/x86, on-demand
   _FARGATE_VCPUS = 1                 # WorkerTaskDefinition: Cpu: '1024'
-  _FARGATE_MEM_GB = 2                # WorkerTaskDefinition: Memory: '2048'
+  _FARGATE_MEM_GB = 4                # WorkerTaskDefinition: Memory: '4096'
   ```
 
   **If you change the worker's Fargate sizing or region, update these four constants to
@@ -414,24 +414,29 @@ downloaded, so a Bedrock outage must leave the run otherwise intact.
 `_fetch_document()` in `weld_download_concurrency`-many tabs of **one** already
 authenticated Playwright context. Two things about it are load-bearing:
 
-- **Each worker still paces itself exactly as the old serial loop did** (a growing
-  `_DOC_FETCH_PAUSE_S` sleep before *every* attempt, not just retries). The 80/80 success
-  measurement recorded in that function's docstring was taken with that pacing in place,
-  and what recording.weld.gov reacts to is request rate. `WELD_DOWNLOAD_CONCURRENCY`
-  (default 4) therefore multiplies the load on a county server directly — raise it a
-  step at a time and watch the job log for retry warnings ("No printCustom button",
-  "Print endpoint returned HTTP"). Getting the worker's IP throttled is a worse outcome
-  than a slow run.
+- **One shared schedule paces every fetch** (`_pace_fetch`: a burst of
+  `_DOC_FETCH_BURST`, then one viewer open per `_DOC_FETCH_INTERVAL_S`), whatever the
+  concurrency. Push recording.weld.gov too fast and it withholds the print button for
+  minutes, which reads in the log as a run of "No printCustom button" warnings on
+  documents that fetch fine later. Measured 2026-10-02: ~1/s locked out after ~28
+  documents (32/40 saved); at 10-12/min it blips once around document 36 and the first
+  retry clears it (50/50). So
+  `WELD_DOWNLOAD_CONCURRENCY` (default 4) only hides per-fetch latency now — it does
+  **not** raise throughput, and the interval is the knob that moves the load on the
+  county. Change it a step at a time and watch for those warnings. Getting the
+  worker's IP throttled is a worse outcome than a slow run.
 - **The disclaimer-cookie re-assert is under an `asyncio.Lock`.** Cookies are
   context-wide, so the `clear_cookies` / `add_cookies` pair a retry performs is shared
   with every fetch in flight; without the lock a sibling can land in the window where the
   cookie is missing and get served the disclaimer page instead of its document. Any new
   context-wide mutation in this path needs the same treatment.
 
-The page wait is `wait_for_selector("#printCustom")`, deliberately **not**
-`wait_for_load_state("networkidle")`: the viewer is PDF.js pulling page images over HTTP
-Range requests, so the network stays busy long after the only thing we need (the print
-button's `data-href`) exists.
+The page wait is `wait_for_selector("#printCustom", state="attached")`, deliberately
+**not** `wait_for_load_state("networkidle")`: the viewer is PDF.js pulling page images
+over HTTP Range requests, so the network stays busy long after the only thing we need (the
+print button's `data-href`) exists. And `attached`, not the default visible-wait: the
+button is hidden, so a visible-wait always runs to its timeout — it did, at 20s a
+document, until 2026-10-02, and that accident was the only thing pacing the county.
 
 ## Adding metadata/map support to another county
 

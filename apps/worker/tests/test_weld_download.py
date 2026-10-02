@@ -20,8 +20,9 @@ PDF = b"%PDF-1.4 body"
 
 @pytest.fixture(autouse=True)
 def _no_pacing(monkeypatch):
-    """The real 2s-per-attempt pacing would make these tests take a minute."""
+    """The real per-fetch pacing would make these tests take minutes."""
     monkeypatch.setattr(weld_county, "_DOC_FETCH_PAUSE_S", 0.0)
+    monkeypatch.setattr(weld_county, "_DOC_FETCH_INTERVAL_S", 0.0)
 
 
 class _FakeResponse:
@@ -202,3 +203,25 @@ async def test_concurrent_fetches_serialise_the_cookie_re_assert(tmp_path: Path)
     # results up with the targets it was given.
     assert [doc.reception for _role, doc, _paths in results] == ["0", "1", "2", "3"]
     assert all(paths for _role, _doc, paths in results)
+
+
+@pytest.mark.asyncio
+async def test_pacing_allows_a_burst_then_spaces_fetches(monkeypatch):
+    """Concurrent fetches share one schedule: a burst goes straight out, the
+    rest are spaced one interval apart however many tabs are waiting."""
+    monkeypatch.setattr(weld_county, "_DOC_FETCH_INTERVAL_S", 0.05)
+    monkeypatch.setattr(weld_county, "_DOC_FETCH_BURST", 3)
+    monkeypatch.setattr(weld_county, "_next_fetch_at", 0.0)
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    starts: list[float] = []
+
+    async def fetch():
+        await weld_county._pace_fetch()
+        starts.append(loop.time() - start)
+
+    await asyncio.gather(*(fetch() for _ in range(6)))
+
+    starts.sort()
+    assert all(t < 0.02 for t in starts[:3])
+    assert starts[3:] == pytest.approx([0.05, 0.1, 0.15], abs=0.02)

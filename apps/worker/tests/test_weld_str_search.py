@@ -201,3 +201,17 @@ async def test_book_page_citation_only_resolves_to_a_hit_from_the_cited_year():
     assert [(role, doc.reception) for role, doc in targets] == [("exception", "135027")]
     assert known == {"135027"}
     assert len(page.searches) == 2  # no year cited -> not searched at all
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_sweep_reuses_the_first_one():
+    """The easement scan and the section scan sweep the same S/T/R in one run;
+    the second must not re-drive the recorder's form."""
+    page = _FakePage(_rows("1", "2"))
+
+    first = await _search_all_rows(page, section="32", township="5N", range_="65W")
+    searches = len(page.searches)
+    second = await _search_all_rows(page, section="32", township="5N", range_="65W")
+
+    assert second == first
+    assert len(page.searches) == searches

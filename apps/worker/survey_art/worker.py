@@ -49,7 +49,7 @@ narration = logging.getLogger("survey_art.narration")
 _FARGATE_VCPU_HOUR_USD = 0.04048
 _FARGATE_GB_HOUR_USD = 0.004445
 _FARGATE_VCPUS = 1  # WorkerTaskDefinition: Cpu: '1024'
-_FARGATE_MEM_GB = 2  # WorkerTaskDefinition: Memory: '2048'
+_FARGATE_MEM_GB = 4  # WorkerTaskDefinition: Memory: '4096'
 
 # On-demand Bedrock price per 1K tokens, (input, output) — from https://claude.com/pricing
 # (Bedrock tracks Anthropic's own published rates 1:1). Keyed by the substring a Bedrock
