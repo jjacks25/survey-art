@@ -55,7 +55,7 @@ const ROLE_CATEGORIES: Record<string, string> = {
   exception: "Cited exceptions",
   owner_name: "Recorded under the owner's name",
   affidavit: "Affidavits, Notices & Agreements",
-  section_township_range_search: "Recorded in this section",
+  section_township_range_search: "Chain of title",
 };
 
 /** `{role}_{reception}.{ext}` → its two halves. */
@@ -330,16 +330,6 @@ export function ResultsPage() {
     [fileGroups]
   );
 
-  // Schedule B-2/cross-reference exception docs (weld_county.py writes them
-  // "exception_{reception}.pdf") are cited leads rather than documents the
-  // property's own history named — still worth counting against how many
-  // citations were found, even now that they're filed by type rather than
-  // split into their own section.
-  const exceptionFiles = useMemo(
-    () => files.filter((f) => f.name.startsWith("exception_")),
-    [files]
-  );
-
   // job.logs mixes plain-English progress steps ("milestone") with verbose
   // developer diagnostics ("detail" — see survey_shared.jobs.LogEntry). The Logs
   // tab shows only the milestones by default so a non-technical surveyor gets a
@@ -349,24 +339,12 @@ export function ResultsPage() {
     [job?.logs]
   );
 
-  // job.metadata.extracted_ids (overview.json, see id_extraction.py) lists every
-  // citation any downloaded document made — one row per (citing document, cited
-  // ID), not one row per unique ID, since weld_county.py's cross-reference walk
-  // deliberately keeps that provenance (which document cited what). The same
-  // reception number recurs once per document that happens to cite it, so this
-  // count dedupes by `id` before comparing against exceptionFiles.length in the
-  // "fetched X of Y" label — otherwise a property with a dense citation graph
-  // (the same easement cited by several documents) inflates the total.
-  const totalReceptionIds = useMemo(() => {
-    const ids = job?.metadata?.extracted_ids;
-    if (!Array.isArray(ids)) return null;
-    const unique = new Set(
-      ids
-        .filter((i) => (i as { id_type?: string })?.id_type === "reception_number")
-        .map((i) => (i as { id?: string }).id)
-    );
-    return unique.size;
-  }, [job?.metadata]);
+  // What became of every reception number the downloaded documents cited —
+  // counted once each, against what was downloaded under any search, by
+  // weld_county.py's _citation_summary.
+  const citations = job?.metadata?.citations as
+    | { cited: number; downloaded: number; not_in_recorder: string[]; not_fetched: string[] }
+    | undefined;
 
   async function poll(id: string) {
     try {
@@ -555,10 +533,14 @@ export function ResultsPage() {
                 onChange={(e) => setFileSearch(e.currentTarget.value)}
                 maw={320}
               />
-              {exceptionFiles.length > 0 && totalReceptionIds !== null && (
+              {citations && citations.cited > 0 && (
                 <Text size="xs" c="dimmed">
-                  Cited exceptions: fetched {exceptionFiles.length} of {totalReceptionIds}{" "}
-                  reception numbers found in the documents read.
+                  Cited documents: downloaded {citations.downloaded} of the {citations.cited}{" "}
+                  recorded documents referenced in the documents read.
+                  {citations.not_in_recorder.length > 0 &&
+                    ` ${citations.not_in_recorder.length} referenced number(s) aren't in the county recorder — usually a misread on an old scan (${citations.not_in_recorder.join(", ")}).`}
+                  {citations.not_fetched.length > 0 &&
+                    ` ${citations.not_fetched.length} weren't fetched because the run's safety limit was reached (${citations.not_fetched.join(", ")}).`}
                 </Text>
               )}
               {matchingFileCount === 0 ? (

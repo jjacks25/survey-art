@@ -1242,7 +1242,44 @@ def _matches_easement_filter(doc_type_label: str) -> bool:
     return any(t in upper for t in ("EASEMENT", "RIGHT OF WAY", "R/W", "ROW"))
 
 
-async def _run_advanced_search(
+# Bounces sometimes come in runs — three back-to-back retries all failed on one
+# S32-T5N-R65W sweep — so later retries wait first.
+_DISCLAIMER_RETRIES = 5
+_DISCLAIMER_BACKOFF_S = 10.0
+
+
+async def _run_advanced_search(page, **criteria: str) -> list[dict]:
+    """`_advanced_search_once`, retried when the recorder bounces to its disclaimer.
+
+    Partway through a session the recorder can bounce any page load to
+    /web/user/disclaimer ("the terms of usage have changed") — the server has
+    dropped our disclaimer cookie. It lands on whichever reload comes next: the
+    form load, the Clear Selections reload, or the search submit itself
+    (measured: all three, in one afternoon on S32-T5N-R65W), and it failed every
+    R8995911 job from 2026-09-28 to 2026-10-02 with "waiting for
+    #field_PLSSLegalID_DOT_Section". Re-asserting the cookie and running the
+    whole search again recovers, same as `_fetch_document`'s retry; logging in
+    again would not (see there).
+    """
+    for attempt in range(_DISCLAIMER_RETRIES):
+        try:
+            rows = await _advanced_search_once(page, **criteria)
+            if "/user/disclaimer" not in page.url:
+                return rows
+        except Exception:
+            if "/user/disclaimer" not in page.url:
+                raise
+        logger.warning(
+            "Advanced Search: bounced to the disclaimer (attempt %d/%d)",
+            attempt + 1,
+            _DISCLAIMER_RETRIES,
+        )
+        await asyncio.sleep(_DISCLAIMER_BACKOFF_S * attempt)
+        await _reassert_disclaimer(page.context)
+    raise RuntimeError("Advanced Search: the recorder kept bouncing to its disclaimer page")
+
+
+async def _advanced_search_once(
     page,
     *,
     section: str = "",
@@ -1261,7 +1298,8 @@ async def _run_advanced_search(
     only metadata; the actual results render only when the search is driven
     through the page UI. Each result is parsed into:
 
-        {"reception": str, "doc_type": str, "rec_date": str, "doc_id": str}
+        {"reception": str, "doc_type": str, "rec_date": str, "doc_id": str,
+         "grantors": [str], "grantees": [str], "legals": [str]}
 
     where `doc_id` is Tyler's internal DOC ID (e.g. 'DOC808S1754'). Note this
     returns whatever rows the search criteria match, up to `_RESULT_ROW_CAP` —
@@ -1273,21 +1311,10 @@ async def _run_advanced_search(
     (`#field_BothNamesID`), not a separate Basic Search page. `start_date` /
     `end_date` are MM/DD/YYYY strings for the Recording Date range.
     """
-    # Partway through a long session the recorder can bounce any page to
-    # /web/user/disclaimer ("the terms of usage have changed") — the server has
-    # dropped our disclaimer cookie, and the form never renders. Measured: 1 in 2
-    # local runs of S32-T5N-R65W's sweep hit it (at search 31), and job for
-    # R8995911 died of it at search 13. Re-asserting the cookie recovers, same as
-    # `_fetch_document`'s retry; logging in again would not (see there).
-    for attempt in range(3):
-        await page.goto(_ADVANCED_SEARCH_URL, wait_until="networkidle", timeout=30_000)
-        if "/user/disclaimer" not in page.url:
-            break
-        logger.warning("Advanced Search: bounced to the disclaimer (attempt %d/3)", attempt + 1)
-        await _reassert_disclaimer(page.context)
     # The form opens with a "Continue session?" dialog if any user state exists.
     # Measured across ~60 consecutive searches on one login it never appeared
     # once, so don't wait long for it.
+    await page.goto(_ADVANCED_SEARCH_URL, wait_until="networkidle", timeout=30_000)
     try:
         await page.click("button:has-text('Yes - Continue')", timeout=1_500)
         await page.wait_for_load_state("networkidle", timeout=10_000)
@@ -1346,11 +1373,27 @@ async def _run_advanced_search(
                 const text = h1.replace(/\\s+/g, ' ').trim();
                 // Header format: "<reception> • <type> • <date>"
                 const parts = text.split(/\\s*•\\s*/);
+                // Body columns: <ul><li>Grantor (2)</li><li><b>NAME</b></li>...</ul>
+                // — the label carries a count once there's more than one entry.
+                const names = label => {
+                    for (const ul of li.querySelectorAll('ul.selfServiceSearchResultColumn')) {
+                        const items = Array.from(ul.querySelectorAll('li'));
+                        const head = (items[0]?.textContent || '').trim();
+                        if (head === label || head.startsWith(label + ' ('))
+                            return items.slice(1)
+                                .map(i => i.textContent.replace(/\\s+/g, ' ').trim())
+                                .filter(t => t && t !== 'SEE RECORD');
+                    }
+                    return [];
+                };
                 return {
                     doc_id: docId,
                     reception: (parts[0] || '').trim(),
                     doc_type: (parts[1] || '').trim(),
                     rec_date: (parts[2] || '').trim(),
+                    grantors: names('Grantor'),
+                    grantees: names('Grantee'),
+                    legals: names('Legal'),
                 };
             });
         }"""
@@ -1529,41 +1572,257 @@ def _section_scan_rank(doc_type_label: str) -> int:
     return 3
 
 
+# The recorder Document Types a chain-of-title search downloads, exactly as
+# the recorder spells them — the list our PLS picked from the Advanced Search
+# form's Document Types box (2026-10-02). Everything else a chain owner's name
+# turns up is only listed in overview.json. To change what gets pulled, edit
+# this list.
+_CHAIN_PULL_TYPES = frozenset(
+    {
+        "ACKNOWLEDGMENT",
+        "ADJUSTMENT",
+        "AGREEMENT",
+        "AMENDED ANNEXATION",
+        "AMENDED DEVELOPMENT PLAN",
+        "AMENDED OIL & GAS LEASE",
+        "AMENDED ORDINANCE (RELATED TO A MAP)",
+        "AMENDED PLAT",
+        "AMENDED PLAT & DEDICATION",
+        "AMENDED RECORDED EXEMPTION",
+        "AMENDED REPLAT & DEDICATION",
+        "AMENDED RIGHT OF WAY",
+        "AMENDED SITE PLAN REVIEW",
+        "AMENDED SUBDIVISION EXEMPTION",
+        "AMENDED SURVEY",
+        "AMENDED ZONING PLAT",
+        "CERTIFICATE OF PERMANENT LOCATION",
+        "CONDOMINIUM MAP",
+        "CORRECTED AMENDED RECORDED EXEMPTION",
+        "CORRECTED PLAT",
+        "CORRECTED RECORDED EXEMPTION",
+        "CORRECTED SUBDIVISION EXEMPTION",
+        "CORRECTED SURVEY",
+        "CORRECTION",
+        "DEVELOPMENT PLAN",
+        "DITCH STATEMENT",
+        "DRAWING",
+        "EASEMENT",
+        "EASEMENT & RIGHT OF WAY",
+        "EASEMENT DEED",
+        "EASEMENT PLAT",
+        "EASEMENT RIGHT OF WAY & SURFACE USE AGM",
+        "EXHIBIT",
+        "FINAL DEVELOPMENT PLAN",
+        "GRANT & RELEASE OF EASEMENT",
+        "HISTORICAL",
+        "HISTORICAL CONVERSION",
+        "IMPROVEMENT LOCATION CERTIFICATE",
+        "LEGAL DESCRIPTION",
+        "LOCATION ASSESSMENT PLAT",
+        "LOT LINE ADJUSTMENT PLAT",
+        "LOT LINE ADJUSTMENT REPLAT",
+        "MAP",
+        "MASTER PLAN",
+        "MINOR RESUBDIVISION PLAT",
+        "MINOR SUBDIVISION",
+        "NOTARY AFFIDAVIT",
+        "OATH",
+        "OIL & GAS LEASE",
+        "ORDINANCE (RELATED TO A MAP)",
+        "PARTY WALL AGREEMENT",
+        "PARTY WALL DECLARATION CONDITIONS & REST",
+        "PATENT",
+        "PETITION FOR ANNEXATION",
+        "PETITION FOR ADDITION OF LANDS",
+        "PETITION FOR EXCLUSION OF LAND",
+        "PETITION FOR INCLUSION OF LAND",
+        "PLAT",
+        "PLAT & DEDICATION",
+        "PLOT PLAN",
+        "RATIFICATION & CORRECTION OF PLAT",
+        "RATIFICATION OF PLAT",
+        "RECORDED EXEMPTION",
+        "REPLAT",
+        "REPLAT & DEDICATION",
+        "RESUB",
+        "REZONING PLAT",
+        "RIGHT OF WAY",
+        "RIGHT OF WAY AGREEMENT",
+        "RIGHT OF WAY DEED",
+        "RIGHT OF WAY EASEMENT",
+        "RIGHT OF WAY PLAT",
+        "ROAD PETITIONS",
+        "RURAL LAND DIVISON",
+        "SITE DEVELOPMENT PLAN",
+        "SITE PLAN",
+        "SITE PLAN REVIEW",
+        "SPECIAL DISTRICT DESCRIPTION",
+        "SUBDIVISION AGREEMENT",
+        "SUBDIVISION EXEMPTION",
+        "SUBDIVISION NAME CHANGE",
+        "SUPPLEMENT TO PLAT",
+        "SUPPLEMENT",
+        "SURFACE USE AGREEMENT",
+        "SURVEY",
+        "SURVEYORS AFFIDAVIT",
+        "USE BY SPECIAL REVIEW",
+        "VACATION",
+        "VACATION & DEDICATION PLAT",
+        "VACATION & REPLAT",
+        "VACATION AND RE-DEDICATION",
+        "VACATION PLAT",
+        "VALVE SITE CONTRACT",
+        "WATER AGREEMENT",
+        "WATER DEED",
+        "ZONING MAP",
+        "ZONE CHANGE",
+    }
+)
+
+# A deed *to* one of these is a right-of-way take, whatever the recorder calls
+# it: R8995911's chain conveyed road ROW to Weld County and the highway
+# department, and ditch ROW to the Lower Latham Ditch Company, all as plain
+# WARRANTY DEEDs. Also never walked to as a chain owner (see below).
+_PUBLIC_GRANTEES = (
+    "WELD CO",
+    "COUNTY",
+    "CITY OF",
+    "TOWN ",
+    "STATE ",
+    "COLORADO STATE",
+    "DEPARTMENT",
+    "HIGHWAY",
+    "TRANSPORTATION",
+    "DITCH",
+    "RESERVOIR",
+    "IRRIGATION",
+    "CANAL",
+)
+
+# Never searched as a chain owner: a deed out of a bank or trustee is a
+# foreclosure or refinance, and its name search returns the county.
+_NOT_A_CHAIN_OWNER = _PUBLIC_GRANTEES + ("BANK", "TRUSTEE", "MORTGAGE", "FEDERAL", "SECRETARY")
+
+
+def _legal_here(row: dict, parcel: ParcelInfo) -> bool | None:
+    """Whether a result row's Legal column puts it in the parcel's township
+    and range: True / False, or None when the recorder indexed no legal (most
+    things before ~1994). Township, not section — a parcel's own vesting deed
+    can be indexed to the neighbouring section only (R8995911, in S32: its
+    2018 deeds 4372900/4372901 are indexed to S31)."""
+    legals = [x for x in row.get("legals", []) if x.strip() and x.strip() != "NO LEGAL"]
+    if not legals:
+        return None
+    here = f"Township: {parcel.township.rstrip('NnSs')} Range: {parcel.range_.rstrip('EeWw')}"
+    return any(here in x for x in legals)
+
+
+def _deed_to_public(row: dict) -> bool:
+    return any(p in g.upper() for g in row.get("grantees", []) for p in _PUBLIC_GRANTEES)
+
+
+def _is_chain_pull(row: dict, parcel: ParcelInfo) -> bool:
+    """Whether a row from a chain owner's name search is worth downloading:
+    one of `_CHAIN_PULL_TYPES`, or a deed to a government or ditch company (a
+    ROW take recorded as a plain deed) — unless its legal puts it in another
+    township."""
+    if _legal_here(row, parcel) is False:
+        return False
+    doc_type = " ".join(row["doc_type"].upper().split())
+    if doc_type in _CHAIN_PULL_TYPES:
+        return True
+    return _matches_vesting_deed_label(doc_type) and _deed_to_public(row)
+
+
+_ENTITY_SUFFIX_RE = re.compile(r"[ ,]+(LLC|LLP|LTD|INC|LP|CORP|CORPORATION)\.?$")
+
+# Owners searched per run — the current one plus this many links back up the
+# chain of title. Each is a county-wide name search, so this bounds the run.
+_MAX_CHAIN_OWNERS = 8
+
+
 async def _section_township_range_search(
     page,
     parcel: ParcelInfo,
     seen_receptions: set[str],
+    prior_owners: list[str] | tuple[str, ...] = (),
 ) -> tuple[list[tuple[str, _DocRecord]], list[dict]]:
-    """S/T/R Advanced Search for every other document recorded against this
-    parcel's section — not just easements/ROW (see `_easement_row_search`).
+    """Name search for every owner in the chain of title, plus a search of the
+    parcel's section, keeping only the PLS's document types (`_is_chain_pull`).
 
-    Run unconditionally alongside every research route (see `scrape()`), per
-    the SOP: a surveyor wants to know about anything else recorded in this
-    section, not only what the property's own Document History or ALTA
-    happened to cite. Mutates `seen_receptions` in place.
+    The chain is walked backwards: a deed *into* an owner names the owner
+    before as its grantor, who is searched next — seeded with the current
+    owner and `prior_owners` (Document History's deed parties). Only deeds
+    indexed to this township, or not indexed at all, are followed.
 
-    Returns `(targets, every_row_found)`. The search is date-swept, so the
-    second element is the section's whole index — 872 documents for
-    S32-T5N-R65W — and goes into overview.json whether or not each one is
-    downloaded. Targets are ordered by survey relevance and cut to
-    `weld_section_download_limit`, so what the cap drops is the least useful
-    end of the list (deeds of trust, 289 of that section's 872) rather than
-    everything recorded before 2022, which is what the old unbounded search
-    dropped.
+    Not bounded by S/T/R. Measured against R8995911's 27-item commitment: the
+    recorder indexes only 3 of those documents to S32-T5N-R65W — the rest
+    predate legal indexing (~1994) or are indexed to S31 — so no section
+    search can find them, while county-wide searches under the chain's names
+    (Petroleum Exploration & Management ← Thurman Hays & Co / Chet Hays
+    Family Co ← Hays Thurman) find 19. Names go in "Grantor or Grantee": an
+    owner granting an easement or ROW is the grantor.
+
+    The section search (S/T/R alone, date-swept) runs too, for what the chain
+    can't reach: documents recorded under other people's names.
+
+    Returns `(targets, every_row_found)` — the second element is everything
+    either search found, pulled or not, for overview.json. Mutates
+    `seen_receptions` in place.
     """
-    criteria = parcel.str_criteria("Section/Township/Range search")
-    if not criteria:
+    if not parcel.owner:
         return [], []
-    rows = await _search_all_rows(page, **criteria)
 
-    fresh = [r for r in rows if r["reception"] and r["reception"] not in seen_receptions]
+    queue = [parcel.owner, *prior_owners]
+    searched: list[str] = []
+    found: dict[str, dict] = {}
+    while queue and len(searched) < _MAX_CHAIN_OWNERS:
+        # Tyler matches names by prefix, and the same entity is indexed with and
+        # without its suffix: R8995911's "THURMAN HAYS & CO LLP" holds the land
+        # through deeds into plain "THURMAN HAYS & CO".
+        name = _ENTITY_SUFFIX_RE.sub("", " ".join(queue.pop(0).upper().split()))
+        if not name or name in searched or any(p in name for p in _NOT_A_CHAIN_OWNER):
+            continue
+        searched.append(name)
+        for row in await _search_all_rows(page, search_name=name):
+            if not row["reception"]:
+                continue
+            found.setdefault(row["reception"], row)
+            if (
+                _matches_vesting_deed_label(row["doc_type"])
+                and _legal_here(row, parcel) is not False
+                and any(name in g.upper() for g in row.get("grantees", []))
+            ):
+                queue += row.get("grantors", [])
+    chain_found = len(found)
+    # And everything indexed to the parcel's section, whoever recorded it — the
+    # chain search can't see documents recorded under other people's names.
+    # Same type filter: S32-T5N-R65W's 874 documents come down to 90.
+    if criteria := parcel.str_criteria("Section/Township/Range search"):
+        for row in await _search_all_rows(page, **criteria):
+            if row["reception"]:
+                found.setdefault(row["reception"], row)
+    logger.info(
+        "Chain-of-title search: %d owner(s) searched (%s), %d document(s) found; "
+        "%d more indexed to the section",
+        len(searched),
+        "; ".join(searched),
+        chain_found,
+        len(found) - chain_found,
+    )
+
+    fresh = [
+        r
+        for r in found.values()
+        if r["reception"] not in seen_receptions and _is_chain_pull(r, parcel)
+    ]
     fresh.sort(key=lambda r: _date_sort_key(r["rec_date"]), reverse=True)  # newest first
     fresh.sort(key=lambda r: _section_scan_rank(r["doc_type"]))  # stable: rank, then date
     limit = get_settings().weld_section_download_limit
     if limit and len(fresh) > limit:
         logger.info(
-            "Section scan: %d document(s) found, downloading the %d most survey-relevant "
-            "(raise WELD_SECTION_DOWNLOAD_LIMIT for more).",
+            "Chain-of-title search: %d pertinent document(s), downloading the %d most "
+            "survey-relevant (raise WELD_SECTION_DOWNLOAD_LIMIT for more).",
             len(fresh),
             limit,
         )
@@ -1573,7 +1832,7 @@ async def _section_township_range_search(
     for r in fresh:
         seen_receptions.add(r["reception"])
         targets.append(("section_township_range_search", _row_to_record(r)))
-    return targets, rows
+    return targets, list(found.values())
 
 
 def _select_direct_extraction_targets(
@@ -1606,6 +1865,36 @@ def _select_direct_extraction_targets(
     return targets
 
 
+# Weld reception numbers run to 7 digits (5,1xx,xxx in 2026). A longer "reception
+# number" read off a document is a date, an API well number or a misread — 210
+# of the 568 job b721dda1 (R8995911) counted — and is neither fetched nor counted.
+_MAX_RECEPTION_DIGITS = 7
+
+
+def _plausible_reception(reception: str) -> bool:
+    return reception.isdigit() and len(reception) <= _MAX_RECEPTION_DIGITS
+
+
+def _citation_summary(extracted_ids: list[dict], results) -> dict:
+    """What became of every reception number the documents cited, for the
+    Results tab: downloaded (under any role — a cited document the owner or
+    section search already fetched counts), looked up but not retrievable from
+    the recorder (usually a misread number), or never fetched (a limit hit)."""
+    cited = {
+        i["id"]
+        for i in extracted_ids
+        if i.get("id_type") == "reception_number" and _plausible_reception(i.get("id", ""))
+    }
+    attempted = {doc.reception.lstrip("0") for _, doc, _ in results}
+    downloaded = {doc.reception.lstrip("0") for _, doc, paths in results if paths}
+    return {
+        "cited": len(cited),
+        "downloaded": len(cited & downloaded),
+        "not_in_recorder": sorted(cited & attempted - downloaded),
+        "not_fetched": sorted(cited - attempted),
+    }
+
+
 def _select_schedule_b2_exception_targets(
     extraction: IdExtraction, known_receptions: set[str]
 ) -> list[tuple[str, _DocRecord]]:
@@ -1627,7 +1916,11 @@ def _select_schedule_b2_exception_targets(
     targets: list[tuple[str, _DocRecord]] = []
     seen = set(known_receptions)
     for item in extraction.ids:
-        if item.id_type != "reception_number" or item.id in seen:
+        if (
+            item.id_type != "reception_number"
+            or item.id in seen
+            or not _plausible_reception(item.id)
+        ):
             continue
         seen.add(item.id)
         targets.append(("exception", _DocRecord(item.id, doc_type=item.context)))
@@ -2461,24 +2754,30 @@ async def scrape(
     # too — a surveyor wants to know about anything else recorded here, not
     # just what this property's own history happened to cite. ---
     narration.info(
-        "Searching the Clerk & Recorder for other documents recorded in this property's section..."
+        "Following the chain of title: searching the Clerk & Recorder under the current "
+        "and previous owners' names..."
     )
     str_targets: list[tuple[str, _DocRecord]] = []
     section_index: list[dict] = []
     async with _recorder_search_session() as search_page:
         if search_page:
             str_targets, section_index = await _section_township_range_search(
-                search_page, parcel, known_receptions
+                search_page,
+                parcel,
+                known_receptions,
+                [
+                    n
+                    for d in all_docs
+                    if d.doc_type in _VESTING_DEED_TYPES
+                    for n in (d.grantee, d.grantor)
+                ],
             )
     if str_targets:
-        if len(section_index) > len(str_targets):
-            narration.info(
-                f"This section has {len(section_index)} recorded document(s) — "
-                f"downloading the {len(str_targets)} most relevant to a survey. "
-                "The full list is in the property metadata."
-            )
-        else:
-            narration.info(f"Found {len(str_targets)} additional document(s) in this section.")
+        narration.info(
+            f"Found {len(section_index)} document(s) under the owners' names — "
+            f"downloading the {len(str_targets)} a title commitment would list. "
+            "The full list is in the property metadata."
+        )
         str_results = await _download_documents(str_targets, dest)
         targets += str_targets
         results += str_results
@@ -2487,7 +2786,7 @@ async def scrape(
             {
                 "targets": _target_rows(str_targets),
                 "results": _result_rows(str_results),
-                # Every document the recorder indexes against this section,
+                # Everything recorded under the chain owners' names,
                 # downloaded or not — a document that wasn't fetched is still
                 # one the surveyor may want to pull by hand.
                 "section_index": [
@@ -2615,6 +2914,7 @@ async def scrape(
         key=lambda row: (CATEGORIES.index(row["category"]), reception_sort_key(row["reception"]))
     )
     ov.set_section("documents", document_rows)
+    ov.set_section("citations", _citation_summary(ov.get("extracted_ids", []), results))
 
     if not saved_paths:
         return (

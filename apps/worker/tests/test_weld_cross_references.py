@@ -98,7 +98,7 @@ async def test_a_whole_depth_level_is_fetched_in_one_call(monkeypatch):
     """
 
     def fake_extract(path: Path) -> IdExtraction:
-        cites = {"a": ["c"], "b": ["d"], "c": [], "d": []}[path.name]
+        cites = {"1": ["3"], "2": ["4"], "3": [], "4": []}[path.name]
         return IdExtraction(
             ids=[ExtractedId(id=r, id_type="reception_number") for r in cites],
             source="text_layer",
@@ -110,13 +110,13 @@ async def test_a_whole_depth_level_is_fetched_in_one_call(monkeypatch):
     monkeypatch.setattr("survey_art.scrapers.weld_county.extract_document_ids", fake_extract)
     monkeypatch.setattr("survey_art.scrapers.weld_county._download_documents", fake_download)
 
-    initial = [("alta", _doc("a"), [Path("a")]), ("vesting_deed", _doc("b"), [Path("b")])]
+    initial = [("alta", _doc("1"), [Path("1")]), ("vesting_deed", _doc("2"), [Path("2")])]
     new_results, _in_tok, _out_tok = await _expand_cross_references(
-        Path("/tmp"), _FakeOverview(), initial, {"a", "b"}
+        Path("/tmp"), _FakeOverview(), initial, {"1", "2"}
     )
 
-    assert download_calls == [["c", "d"]]
-    assert {doc.reception for _, doc, _ in new_results} == {"c", "d"}
+    assert download_calls == [["3", "4"]]
+    assert {doc.reception for _, doc, _ in new_results} == {"3", "4"}
 
 
 @pytest.mark.asyncio
@@ -161,3 +161,27 @@ async def test_skips_extraction_for_failed_downloads(monkeypatch):
 
     assert extract_calls == []
     assert new_results == []
+
+
+def test_citation_summary_counts_cited_documents_once_under_any_role():
+    """Job b721dda1 showed "fetched 182 of 568": the 568 counted dates and well
+    numbers as reception numbers, and the 182 missed cited documents another
+    search had already downloaded."""
+    from survey_art.scrapers.weld_county import _citation_summary
+
+    cited = [
+        {"id": i, "id_type": "reception_number"}
+        for i in ("4508544", "4508544", "1497035", "149705", "1983622", "20151221")
+    ]
+    results = [
+        ("owner_name_search", _doc("4508544"), [Path("x")]),  # cited, found by another search
+        ("exception", _doc("1497035"), [Path("y")]),
+        ("exception", _doc("149705"), []),  # a misread: the recorder has nothing
+    ]
+
+    assert _citation_summary(cited, results) == {
+        "cited": 4,  # duplicates and the 8-digit date don't count
+        "downloaded": 2,
+        "not_in_recorder": ["149705"],
+        "not_fetched": ["1983622"],
+    }

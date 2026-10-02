@@ -217,9 +217,10 @@ filed, so its citations never change and the answer is reusable forever. Two way
 pays off, both common:
 
 - **Re-running a property** (the Reprocess button) costs ~$0 in Bedrock instead of ~$2.
-- **A different parcel in the same section** reuses everything
-  `_section_township_range_search()` and `_easement_row_search()` turn up — those return
-  the same easements, plats and ROW documents for every parcel in a section.
+- **A different parcel in the same section** reuses everything `_easement_row_search()`
+  turns up — it returns the same easements, plats and ROW documents for every parcel in a
+  section — and a neighbour with the same chain of title reuses what
+  `_section_township_range_search()` found.
 
 Three invariants to keep:
 

@@ -306,6 +306,11 @@ _EXTRACT_TOOL = {
 # wrong citations. Measured on the R1611986 sample: 7 spurious emissions of those
 # three ids across 8 documents that contain none of them, against 0 with the
 # placeholders below. Keep example ids unmistakably fake.
+# Bump when `_PROMPT` changes what gets reported, so cached answers from the old
+# prompt aren't served. p2: skip PLS/seal and well API numbers — job b721dda1
+# fetched recorder document 22098 because it read King Surveyors' "PLS 22098"
+# off a monument cap as a reception number.
+_PROMPT_VERSION = "p2"
 _PROMPT = (
     "These images are tiles of one page of a land survey / title commitment. Read every "
     "one and find every reference to another recorded document: exception and easement "
@@ -317,8 +322,10 @@ _PROMPT = (
     "the images. Include brief context saying what the document is.\n\n"
     "Tiles overlap, so the same reference may appear twice — report it each time you see "
     "it; duplicates are removed later. Skip dates, bearings, distances, section/township/"
-    "range numbers and ordinance numbers. If a tile has no references, that's fine — call "
-    "record_references with whatever the others contain, or an empty list."
+    "range numbers, ordinance numbers, surveyor license / PLS and seal numbers (e.g. on "
+    "a monument cap), and oil & gas well API numbers. If a tile has no references, "
+    "that's fine — call record_references with whatever the others contain, or an empty "
+    "list."
 )
 
 
@@ -757,10 +764,15 @@ def cache_fingerprint(model: str | None = None) -> str:
 
     And so is the orientation pass, for the same reason: it changes the answer
     for a tenth of the pages in the corpus without touching tile geometry.
+
+    And the prompt version (`_PROMPT_VERSION`), when the prompt changes what
+    counts as a reference.
     """
     model = model or get_settings().id_extraction_model
     render = f"{_TILE_MAX_NATIVE_PX}_{_TILE_MAX_PX}_{_TILE_FORMAT}{_TILE_QUALITY}"
-    return f"{model}_{render}_turn{_TURN_PROBE_MAX_PX}".replace("/", "_").replace(":", "_")
+    return f"{model}_{render}_turn{_TURN_PROBE_MAX_PX}_{_PROMPT_VERSION}".replace("/", "_").replace(
+        ":", "_"
+    )
 
 
 def extract_document_ids(pdf_path: Path, *, model: str | None = None) -> IdExtraction:
