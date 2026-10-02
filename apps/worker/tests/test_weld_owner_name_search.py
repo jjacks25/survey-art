@@ -22,6 +22,7 @@ class _FakePage:
         self._by_query = by_query
         self.queries: list[tuple[str, str]] = []
         self._form: dict[str, str] = {}
+        self.url = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
 
     async def goto(self, *a, **k):
         pass

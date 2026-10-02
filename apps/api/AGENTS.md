@@ -38,8 +38,13 @@ scraper or a browser, so it stays small and fits scale-to-zero Lambda.
   returns an empty list if the job has no `doc_prefix` yet (not completed, or failed
   before any upload).
 - `GET /api/health` → liveness.
-- `POST /api/kmz/identify` (multipart `file`) → `{identifier}`, the account/parcel
-  number found in a county-exported KMZ, or `null` if none was found. Stateless —
+- `POST /api/kmz/identify` (multipart `file`) → `{identifier, parcels}`. `identifier` is
+  the account/parcel number from a county-exported KMZ, or `null`. When it's `null`, the
+  KMZ is treated as a drawing (a pipeline route, a sketched area): `parcels` lists every
+  Weld parcel its Points/LineStrings/Polygons intersect, from Weld's public
+  `Parcels_open_data` ArcGIS layer (`kmz.parcels_for_geometry`, capped at `MAX_PARCELS`).
+  `tests/fixtures/greeley_west_pipeline.kmz` is a real 3-point line that crosses 5 parcels.
+  This is the API's only outbound call; the Lambda isn't in a VPC so it has internet. Stateless —
   doesn't create a job; the frontend's KMZ tab feeds the result straight into the
   same `POST /api/jobs` call the Account/Parcel # tab uses. See `app/kmz.py`: it opens
   the KMZ's `.kml` entry (`defusedxml`, not stdlib `xml.etree` — the KML is untrusted

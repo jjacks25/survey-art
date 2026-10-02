@@ -146,6 +146,14 @@ export class ApiClient {
       body: form,
     });
     if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
-    return (await resp.json()) as { identifier: string | null };
+    return (await resp.json()) as { identifier: string | null; parcels: KmzParcel[] };
   }
+}
+
+/** A parcel a drawn KMZ touches (see apps/api/app/kmz.py). */
+export interface KmzParcel {
+  account: string;
+  owner: string;
+  situs: string;
+  str_code: string;
 }

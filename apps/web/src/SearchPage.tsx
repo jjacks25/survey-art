@@ -3,6 +3,7 @@ import { useNavigate, useOutletContext } from "react-router-dom";
 import {
   Alert,
   Button,
+  Checkbox,
   FileInput,
   Group,
   Loader,
@@ -13,6 +14,7 @@ import {
   TextInput,
 } from "@mantine/core";
 
+import type { KmzParcel } from "./api";
 import { LayoutContext } from "./Layout";
 
 // Keys must match COUNTY_SCRAPERS in src/survey_art/pipeline.py.
@@ -41,6 +43,8 @@ export function SearchPage() {
   const [county, setCounty] = useState<string | null>(COUNTIES[0]?.value ?? null);
   const [kmzFile, setKmzFile] = useState<File | null>(null);
   const [kmzAccount, setKmzAccount] = useState("");
+  const [kmzParcels, setKmzParcels] = useState<KmzParcel[]>([]);
+  const [kmzSelected, setKmzSelected] = useState<string[]>([]);
   const [kmzParsing, setKmzParsing] = useState(false);
   const [kmzError, setKmzError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -50,25 +54,32 @@ export function SearchPage() {
     mode === "address"
       ? !!address.trim()
       : mode === "kmz"
-        ? !!kmzAccount.trim() && !!county
+        ? (!!kmzAccount.trim() || kmzSelected.length > 0) && !!county
         : !!account.trim() && !!county;
 
   /** A KMZ export carries the county's own account/parcel number in its
    * ExtendedData — extracting it routes through the exact same Account/Parcel #
    * lookup as manual entry, so this only ever populates `kmzAccount` for the
-   * user to review, it never submits on its own. */
+   * user to review, it never submits on its own. A KMZ that's only a drawing (a
+   * pipeline route, a sketched boundary) names no account; the API returns every
+   * parcel the drawing touches instead, and each one checked becomes its own job. */
   async function handleKmzFile(file: File | null) {
     setKmzFile(file);
     setKmzAccount("");
+    setKmzParcels([]);
+    setKmzSelected([]);
     setKmzError(null);
     if (!file) return;
     setKmzParsing(true);
     try {
-      const { identifier } = await api.identifyKmz(file);
+      const { identifier, parcels } = await api.identifyKmz(file);
       if (identifier) {
         setKmzAccount(identifier);
+      } else if (parcels.length) {
+        setKmzParcels(parcels);
+        setKmzSelected(parcels.map((p) => p.account));
       } else {
-        setKmzError("Couldn't find an account/parcel number in this KMZ.");
+        setKmzError("Couldn't find an account/parcel number or any parcels under this KMZ.");
       }
     } catch (e) {
       setKmzError(String(e));
@@ -82,6 +93,13 @@ export function SearchPage() {
     setError(null);
     setSubmitting(true);
     try {
+      if (mode === "kmz" && !kmzAccount.trim()) {
+        const jobs = [];
+        for (const acct of kmzSelected) jobs.push(await api.createJob(acct, county!));
+        loadHistory();
+        navigate(`/jobs/${jobs[0].jobId}`);
+        return;
+      }
       const { jobId } =
         mode === "address"
           ? await api.createJob(address.trim())
@@ -143,8 +161,8 @@ export function SearchPage() {
               onChange={setCounty}
             />
             <FileInput
-              label="Parcel KMZ"
-              description="A KMZ exported from the county GIS site for a single parcel"
+              label="KMZ"
+              description="A parcel exported from the county GIS site, or any drawn route or area"
               placeholder="Upload a .kmz file"
               accept=".kmz"
               value={kmzFile}
@@ -166,12 +184,37 @@ export function SearchPage() {
                 onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
               />
             )}
+            {kmzParcels.length > 0 && (
+              <Checkbox.Group
+                label={`${kmzParcels.length} parcel(s) under this drawing`}
+                description="Each checked parcel is searched as its own job."
+                value={kmzSelected}
+                onChange={setKmzSelected}
+              >
+                <Stack gap={6} mt="xs">
+                  {kmzParcels.map((p) => (
+                    <Checkbox
+                      key={p.account}
+                      value={p.account}
+                      label={`${p.account} — ${p.owner || "unknown owner"}`}
+                      description={[p.situs, p.str_code && `S-T-R ${p.str_code}`]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    />
+                  ))}
+                </Stack>
+              </Checkbox.Group>
+            )}
           </Stack>
         </Tabs.Panel>
       </Tabs>
 
       <Button onClick={submit} disabled={!canSubmit || submitting}>
-        {submitting ? "Starting..." : "Search Records"}
+        {submitting
+          ? "Starting..."
+          : mode === "kmz" && !kmzAccount && kmzSelected.length > 1
+            ? `Search ${kmzSelected.length} Parcels`
+            : "Search Records"}
       </Button>
 
       {error && <Alert color="red" title="Error">{error}</Alert>}

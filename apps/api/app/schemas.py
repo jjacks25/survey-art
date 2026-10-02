@@ -17,8 +17,18 @@ class CreateJobResponse(BaseModel):
     status: str
 
 
+class KmzParcel(BaseModel):
+    account: str
+    owner: str = ""
+    situs: str = ""
+    str_code: str = ""  # Weld's "section township range quarter", e.g. "15 5 67 0"
+
+
 class KmzIdentifyResponse(BaseModel):
     identifier: str | None
+    # Parcels the KMZ's drawn geometry touches — filled only when the file
+    # doesn't name an account itself (see app/kmz.py).
+    parcels: list[KmzParcel] = []
 
 
 class JobResponse(BaseModel):

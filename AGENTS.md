@@ -124,8 +124,15 @@ Notes:
   phases are actually implemented today.
 - The SOP also documents two supplemental phases that run independent of the research
   path taken: retrieving the BLM GLO original survey of record (see "BLM GLO Records"
-  below), and assembling the county/state road right-of-way packet. Neither is automated
-  yet — see [`docs/weld_county_sop.md`](docs/weld_county_sop.md#whats-not-yet-automated).
+  below), and assembling the county/state road right-of-way packet (Phase 5 —
+  `scrapers/weld_road_row.py`). Both are automated.
+- The SOP's [URL Reference](docs/weld_county_sop.md#url-reference) and
+  [Glossary](docs/weld_county_sop.md#glossary) list every county/state site this tool
+  touches (with which URLs are dead) and define the survey terms (reception vs. Book/Page,
+  S-T-R, Schedule B-2, BOCC, CDOT route ids). Read them before working on a scraper.
+- **Legal descriptions are only indexed from ~1994.** Older documents are reachable only by
+  reception number or Book/Page, and Book numbers repeat across eras — see the SOP's
+  "Book/Page citations and the pre-1994 gap".
 
 ### Denver County
 

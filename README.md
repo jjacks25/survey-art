@@ -225,7 +225,7 @@ The schema is open: downstream consumers can read `Overview` via the
 
 | County | State | Scraper key | Approach | Status |
 |---|---|---|---|---|
-| Weld | CO | `CO_weld` | Pure HTTP + Playwright (no LLM) | Direct extraction, partial-history, and owner-name search all working (needs registered recorder account); GLO and road ROW not yet automated |
+| Weld | CO | `CO_weld` | Pure HTTP + Playwright (no LLM) | Direct extraction, partial-history, and owner-name search all working (needs registered recorder account); GLO survey of record and road ROW automated too |
 | Denver | CO | `CO_denver` | browser-use + LLM | Works; requires `CO_DENVER_USERNAME/PASSWORD` |
 | Jefferson | CO | `CO_jefferson` | Hybrid REST API + browser-use | Works (no auth) |
 | Arapahoe | CO | `CO_arapahoe` | browser-use + LLM | Proof-of-concept |
@@ -288,7 +288,13 @@ read it before modifying scraper logic. Key points:
   its field notes, and any indexed federal land patent. See
   [`scrapers/glo_records.py`](apps/worker/survey_art/scrapers/glo_records.py) and
   [docs/weld_county_sop.md](docs/weld_county_sop.md#phase-4--glo-original-survey-of-record).
-- **County + state road right-of-way** — not yet implemented; see
+- **County + state road right-of-way** (implemented): runs after GLO on every route. Plain
+  HTTP to Weld's parcel/road-centerline layers (abutting roads), the BOCC Laserfiche WebLink
+  (county road petitions and vacations by S/T/R), and CDOT OTIS's ROW Plans API (state
+  highways within 300 ft, at the parcel's milepost); the plan PDFs come from CDOT's OnBase
+  viewer through Playwright. Also lists the ALTA's road exceptions and which were found.
+  Results in `overview.json` → `road_right_of_way`. See
+  [`scrapers/weld_road_row.py`](apps/worker/survey_art/scrapers/weld_road_row.py) and
   [docs/weld_county_sop.md](docs/weld_county_sop.md#phase-5--county--state-road-right-of-way).
 
 Document type codes (`SURV`, `WD`, `SWD`, `QCD`, `EASE`, `ROW`, etc.) and the
@@ -463,7 +469,7 @@ Decision Matrix (_decision_matrix()) — branches on Document History
 All document downloads inject a `disclaimerAccepted=true` cookie (bypasses the
 reCAPTCHA-gated disclaimer button) and require an authenticated session — see
 [`docs/weld_county_sop.md`](docs/weld_county_sop.md) for the full decision tree and
-what's not yet automated (GLO survey-of-record, road ROW).
+what's not yet automated.
 
 For Denver / Jefferson / Arapahoe the architecture differs — see each scraper file
 under `apps/worker/survey_art/scrapers/`.
