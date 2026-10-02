@@ -27,11 +27,10 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal
 from pathlib import Path
 
 from survey_art import costs
-from survey_art.download import _slug
+from survey_art.download import slug
 from survey_art.geocode import address_to_county
 from survey_art.id_extraction import make_thumbnail
 from survey_art.pipeline import run_async
@@ -42,46 +41,6 @@ from survey_shared.config import get_shared_settings
 logger = logging.getLogger(__name__)
 narration = logging.getLogger("survey_art.narration")
 
-# ponytail: flat on-demand Fargate rate (Linux/x86, us-west-2 — this deploy's default
-# region, see infra/deploy.py's DEFAULT_REGION) times wall-clock task runtime, rather
-# than a real AWS Cost Explorer/CUR integration (24-48h reporting lag, can't back a
-# live UI). Revisit with per-region pricing if this ever deploys outside us-west-2.
-_FARGATE_VCPU_HOUR_USD = 0.04048
-_FARGATE_GB_HOUR_USD = 0.004445
-_FARGATE_VCPUS = 1  # WorkerTaskDefinition: Cpu: '1024'
-_FARGATE_MEM_GB = 4  # WorkerTaskDefinition: Memory: '4096'
-
-# On-demand Bedrock price per 1K tokens, (input, output) — from https://claude.com/pricing
-# (Bedrock tracks Anthropic's own published rates 1:1). Keyed by the substring a Bedrock
-# model/inference-profile ID contains, e.g. "us.anthropic.claude-haiku-4-5-20251001-v1:0".
-# Fallback only: browser-use's Agent scrapers (Denver/Arapahoe/Jefferson) already return a
-# real dollar cost via llm.agent_cost(), so this only fires when that's 0 — today, that's
-# every Weld run, since id_extraction.py's raw bedrock-runtime.converse() calls never priced
-# their own tokens. ponytail: add a row here for each new model id_extraction_model/model
-# gets pointed at; there's no API that returns this, so it can't be looked up automatically.
-_BEDROCK_PRICE_PER_1K_TOKENS: dict[str, tuple[float, float]] = {
-    "haiku-4-5": (0.001, 0.005),
-    "sonnet-4-5": (0.003, 0.015),
-    "sonnet-4-6": (0.003, 0.015),
-    "opus-4-5": (0.005, 0.025),
-    "opus-4-6": (0.005, 0.025),
-    "opus-4-7": (0.005, 0.025),
-    "opus-4-8": (0.005, 0.025),
-    "sonnet-5": (0.002, 0.010),
-    "opus-5": (0.005, 0.025),
-    # Bedrock on-demand rate (not OpenAI's own API rate, which differs) — per AWS's
-    # 2026-07-30 Bedrock price cut announcement for GPT-5.6 Luna/Terra.
-    "gpt-5.6-luna": (0.00022, 0.00132),
-}
-
-
-def _bedrock_token_cost(model: str, in_tok: int, out_tok: int) -> float:
-    for fragment, (in_price, out_price) in _BEDROCK_PRICE_PER_1K_TOKENS.items():
-        if fragment in model:
-            return (in_tok / 1000) * in_price + (out_tok / 1000) * out_price
-    logger.warning("No Bedrock price entry for model %r — bedrock_cost_usd will read 0", model)
-    return 0.0
-
 
 def _cost_fields(
     start_time: float,
@@ -89,35 +48,24 @@ def _cost_fields(
     in_tok: int,
     out_tok: int,
     *,
-    saved: list[Path] | None = None,
-    log_volume: tuple[int, int] = (0, 0),
+    saved: list[Path],
+    log_volume: tuple[int, int],
 ) -> dict:
-    """Cost breakdown for one job run, for jobs.update_status().
-
-    `costs` is the full per-service itemisation (see costs.py). The four scalar
-    fields alongside it are the two biggest lines repeated, kept because job
-    records written before `costs` existed still carry them and DynamoDB items
-    don't migrate themselves.
+    """Cost breakdown for one job run, for jobs.update_status() — see costs.py.
 
     `log_volume` is read before the log handler has finished draining its queue,
-    so it misses the handful of lines this call itself is about to emit — an
-    estimate whose two consumers (DynamoDB write units, CloudWatch ingestion)
-    together come to a fraction of a cent, so it isn't worth restructuring the
-    job's exit paths to get exact.
+    so it misses the handful of lines the caller is about to emit — an estimate
+    whose two consumers (DynamoDB write units, CloudWatch ingestion) together
+    come to a fraction of a cent.
     """
     if not bedrock_cost_usd and (in_tok or out_tok):
-        bedrock_cost_usd = _bedrock_token_cost(get_settings().id_extraction_model, in_tok, out_tok)
+        bedrock_cost_usd = costs.bedrock_token_cost(
+            get_settings().id_extraction_model, in_tok, out_tok
+        )
     elapsed = time.time() - start_time
-    fargate_cost = (elapsed / 3600) * (
-        _FARGATE_VCPUS * _FARGATE_VCPU_HOUR_USD + _FARGATE_MEM_GB * _FARGATE_GB_HOUR_USD
-    )
-    files = [p for p in (saved or []) if p.is_file()]
+    files = [p for p in saved if p.is_file()]
     log_appends, log_bytes = log_volume
     return {
-        "bedrock_cost_usd": round(bedrock_cost_usd, 4),
-        "bedrock_input_tokens": in_tok,
-        "bedrock_output_tokens": out_tok,
-        "fargate_cost_usd": round(fargate_cost, 4),
         "fargate_seconds": round(elapsed, 1),
         "costs": costs.estimate(
             elapsed_s=elapsed,
@@ -221,7 +169,7 @@ def _load_overview(tmp: Path) -> dict | None:
     if the scraper that ran for this job writes one."""
     for path in tmp.rglob("overview.json"):
         try:
-            return json.loads(path.read_text(), parse_float=Decimal)
+            return json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             return None
     return None
@@ -244,8 +192,7 @@ def _resolve_location(address: str, metadata: dict | None) -> dict | None:
         except Exception:  # noqa: BLE001 — the map pin is a nice-to-have, not critical
             continue
         if geocoded and geocoded.lat is not None and geocoded.lon is not None:
-            # DynamoDB rejects native floats — round-trip through str() to Decimal.
-            return {"lat": Decimal(str(geocoded.lat)), "lon": Decimal(str(geocoded.lon))}
+            return {"lat": geocoded.lat, "lon": geocoded.lon}
     return None
 
 
@@ -282,7 +229,7 @@ def _doc_prefix(tmp: Path, saved: list[Path], input_address: str, metadata: dict
     them across per-job prefixes.
 
     County comes from where the scraper actually saved files locally
-    (``tmp/{county_key}/{slug}/...``, see ``download.make_download_dir``) —
+    (``tmp/{county_key}/{slug}/...``, see ``download.download_dir``) —
     more reliable than the job's `county` param, which may be unset (auto-
     detected). The identifier prefers, in order: the scraper's resolved
     property address, the original input, the account number, the legal
@@ -302,7 +249,7 @@ def _doc_prefix(tmp: Path, saved: list[Path], input_address: str, metadata: dict
     )
     state = (state or "unknown").lower()
     county_name = (county_name or "unknown").lower()
-    return f"{state}/{county_name}/{_slug(identifier)}"
+    return f"{state}/{county_name}/{slug(identifier)}"
 
 
 def _archive_full_log(job_id: str) -> None:
@@ -382,9 +329,7 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     """Run one scrape job end-to-end. Returns a process-style exit code."""
     job = jobs.get_job(job_id)
     if job is None or job.status in jobs.TERMINAL:
-        logger.info(
-            "Job %s skipped: already %s", job_id, job.status if job else "deleted"
-        )
+        logger.info("Job %s skipped: already %s", job_id, job.status if job else "deleted")
         return 0
     jobs.update_status(job_id, jobs.RUNNING)
     logger.info("Job %s RUNNING: %s (county=%s)", job_id, address, county or "auto")
@@ -393,13 +338,29 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     scraper_logger.addHandler(log_handler)
     narration.info(f"Starting your search for {address}...")
     start_time = time.time()
+    saved: list[Path] = []
+    cost, in_tok, out_tok = 0.0, 0, 0
+
+    def finish(status: str, **fields) -> None:
+        # Every exit path records a cost: a failed run still burned real
+        # Bedrock tokens and Fargate seconds.
+        jobs.update_status(
+            job_id,
+            status,
+            **fields,
+            **_cost_fields(
+                start_time, cost, in_tok, out_tok, saved=saved, log_volume=log_handler.volume
+            ),
+        )
+
     try:
-        with tempfile.TemporaryDirectory(prefix=f"job-{job_id}-") as tmp:
+        with tempfile.TemporaryDirectory(prefix=f"job-{job_id}-") as tmp_name:
+            tmp = Path(tmp_name)
             try:
                 saved, err, cost, in_tok, out_tok = await _run_unless_cancelled(
                     job_id,
                     asyncio.wait_for(
-                        run_async(address, tmp_dir=Path(tmp), quiet=True, county_override=county),
+                        run_async(address, tmp_dir=tmp, quiet=True, county_override=county),
                         timeout=_JOB_TIMEOUT_SECONDS,
                     ),
                 )
@@ -407,46 +368,31 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
                 narration.info("This search was cancelled.")
                 logger.info("Job %s CANCELLED: scrape stopped", job_id)
                 return 0
-            except asyncio.TimeoutError:
-                jobs.update_status(
-                    job_id,
+            except TimeoutError:
+                hours = _JOB_TIMEOUT_SECONDS // 3600
+                finish(
                     jobs.FAILED,
-                    error=f"Search exceeded the {_JOB_TIMEOUT_SECONDS // 3600}-hour time limit and was stopped.",
-                    **_cost_fields(start_time, 0.0, 0, 0, log_volume=log_handler.volume),
+                    error=f"Search exceeded the {hours}-hour time limit and was stopped.",
                 )
                 narration.info("This search took too long and was stopped to avoid runaway cost.")
                 logger.error("Job %s FAILED: timed out after %ss", job_id, _JOB_TIMEOUT_SECONDS)
                 return 1
             if err:
-                jobs.update_status(
-                    job_id,
-                    jobs.FAILED,
-                    error=err,
-                    **_cost_fields(
-                        start_time, cost, in_tok, out_tok,
-                        saved=saved, log_volume=log_handler.volume,
-                    ),
-                )
+                finish(jobs.FAILED, error=err)
                 narration.info("We hit a problem and couldn't finish this search.")
                 logger.error("Job %s FAILED: %s", job_id, err)
                 return 1
-            metadata = _load_overview(Path(tmp))
-            doc_prefix = _doc_prefix(Path(tmp), saved, address, metadata)
+            metadata = _load_overview(tmp)
+            doc_prefix = _doc_prefix(tmp, saved, address, metadata)
             count = jobs.upload_documents(doc_prefix, saved)
             jobs.upload_thumbnails(doc_prefix, _make_thumbnails(saved))
             _upload_map_image(job_id, metadata)
-            location = _resolve_location(address, metadata)
-            jobs.update_status(
-                job_id,
+            finish(
                 jobs.COMPLETED,
                 file_count=count,
                 metadata=metadata,
-                location=location,
+                location=_resolve_location(address, metadata),
                 doc_prefix=doc_prefix,
-                **_cost_fields(
-                    start_time, cost, in_tok, out_tok,
-                    saved=saved, log_volume=log_handler.volume,
-                ),
             )
             if (metadata or {}).get("limits", {}).get("cross_reference_depth_limit"):
                 narration.info(
@@ -459,12 +405,7 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     except Exception as exc:  # noqa: BLE001 — surface any failure to the job record
         narration.info("Something unexpected went wrong and the search had to stop.")
         logger.exception("Job %s crashed", job_id)
-        jobs.update_status(
-            job_id,
-            jobs.FAILED,
-            error=str(exc),
-            **_cost_fields(start_time, 0.0, 0, 0, log_volume=log_handler.volume),
-        )
+        finish(jobs.FAILED, error=str(exc))
         return 1
     finally:
         scraper_logger.removeHandler(log_handler)
@@ -484,7 +425,7 @@ async def _run_once() -> int:
 
 async def _poll_loop() -> int:
     """Local-dev queue consumer: process SQS messages until interrupted."""
-    queue_url = get_shared_settings().require_job_queue_url()
+    queue_url = get_shared_settings().require("job_queue_url")
     sqs = aws.client("sqs")
     logger.info("Worker polling %s", queue_url)
     while True:

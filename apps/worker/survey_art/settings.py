@@ -68,10 +68,6 @@ class Settings(BaseSettings):
     # ROW, then deeds, then the rest). 0 means no cap — fetch the section.
     weld_section_download_limit: int = 250
 
-    # Legacy eRecording credentials (old Java system — no longer used)
-    weld_erecording_username: str = ""
-    weld_erecording_password: str = ""
-
     # Denver County Clerk & Recorder (Kofile Tech) login
     co_denver_username: str = ""
     co_denver_password: str = ""
@@ -87,23 +83,9 @@ class Settings(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         # Earlier sources win, so a real env var/`.env` entry still overrides the
         # secret (handy for local testing against real creds without touching AWS).
-        sources: tuple[PydanticBaseSettingsSource, ...] = (
-            init_settings,
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        )
         secret_id = os.environ.get("APP_CONFIG_SECRET_ID", "")
-        if secret_id:
-            secrets_settings = AWSSecretsManagerSettingsSource(settings_cls, secret_id)
-            sources = (
-                init_settings,
-                env_settings,
-                dotenv_settings,
-                secrets_settings,
-                file_secret_settings,
-            )
-        return sources
+        secrets = (AWSSecretsManagerSettingsSource(settings_cls, secret_id),) if secret_id else ()
+        return (init_settings, env_settings, dotenv_settings, *secrets, file_secret_settings)
 
 
 @lru_cache(maxsize=1)

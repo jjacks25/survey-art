@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
+from importlib.metadata import version
 from pathlib import Path
 
-from survey_art import __version__
-from survey_art.pipeline import COUNTY_SCRAPERS, run
+from survey_art.pipeline import COUNTY_SCRAPERS, run_async
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +28,6 @@ def main() -> None:
     )
     parser.add_argument(
         "-t", "--tmp", type=Path, default=Path("tmp"), help="Output directory (default: ./tmp)"
-    )
-    parser.add_argument(
-        "--no-skip-existing", action="store_true", help="Re-download existing files"
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
     parser.add_argument(
@@ -68,20 +66,22 @@ def main() -> None:
             "instead of the HTTP shortcut."
         ),
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+
+    parser.add_argument("--version", action="version", version=version("survey-art"))
 
     args = parser.parse_args()
     address = " ".join(args.address)
 
-    saved, err, _cost, _in_tok, _out_tok = run(
-        address,
-        tmp_dir=args.tmp,
-        skip_existing=not args.no_skip_existing,
-        quiet=args.quiet,
-        county_override=args.county,
-        str_input=args.str_input,
-        owner_input=args.owner_input,
-        sop_strict=args.sop_strict,
+    saved, err, _cost, _in_tok, _out_tok = asyncio.run(
+        run_async(
+            address,
+            tmp_dir=args.tmp,
+            quiet=args.quiet,
+            county_override=args.county,
+            str_input=args.str_input,
+            owner_input=args.owner_input,
+            sop_strict=args.sop_strict,
+        )
     )
 
     if err:

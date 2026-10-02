@@ -63,7 +63,7 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
     jobs.save_property(address=req.address, county=req.county or "")
 
     aws.client("sqs").send_message(
-        QueueUrl=get_shared_settings().require_job_queue_url(),
+        QueueUrl=get_shared_settings().require("job_queue_url"),
         MessageBody=json.dumps(
             {"jobId": job_id, "address": req.address, "county": req.county or ""}
         ),
@@ -120,11 +120,8 @@ def get_job(job_id: str) -> JobResponse:
     job = jobs.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    # get_job() already resolved `metadata` from S3 (see jobs.upload_metadata());
-    # metadataKey itself is an internal storage detail, not part of the API.
-    item = job.to_item()
-    item.pop("metadataKey", None)
-    return JobResponse(**item)
+    # get_job() already resolved `metadata` from S3 (see jobs.upload_metadata()).
+    return JobResponse.model_validate(job.model_dump())
 
 
 @app.get("/api/jobs/{job_id}/files", response_model=FilesResponse)
@@ -151,7 +148,7 @@ def delete_job(job_id: str) -> None:
             # top of it.
             try:
                 aws.client("ecs").stop_task(
-                    cluster=get_shared_settings().require_cluster_arn(),
+                    cluster=get_shared_settings().require("cluster_arn"),
                     task=job.task_arn,
                     reason="Cancelled by user",
                 )

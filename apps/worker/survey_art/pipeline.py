@@ -2,28 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 
-from survey_art.console import county_resolved, download_done, files_table, model_banner, run_cost
-from survey_art.document_filter import DEFAULT_FILTER, DocumentFilter
-from survey_art.geocode import GeocodedAddress, address_to_county
-from survey_art.scrapers import (
-    arapahoe_county,
-    denver_county,
-    jefferson_county,
-    weld_county,
-)
+from survey_art.console import county_resolved, files_table, model_banner, run_cost
+from survey_art.geocode import County, GeocodedAddress, address_to_county
+from survey_art.scrapers import arapahoe_county, denver_county, jefferson_county, weld_county
 from survey_art.settings import get_settings
 
-logger = logging.getLogger(__name__)
-
-# Maps County.key() -> scrape coroutine function
-ScrapeFn = Callable[..., Coroutine]
-
-COUNTY_SCRAPERS: dict[str, ScrapeFn] = {
+# Maps County.key() -> scrape coroutine function. Every scraper is called as
+# `scrape(geocoded, tmp_dir)` and returns (saved, error, cost_usd, in_tokens, out_tokens).
+COUNTY_SCRAPERS: dict[str, Callable[..., Coroutine]] = {
     "CO_weld": weld_county.scrape,
     "CO_denver": denver_county.scrape,
     "CO_arapahoe": arapahoe_county.scrape,
@@ -34,39 +23,28 @@ COUNTY_SCRAPERS: dict[str, ScrapeFn] = {
 async def run_async(
     address: str,
     *,
-    tmp_dir: Path | None = None,
-    doc_filter: DocumentFilter = DEFAULT_FILTER,
-    skip_existing: bool = True,
+    tmp_dir: Path = Path("tmp"),
     quiet: bool = False,
     county_override: str | None = None,
     str_input: str = "",
     owner_input: str = "",
     sop_strict: bool = False,
 ) -> tuple[list[Path], str | None, float, int, int]:
-    """
-    Full async pipeline: geocode address -> dispatch to county scraper -> download.
-    Returns (saved_paths, error_message, bedrock_cost_usd, input_tokens, output_tokens).
-    """
-    tmp = tmp_dir or Path("tmp")
-    s = get_settings()
+    """Geocode `address`, dispatch to its county's scraper, and return
+    `(saved_paths, error_message, bedrock_cost_usd, input_tokens, output_tokens)`."""
     if not quiet:
-        model_banner(s.model)
+        model_banner(get_settings().model)
 
-    geocoded: GeocodedAddress | None = address_to_county(address)
+    geocoded = address_to_county(address)
     if not geocoded:
         if not county_override:
             return [], "Could not resolve address to a county.", 0.0, 0, 0
-        # county_override supplied but geocoding failed (e.g. input is a parcel/account ID).
-        # Build a minimal GeocodedAddress so the scraper can run.
-        _state, _county_name = (county_override.split("_", 1) + ["Unknown"])[:2]
-        from survey_art.geocode import County
-
+        # Geocoding fails for non-address input (an account/parcel ID); with a
+        # county override, hand the raw input to the scraper as the street.
+        state, _, name = county_override.partition("_")
+        county = County(state=state.upper(), name=name.replace("_", " ").title() or "Unknown")
         geocoded = GeocodedAddress(
-            street=address,
-            city="",
-            state=_state.upper(),
-            zip_code="",
-            county=County(state=_state.upper(), name=_county_name.replace("_", " ").title()),
+            street=address, city="", state=county.state, zip_code="", county=county
         )
 
     if not quiet:
@@ -76,58 +54,15 @@ async def run_async(
     scrape_fn = COUNTY_SCRAPERS.get(county_key)
     if not scrape_fn:
         supported = ", ".join(COUNTY_SCRAPERS)
-        return (
-            [],
-            f"County '{county_key}' is not yet supported. Supported counties: {supported}",
-            0.0,
-            0,
-            0,
-        )
+        return [], f"County '{county_key}' is not yet supported. Supported: {supported}", 0, 0, 0
 
-    # Weld scraper accepts SOP Phase 1 keyword args; other scrapers don't (yet).
-    scrape_kwargs: dict = {}
+    # Weld accepts SOP Phase 1 keyword args; the other scrapers don't.
+    kwargs = {}
     if county_key == "CO_weld":
-        scrape_kwargs = {
-            "str_input": str_input,
-            "owner_input": owner_input,
-            "sop_strict": sop_strict,
-        }
-    saved, err, cost, in_tok, out_tok = await scrape_fn(geocoded, tmp, doc_filter, **scrape_kwargs)
+        kwargs = {"str_input": str_input, "owner_input": owner_input, "sop_strict": sop_strict}
+    saved, err, cost, in_tok, out_tok = await scrape_fn(geocoded, tmp_dir, **kwargs)
     if not quiet:
         run_cost(cost, in_tok, out_tok)
-    if err:
-        return [], err, cost, in_tok, out_tok
-
-    if not quiet and saved:
-        download_done(saved, str(tmp))
-        files_table(saved, str(tmp))
-
-    return saved, None, cost, in_tok, out_tok
-
-
-def run(
-    address: str,
-    *,
-    tmp_dir: Path | None = None,
-    doc_filter: DocumentFilter = DEFAULT_FILTER,
-    skip_existing: bool = True,
-    quiet: bool = False,
-    county_override: str | None = None,
-    str_input: str = "",
-    owner_input: str = "",
-    sop_strict: bool = False,
-) -> tuple[list[Path], str | None, float, int, int]:
-    """Synchronous wrapper around run_async."""
-    return asyncio.run(
-        run_async(
-            address,
-            tmp_dir=tmp_dir,
-            doc_filter=doc_filter,
-            skip_existing=skip_existing,
-            quiet=quiet,
-            county_override=county_override,
-            str_input=str_input,
-            owner_input=owner_input,
-            sop_strict=sop_strict,
-        )
-    )
+        if saved and not err:
+            files_table(saved, tmp_dir)
+    return ([] if err else saved), err, cost, in_tok, out_tok

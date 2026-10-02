@@ -27,7 +27,10 @@ while the model bill goes unwatched.
 
 from __future__ import annotations
 
+import logging
 import math
+
+logger = logging.getLogger(__name__)
 
 # --- Rates: us-west-2, on-demand, USD. See the module docstring before editing. --- #
 
@@ -50,7 +53,7 @@ _FARGATE_GB_HOUR = 0.004445
 
 # --- Fixed facts about how this app is deployed --- #
 
-# WorkerTaskDefinition in infra/cloudformation/backend.yaml: Cpu '1024', Memory '2048'.
+# WorkerTaskDefinition in infra/cloudformation/backend.yaml: Cpu '1024', Memory '4096'.
 # Change those and these must change with them.
 _FARGATE_VCPUS = 1
 _FARGATE_MEM_GB = 4
@@ -70,6 +73,35 @@ _API_LAMBDA_SECONDS = 0.1
 # timestamps, cost fields). Rough, and it barely matters — one write unit is
 # $0.000000625.
 _DDB_BASE_ITEM_BYTES = 1_500
+
+
+# On-demand Bedrock price per 1K tokens, (input, output), keyed by a substring of
+# the Bedrock model/inference-profile ID (e.g. "us.anthropic.claude-haiku-4-5-...").
+# Only consulted when a run's own usage accounting reported no dollar figure — today
+# that's id_extraction.py's raw converse() calls, i.e. every Weld run. Add a row for
+# each new model `id_extraction_model` gets pointed at; no API returns these.
+_BEDROCK_PRICE_PER_1K_TOKENS: dict[str, tuple[float, float]] = {
+    "haiku-4-5": (0.001, 0.005),
+    "sonnet-4-5": (0.003, 0.015),
+    "sonnet-4-6": (0.003, 0.015),
+    "opus-4-5": (0.005, 0.025),
+    "opus-4-6": (0.005, 0.025),
+    "opus-4-7": (0.005, 0.025),
+    "opus-4-8": (0.005, 0.025),
+    "sonnet-5": (0.002, 0.010),
+    "opus-5": (0.005, 0.025),
+    # Bedrock's on-demand rate, not OpenAI's own API rate (they differ).
+    "gpt-5.6-luna": (0.00022, 0.00132),
+}
+
+
+def bedrock_token_cost(model: str, in_tok: int, out_tok: int) -> float:
+    """Dollar cost of `in_tok`/`out_tok` on `model` at on-demand rates, or 0 if unpriced."""
+    for fragment, (in_price, out_price) in _BEDROCK_PRICE_PER_1K_TOKENS.items():
+        if fragment in model:
+            return (in_tok / 1000) * in_price + (out_tok / 1000) * out_price
+    logger.warning("No Bedrock price entry for model %r — its cost will read 0", model)
+    return 0.0
 
 
 class CostLine:

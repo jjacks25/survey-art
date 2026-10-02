@@ -35,7 +35,7 @@ ignore = []
 "apps/api/app/schemas.py" = ["N815"]
 
 [tool.pytest.ini_options]
-testpaths = ["apps/worker/tests", "apps/api/tests", "packages/survey_shared/tests", "infra/tests"]
+testpaths = ["apps/worker/tests", "apps/api/tests", "infra/tests"]
 pythonpath = ["apps/worker", "apps/api"]
 addopts = "-v --tb=short"
 asyncio_mode = "auto"

@@ -55,21 +55,21 @@ import asyncio
 import functools
 import json
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 from pydantic import ValidationError
 
-from survey_art.county_sites import SUPPORTED_COUNTIES
 from survey_art.doc_classify import CATEGORIES, classify, reception_sort_key
-from survey_art.document_filter import DEFAULT_FILTER, DocumentFilter
-from survey_art.download import download_dir as make_download_dir
+from survey_art.download import download_dir
 from survey_art.geocode import GeocodedAddress
 from survey_art.id_extraction import IdExtraction, cache_fingerprint, extract_document_ids
+from survey_art.overview import Overview, overview_path
 from survey_art.scrapers.glo_records import fetch_glo_records
 from survey_art.scrapers.weld_road_row import fetch_road_row, road_row_references
 from survey_art.settings import get_settings
@@ -82,11 +82,9 @@ logger = logging.getLogger(__name__)
 # it never replaces those.
 narration = logging.getLogger("survey_art.narration")
 
-_ENTRY = next(e for e in SUPPORTED_COUNTIES if e["county"] == "Weld")
-_PORTAL_URL = _ENTRY["urls"]["property_portal"]
 _PORTAL_SEARCH_URL = "https://apps.weld.gov/propertyportal/index.cfm"
-_RECORDER_DISCLAIMER = _ENTRY["urls"]["recorder"]
 _PROPERTY_REPORT_URL = "https://propertyreport.weld.gov/"
+_RECORDER_DOCUMENT_URL = "https://recording.weld.gov/web/web/integration/document/{reception}"
 
 _HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -94,72 +92,63 @@ _HTTP_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Survey-relevant document type codes used by Weld County recorder.
-# Codes not in this set are skipped (mortgage releases, tax liens, etc.)
-_SURVEY_TYPE_CODES = {
-    # Plats / surveys
-    "SURV",  # Survey / Site Plan
-    "SUB",  # Subdivision Plat
-    "LSP",  # Land Survey Plat
-    "ISP",  # Improvement Survey Plat
-    "ILC",  # Improvement Location Certificate
-    "ALTA",  # ALTA/NSPS Survey
-    "PLAT",  # Generic plat
-    "AMDPL",  # Amended Plat
-    "CORPL",  # Correction Plat
-    "VACPL",  # Vacating Plat
-    "CONDPL",  # Condominium Plat
-    # Deeds (ownership chain)
-    "WD",  # Warranty Deed
-    "WDN",  # Warranty Deed (Non-Money)
-    "SWD",  # Special Warranty Deed
-    "SWDN",  # Special Warranty Deed (Non-Money)
-    "QCD",  # Quit Claim Deed
-    "QCN",  # Quit Claim Deed (Non-Money)
-    "QCDN",  # Quit Claim Deed (Non-Money, alternate code)
-    "PRD",  # Personal Representative Deed
-    "TRD",  # Trustee Deed
-    "GD",  # General Deed
-    # Easements & ROW
-    "ESMT",  # Easement
-    "ROW",  # Right of Way
-    "ROWE",  # Right of Way Easement
-    "AE",  # Access Easement
-    "UE",  # Utility Easement
-    "DE",  # Drainage Easement
-    "CE",  # Conservation Easement
-    # Government / public records
-    "RES",  # Resolution
-    "ORD",  # Ordinance
-    "COD",  # Certificate of Dedication
-    "NOC",  # Notice of Condemnation
-}
-
 
 @dataclass
 class _DocRecord:
     reception: str
-    rec_date: str
-    doc_type: str
-    grantor: str
-    grantee: str
-    url: str
+    rec_date: str = ""
+    doc_type: str = ""
+    grantor: str = ""
+    grantee: str = ""
     doc_fee: str = ""
     sale_date: str = ""
     sale_price: str = ""
+    url: str = ""
+
+    def __post_init__(self) -> None:
+        # Anything found by search or citation is fetched through the
+        # recorder's integration URL; only Document History rows carry their own.
+        self.url = self.url or _RECORDER_DOCUMENT_URL.format(reception=self.reception)
 
     def to_dict(self) -> dict:
-        return {
-            "reception": self.reception,
-            "rec_date": self.rec_date,
-            "doc_type": self.doc_type,
-            "grantor": self.grantor,
-            "grantee": self.grantee,
-            "doc_fee": self.doc_fee,
-            "sale_date": self.sale_date,
-            "sale_price": self.sale_price,
-            "url": self.url,
+        return asdict(self)
+
+
+def _row_to_record(row: dict) -> _DocRecord:
+    """An Advanced Search result row (see `_run_advanced_search`) as a download target."""
+    return _DocRecord(row["reception"], rec_date=row["rec_date"], doc_type=row["doc_type"])
+
+
+def _target_rows(targets) -> list[dict]:
+    """overview.json rows for `(role, doc)` download targets."""
+    return [
+        {"role": role, "reception": doc.reception, "doc_type": doc.doc_type, "url": doc.url}
+        for role, doc, *_ in targets
+    ]
+
+
+def _result_rows(results: list[tuple[str, _DocRecord, list[Path]]]) -> list[dict]:
+    """overview.json rows for `(role, doc, paths)` download results."""
+    return [
+        {
+            "role": role,
+            "reception": doc.reception,
+            "doc_type": doc.doc_type,
+            "status": "downloaded" if paths else "failed",
+            "files": [str(p) for p in paths],
         }
+        for role, doc, paths in results
+    ]
+
+
+async def _launch_browser(pw, *, slow_mo: int = 400):
+    """Chromium for the county sites. Set WELD_HEADED=1 to watch it drive itself."""
+    headed = os.environ.get("WELD_HEADED", "").lower() in ("1", "true", "yes")
+    return await pw.chromium.launch(
+        headless=not headed,
+        args=["--disable-blink-features=AutomationControlled"],
+        slow_mo=slow_mo if headed else 0,
+    )
 
 
 # All of Weld County is north of the 6th P.M. base line and west of the meridian,
@@ -206,6 +195,22 @@ class ParcelInfo:
         if not (self.section or self.township or self.range_):
             return ""
         return f"S{self.section}-T{self.township}-R{self.range_}"
+
+    def str_criteria(self, purpose: str) -> dict[str, str] | None:
+        """Advanced Search criteria for this parcel's S/T/R, or None (logged as
+        skipping `purpose`) when any of the three is unknown."""
+        if not (self.section and self.township and self.range_):
+            logger.warning(
+                "%s: parcel S/T/R is incomplete (%s/%s/%s) — skipping.",
+                purpose,
+                self.section,
+                self.township,
+                self.range_,
+            )
+            return None
+        # _run_advanced_search strips the N/S and E/W off township and range.
+        section = self.section.lstrip("0") or self.section
+        return {"section": section, "township": self.township, "range_": self.range_}
 
     def to_dict(self) -> dict:
         return {
@@ -419,12 +424,6 @@ def _get_parcel_info_http(query: str, query_type: str = "address") -> ParcelInfo
     return info
 
 
-def _get_account_number(address: str) -> str | None:
-    """Back-compat shim: return just the account number for an address query."""
-    info = _get_parcel_info_http(address, "address")
-    return info.account if info else None
-
-
 # ---------------------------------------------------------------------------
 # Browser-walk Phase 1 (SOP-strict path)
 # ---------------------------------------------------------------------------
@@ -451,19 +450,12 @@ async def _get_parcel_info_browser(
 
     Set WELD_HEADED=1 to watch the browser drive itself.
     """
-    import os
-
     from playwright.async_api import async_playwright
 
-    headed = os.environ.get("WELD_HEADED", "").lower() in ("1", "true", "yes")
     info: ParcelInfo | None = None
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=not headed,
-            args=["--disable-blink-features=AutomationControlled"],
-            slow_mo=400 if headed else 0,
-        )
+        browser = await _launch_browser(pw)
         ctx = await browser.new_context(user_agent=_HTTP_HEADERS["User-Agent"])
         page = await ctx.new_page()
 
@@ -554,8 +546,8 @@ async def _browser_read_identify_panel(page) -> ParcelInfo | None:
             """() => {
             const m = Array.from(document.querySelectorAll('*'))
               .find(n => n.textContent && n.textContent.startsWith('Identify'));
-            return m ? m.closest('[class*="results"], [class*="Results"], aside, section')?.innerText
-                     : document.body.innerText;
+            const panel = '[class*="results"], [class*="Results"], aside, section';
+            return m ? m.closest(panel)?.innerText : document.body.innerText;
         }"""
         )
         or ""
@@ -572,7 +564,6 @@ async def _browser_read_identify_panel(page) -> ParcelInfo | None:
         logger.warning("Identify panel did not contain an account number")
         return None
 
-    str_text = grab("Section") or ""
     s_m = re.search(r"Section[: ]+(\d+)", text, re.IGNORECASE)
     t_m = re.search(r"Township[: ]+(\d+[NS]?)", text, re.IGNORECASE)
     r_m = re.search(r"Range[: ]+(\d+[EW]?)", text, re.IGNORECASE)
@@ -792,13 +783,6 @@ async def _capture_map_image(account: str, dest_dir: Path) -> Path | None:
             await browser.close()
 
 
-def _filter_survey_docs(records: list[_DocRecord]) -> list[_DocRecord]:
-    """Keep only documents relevant to land survey research."""
-    filtered = [r for r in records if r.doc_type in _SURVEY_TYPE_CODES]
-    logger.info("Document filter: %d/%d records match survey types", len(filtered), len(records))
-    return filtered
-
-
 # ---------------------------------------------------------------------------
 # Decision Matrix — routes a parcel to a research strategy based on what its
 # Document History contains (see docs/weld_county_sop.md for the full spec).
@@ -1002,6 +986,12 @@ _DISCLAIMER_COOKIE = {
 }
 
 
+async def _reassert_disclaimer(ctx) -> None:
+    """Replace whatever disclaimer cookie the server last set with ours."""
+    await ctx.clear_cookies(name="disclaimerAccepted")
+    await ctx.add_cookies([_DISCLAIMER_COOKIE])
+
+
 async def _recorder_login(ctx, username: str, password: str) -> bool:
     """Authenticate `ctx` against recording.weld.gov. Returns success.
 
@@ -1089,13 +1079,13 @@ async def _fetch_document(
             # lock a sibling can land in the window where the cookie is missing
             # and get served the disclaimer instead of its document.
             async with cookie_lock:
-                await ctx.clear_cookies(name="disclaimerAccepted")
-                await ctx.add_cookies([_DISCLAIMER_COOKIE])
+                await _reassert_disclaimer(ctx)
         # Nothing below may escape: these run under one `asyncio.gather`, so a
         # raise here would cancel every other document in flight (mid-write, in
         # the worst case) and skip the browser teardown. A document that can't
         # be fetched returns no paths instead — the caller already treats that
         # as "failed" and carries on with the rest.
+        where = f"{role} reception {doc.reception} (attempt {attempt + 1}/{_DOC_FETCH_ATTEMPTS})"
         doc_page = None
         try:
             doc_page = await ctx.new_page()
@@ -1124,12 +1114,7 @@ async def _fetch_document(
                 image_div = await doc_page.query_selector("#ImageDiv")
                 msg = (await image_div.inner_text()).strip()[:200] if image_div else ""
                 logger.warning(
-                    "No printCustom button for %s reception %s (attempt %d/%d) — %s",
-                    role,
-                    doc.reception,
-                    attempt + 1,
-                    _DOC_FETCH_ATTEMPTS,
-                    msg or "(no diagnostic message)",
+                    "No printCustom button for %s — %s", where, msg or "(no diagnostic message)"
                 )
                 continue
 
@@ -1137,25 +1122,14 @@ async def _fetch_document(
             resp = await ctx.request.get(pdf_url)
             body = await resp.body() if resp.status == 200 else b""
             if resp.status != 200:
-                logger.warning(
-                    "Print endpoint returned HTTP %s for %s reception %s (attempt %d/%d)",
-                    resp.status,
-                    role,
-                    doc.reception,
-                    attempt + 1,
-                    _DOC_FETCH_ATTEMPTS,
-                )
+                logger.warning("Print endpoint returned HTTP %s for %s", resp.status, where)
                 continue
             if not body or body[:5] != b"%PDF-":
                 logger.warning(
-                    "Print endpoint returned non-PDF body for %s reception %s "
-                    "(head=%r, %d bytes, attempt %d/%d)",
-                    role,
-                    doc.reception,
+                    "Print endpoint returned non-PDF body for %s (head=%r, %d bytes)",
+                    where,
                     body[:8],
                     len(body),
-                    attempt + 1,
-                    _DOC_FETCH_ATTEMPTS,
                 )
                 continue
 
@@ -1171,7 +1145,7 @@ async def _fetch_document(
             )
             break
         except Exception as exc:
-            logger.warning("Download error for %s reception %s: %s", role, doc.reception, exc)
+            logger.warning("Download error for %s: %s", where, exc)
         finally:
             if doc_page is not None:
                 await doc_page.close()
@@ -1180,13 +1154,9 @@ async def _fetch_document(
 
 
 async def _download_documents(
-    address: str,
     targets: list[tuple[str, _DocRecord]],
-    doc_filter: DocumentFilter,
     dest_dir: Path,
-    username: str = "",
-    password: str = "",
-) -> tuple[list[tuple[str, _DocRecord, list[Path]]], float, int, int]:
+) -> list[tuple[str, _DocRecord, list[Path]]]:
     """Phase 3: download recorder documents via Playwright with disclaimer bypass.
 
     Accepts a list of `(role, _DocRecord)` tuples. The `role` is used as the
@@ -1201,53 +1171,30 @@ async def _download_documents(
     the `disclaimerAccepted=true` cookie directly — the document viewer only
     checks for the cookie's presence.
 
-    Returns `(results, cost, in_tokens, out_tokens)` where `results` is a list
-    of `(role, doc_record, [saved_paths])` so the caller can map each downloaded
-    document back to its semantic role.
+    Returns a list of `(role, doc_record, [saved_paths])`, in `targets` order,
+    so the caller can map each downloaded document back to its semantic role.
     """
     if not targets:
-        return [], 0.0, 0, 0
+        return []
 
     from playwright.async_api import async_playwright
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-
-    # Set WELD_HEADED=1 to watch the browser drive itself (useful for debugging).
-    import os
-
-    headed = os.environ.get("WELD_HEADED", "").lower() in ("1", "true", "yes")
+    s = get_settings()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=not headed,
-            args=["--disable-blink-features=AutomationControlled"],
-            slow_mo=500 if headed else 0,
-        )
-        ctx = await browser.new_context(
-            user_agent=_HTTP_HEADERS["User-Agent"],
-            accept_downloads=True,
-        )
-
+        browser = await _launch_browser(pw, slow_mo=500)
+        ctx = await browser.new_context(user_agent=_HTTP_HEADERS["User-Agent"])
         await ctx.add_cookies([_DISCLAIMER_COOKIE])
-        setup_page = await ctx.new_page()
 
-        # Step 2: Login if credentials are provided.
-        #
-        # The login page is a jQuery Mobile fragment — loading `/web/user/login`
-        # directly leaves jQuery undefined, so clicking the in-page submit
-        # button (or calling the JS handler) doesn't work. The button's JS
-        # handler ultimately POSTs the serialized form to `/web/user/login`
-        # and expects a JSON `{success, message}` response, so we just do
-        # that POST directly through Playwright's request context. The
-        # response cookies are shared with subsequent page navigations.
-        if username and password:
-            if not await _recorder_login(ctx, username, password):
+        # Anonymous viewing gets a "must be a registered user" stub instead of
+        # the document, but the attempt is still made (and logged) without creds.
+        if s.weld_recorder_username and s.weld_recorder_password:
+            if not await _recorder_login(ctx, s.weld_recorder_username, s.weld_recorder_password):
                 await browser.close()
-                return [], 0.0, 0, 0
+                return []
 
-        await setup_page.close()
-
-        # Step 3: Download each document as a single complete PDF.
+        # Download each document as a single complete PDF.
         #
         # Tyler's viewer uses PDF.js with HTTP Range requests, so trying to
         # snoop the network for "the PDF" yields fragmented byte chunks rather
@@ -1261,7 +1208,7 @@ async def _download_documents(
         # tabs of this one already-authenticated context — so the session is
         # established once and never re-established mid-run. `gather` preserves
         # input order, so `results` still lines up with `targets`.
-        limit = max(1, get_settings().weld_download_concurrency)
+        limit = max(1, s.weld_download_concurrency)
         semaphore = asyncio.Semaphore(limit)
         cookie_lock = asyncio.Lock()
         logger.info("Fetching %d document(s), %d at a time", len(targets), limit)
@@ -1276,51 +1223,22 @@ async def _download_documents(
 
     total_files = sum(len(paths) for _, _, paths in results)
     logger.info("Weld County: saved %d file(s) across %d document(s)", total_files, len(results))
-    return results, 0.0, 0, 0
+    return results
 
-
-# ---------------------------------------------------------------------------
-# Direct Extraction — ALTA + vesting deed already on file (decision path "direct")
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Partial History Search — S/T/R Advanced Search for easements/ROW, plus
 # whatever vesting deed is on file (decision path "alternate_partial")
 # ---------------------------------------------------------------------------
 
-# Document Types multiselect filter list for the Advanced Search. Every
-# variant of EASEMENT / RIGHT OF WAY the SOP enumerates. The Self Service Web
-# search UI is an autocomplete input that's awkward to drive headlessly, so
-# we let the Advanced Search return ALL rows matching the S/T/R and
-# post-filter on the Type column rendered in each result row.
-_EASEMENT_ROW_DOC_TYPES = {
-    "EASEMENT",
-    "EASEMENT & RIGHT OF WAY",
-    "EASEMENT DEED",
-    "EASEMENT PLAT",
-    "EASEMENT RIGHT OF WAY & SURFACE USE AGR",
-    "EASEMENT RIGHT OF WAY AND SURFACE USE AGR",
-    "EASEMENT & SURFACE USE AGR",
-    "GRANT & RELEASE OF EASEMENT",
-    "RIGHT OF WAY",
-    "RIGHT OF WAY EASEMENT",
-    "RIGHT OF WAY AGREEMENT",
-    "AMENDED RIGHT OF WAY",
-    "R/W AGREEMENT",
-    "ROW",
-    "RIGHT OF WAY (RW)",
-}
-
 _ADVANCED_SEARCH_URL = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
 
 
 def _matches_easement_filter(doc_type_label: str) -> bool:
-    """Loose match: a doc type passes if any easement keyword appears in it."""
-    upper = doc_type_label.upper().strip()
-    if upper in _EASEMENT_ROW_DOC_TYPES:
-        return True
-    # The label may carry extra punctuation/spacing; match the canonical
-    # tokens conservatively.
+    """Loose match on the Advanced Search Type column — the recorder spells the
+    same easement/ROW type many ways ("EASEMENT RIGHT OF WAY & SURFACE USE AGR",
+    "R/W AGREEMENT", "RIGHT OF WAY (RW)"), so match keywords, not a list."""
+    upper = doc_type_label.upper()
     return any(t in upper for t in ("EASEMENT", "RIGHT OF WAY", "R/W", "ROW"))
 
 
@@ -1366,8 +1284,7 @@ async def _run_advanced_search(
         if "/user/disclaimer" not in page.url:
             break
         logger.warning("Advanced Search: bounced to the disclaimer (attempt %d/3)", attempt + 1)
-        await page.context.clear_cookies(name="disclaimerAccepted")
-        await page.context.add_cookies([_DISCLAIMER_COOKIE])
+        await _reassert_disclaimer(page.context)
     # The form opens with a "Continue session?" dialog if any user state exists.
     # Measured across ~60 consecutive searches on one login it never appeared
     # once, so don't wait long for it.
@@ -1425,7 +1342,8 @@ async def _run_advanced_search(
             const items = document.querySelectorAll('li.ss-search-row[data-documentid]');
             return Array.from(items).map(li => {
                 const docId = li.getAttribute('data-documentid') || '';
-                const text = (li.querySelector('h1')?.textContent || '').replace(/\\s+/g, ' ').trim();
+                const h1 = li.querySelector('h1')?.textContent || '';
+                const text = h1.replace(/\\s+/g, ' ').trim();
                 // Header format: "<reception> • <type> • <date>"
                 const parts = text.split(/\\s*•\\s*/);
                 return {
@@ -1528,8 +1446,6 @@ async def _recorder_search_session(username: str, password: str):
     are missing or login fails, so callers can treat "no session" as "skip
     this research route" without crashing the run.
     """
-    import os
-
     from playwright.async_api import async_playwright
 
     if not (username and password):
@@ -1540,36 +1456,12 @@ async def _recorder_search_session(username: str, password: str):
         yield None
         return
 
-    headed = os.environ.get("WELD_HEADED", "").lower() in ("1", "true", "yes")
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=not headed,
-            args=["--disable-blink-features=AutomationControlled"],
-            slow_mo=400 if headed else 0,
-        )
-        ctx = await browser.new_context(user_agent=_HTTP_HEADERS["User-Agent"])
-        await ctx.add_cookies([_DISCLAIMER_COOKIE])
+        browser = await _launch_browser(pw)
         try:
-            resp = await ctx.request.post(
-                _RECORDER_LOGIN_URL,
-                form={"field_UserId": username, "field_Password": password},
-                headers={"X-Requested-With": "XMLHttpRequest"},
-            )
-            payload = json.loads(await resp.text())
-            if not payload.get("success"):
-                logger.error("Advanced Search login failed: %s", payload.get("message", "(no msg)"))
-                await browser.close()
-                yield None
-                return
-        except Exception as exc:
-            logger.warning("Advanced Search login error: %s", exc)
-            await browser.close()
-            yield None
-            return
-
-        page = await ctx.new_page()
-        try:
-            yield page
+            ctx = await browser.new_context(user_agent=_HTTP_HEADERS["User-Agent"])
+            await ctx.add_cookies([_DISCLAIMER_COOKIE])
+            yield await ctx.new_page() if await _recorder_login(ctx, username, password) else None
         finally:
             await browser.close()
 
@@ -1588,31 +1480,20 @@ async def _easement_row_search(
     it selects targets.
     """
     targets: list[tuple[str, _DocRecord]] = []
-    if not (parcel.section and parcel.township and parcel.range_):
-        logger.warning(
-            "Easement/ROW search: parcel S/T/R is incomplete (%s/%s/%s) — skipping.",
-            parcel.section,
-            parcel.township,
-            parcel.range_,
-        )
+    criteria = parcel.str_criteria("Easement/ROW search")
+    if not criteria:
         return targets
-
-    section = parcel.section.lstrip("0") or parcel.section
-    township = parcel.township  # _run_advanced_search strips N/S
-    range_ = parcel.range_  # and E/W respectively
 
     # Date-swept: the type filter below runs on rows the form already returned,
     # so a capped search silently filters the newest 100 documents rather than
     # every easement ever recorded against the section.
-    rows = await _search_all_rows(page, section=section, township=township, range_=range_)
-    # If a Subdivision is on file, repeat with Platted Legal.
+    rows = await _search_all_rows(page, **criteria)
+    # If a Subdivision is on file, repeat with Platted Legal (deduped by reception).
     if parcel.subdivision:
-        sub_rows = await _search_all_rows(page, subdivision=parcel.subdivision)
-        # Deduplicate by reception across the two searches.
-        by_reception_in_results = {r["reception"]: r for r in rows}
-        for r in sub_rows:
-            by_reception_in_results.setdefault(r["reception"], r)
-        rows = list(by_reception_in_results.values())
+        by_reception = {r["reception"]: r for r in rows}
+        for r in await _search_all_rows(page, subdivision=parcel.subdivision):
+            by_reception.setdefault(r["reception"], r)
+        rows = list(by_reception.values())
 
     for r in rows:
         reception = r["reception"]
@@ -1621,21 +1502,7 @@ async def _easement_row_search(
         if not _matches_easement_filter(r["doc_type"]):
             continue
         seen_receptions.add(reception)
-        # Synthesize a _DocRecord pointing at the integration URL so the
-        # existing downloader can fetch it via #printCustom.
-        targets.append(
-            (
-                "easement_or_row",
-                _DocRecord(
-                    reception=reception,
-                    rec_date=r["rec_date"],
-                    doc_type=r["doc_type"],
-                    grantor="",
-                    grantee="",
-                    url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
-                ),
-            )
-        )
+        targets.append(("easement_or_row", _row_to_record(r)))
     return targets
 
 
@@ -1682,19 +1549,10 @@ async def _section_township_range_search(
     everything recorded before 2022, which is what the old unbounded search
     dropped.
     """
-    if not (parcel.section and parcel.township and parcel.range_):
-        logger.warning(
-            "Section/Township/Range search: parcel S/T/R is incomplete (%s/%s/%s) — skipping.",
-            parcel.section,
-            parcel.township,
-            parcel.range_,
-        )
+    criteria = parcel.str_criteria("Section/Township/Range search")
+    if not criteria:
         return [], []
-
-    section = parcel.section.lstrip("0") or parcel.section
-    rows = await _search_all_rows(
-        page, section=section, township=parcel.township, range_=parcel.range_
-    )
+    rows = await _search_all_rows(page, **criteria)
 
     fresh = [r for r in rows if r["reception"] and r["reception"] not in seen_receptions]
     fresh.sort(key=lambda r: _date_sort_key(r["rec_date"]), reverse=True)  # newest first
@@ -1770,19 +1628,7 @@ def _select_schedule_b2_exception_targets(
         if item.id_type != "reception_number" or item.id in seen:
             continue
         seen.add(item.id)
-        targets.append(
-            (
-                "exception",
-                _DocRecord(
-                    reception=item.id,
-                    rec_date="",
-                    doc_type=item.context,
-                    grantor="",
-                    grantee="",
-                    url=f"https://recording.weld.gov/web/web/integration/document/{item.id}",
-                ),
-            )
-        )
+        targets.append(("exception", _DocRecord(item.id, doc_type=item.context)))
     if get_settings().application_mode.lower() == "demo" and len(targets) > _DEMO_EXCEPTION_LIMIT:
         narration.info(
             f"Demo mode: downloading {_DEMO_EXCEPTION_LIMIT} of the "
@@ -1904,14 +1750,10 @@ def _extract_cited_ids(reception: str, path: Path) -> IdExtraction:
 
 
 async def _expand_cross_references(
-    address: str,
-    doc_filter: DocumentFilter,
     dest: Path,
     ov,
     initial_results: list[tuple[str, _DocRecord, list[Path]]],
     known_receptions: set[str],
-    username: str,
-    password: str,
 ) -> tuple[list[tuple[str, _DocRecord, list[Path]]], int, int]:
     """Read every downloaded document for the other documents it cites, fetch
     those too, and repeat until nothing new turns up.
@@ -2021,7 +1863,7 @@ async def _expand_cross_references(
             and discovered < _MAX_CROSS_REFERENCE_DOCS
         ):
             searched_book_pages.update(item.id for item in book_pages)
-            async with _recorder_search_session(username, password) as search_page:
+            async with _recorder_search_session() as search_page:
                 if search_page:
                     resolved: dict[str, str] = dict(ov.get("book_page_resolutions", {}))
                     found = await _resolve_book_page_citations(
@@ -2047,11 +1889,7 @@ async def _expand_cross_references(
         if not next_targets:
             break
 
-        downloaded, _dl_cost, dl_in, dl_out = await _download_documents(
-            address, next_targets, doc_filter, dest, username=username, password=password
-        )
-        in_tok += dl_in
-        out_tok += dl_out
+        downloaded = await _download_documents(next_targets, dest)
         new_results.extend(downloaded)
         level = downloaded
         depth += 1
@@ -2063,8 +1901,6 @@ async def _select_partial_history_targets(
     decision: dict,
     all_docs: list[_DocRecord],
     parcel: ParcelInfo,
-    username: str = "",
-    password: str = "",
 ) -> list[tuple[str, _DocRecord]]:
     """Pick targets for the partial-history route (decision path "alternate_partial").
 
@@ -2091,7 +1927,7 @@ async def _select_partial_history_targets(
         targets.append(("vesting_deed", by_reception[deed_dict["reception"]]))
 
     seen_receptions = {d.reception for d in all_docs}
-    async with _recorder_search_session(username, password) as page:
+    async with _recorder_search_session() as page:
         if page is None:
             return targets
         targets += await _easement_row_search(page, parcel, seen_receptions)
@@ -2110,16 +1946,8 @@ async def _select_partial_history_targets(
 # (decision path "alternate_empty": Document History is empty)
 # ---------------------------------------------------------------------------
 
-_VESTING_DEED_LABELS = {
-    "WARRANTY DEED",
-    "SPECIAL WARRANTY DEED",
-    "QUIT CLAIM DEED",
-    "GENERAL WARRANTY DEED",
-}
-
-# Any other label with DEED in it also vests title — "JOINT TENANCY WARRANTY
-# DEED", "PERSONAL REPRESENTATIVES DEED", "BARGAIN AND SALE DEED",
-# "TREASURERS DEED" — so the set above is a floor, not the whole list. What has
+# Any label with DEED in it vests title — "WARRANTY DEED", "JOINT TENANCY
+# WARRANTY DEED", "PERSONAL REPRESENTATIVES DEED", "TREASURERS DEED". What has
 # to stay out is the paperwork that says DEED without conveying the land: a
 # deed of trust is a mortgage, and mineral/royalty deeds and easement deeds
 # convey something other than the fee.
@@ -2136,42 +1964,20 @@ _NOT_A_VESTING_DEED = (
     "SUBORDINATION",
 )
 
-# Document Types filter list for the subdivision-exemption search.
-_EXEMPTION_DOC_TYPES = {
-    "SUBDIVISION EXEMPTION",
-    "EXEMPTION",
-    "MINOR SUBDIVISION",
-    "AMENDED EXEMPTION",
-}
-
 
 def _matches_vesting_deed_label(doc_type_label: str) -> bool:
-    upper = doc_type_label.upper().strip()
-    if upper in _VESTING_DEED_LABELS:
-        return True
+    upper = doc_type_label.upper()
     return "DEED" in upper and not any(t in upper for t in _NOT_A_VESTING_DEED)
 
 
 def _matches_exemption_filter(doc_type_label: str) -> bool:
-    upper = doc_type_label.upper().strip()
-    return upper in _EXEMPTION_DOC_TYPES or "EXEMPTION" in upper
+    upper = doc_type_label.upper()
+    return "EXEMPTION" in upper or "MINOR SUBDIVISION" in upper
 
 
 def _matches_survey_filter(doc_type_label: str) -> bool:
-    upper = doc_type_label.upper().strip()
+    upper = doc_type_label.upper()
     return "SURVEY" in upper or "ALTA" in upper
-
-
-def _row_to_record(row: dict) -> _DocRecord:
-    reception = row["reception"]
-    return _DocRecord(
-        reception=reception,
-        rec_date=row["rec_date"],
-        doc_type=row["doc_type"],
-        grantor="",
-        grantee="",
-        url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
-    )
 
 
 # An owner-name search narrowed to this section returns a handful of rows; the
@@ -2221,12 +2027,7 @@ async def _owner_name_search(
         return []
 
     queries: list[dict[str, str]] = []
-    if parcel.section and parcel.township and parcel.range_:
-        str_query = {
-            "section": parcel.section.lstrip("0") or parcel.section,
-            "township": parcel.township,
-            "range_": parcel.range_,
-        }
+    if str_query := parcel.str_criteria("Owner-name search, S/T/R-bounded queries"):
         queries.append({"search_name": parcel.owner, **str_query})
         surname = parcel.owner.split()[0]
         if surname != parcel.owner:
@@ -2311,28 +2112,14 @@ async def _select_owner_name_search_targets(
             if reception and reception not in seen and "AFFIDAVIT" in row["doc_type"].upper():
                 seen.add(reception)
                 targets.append(("affidavit", _row_to_record(row)))
-    else:
-        logger.warning("Owner-name search: no owner name on record — skipping.")
 
-    if not (parcel.section and parcel.township and parcel.range_):
-        logger.warning(
-            "Owner-name search: parcel S/T/R is incomplete (%s/%s/%s) — skipping "
-            "exemption/easement/ALTA searches.",
-            parcel.section,
-            parcel.township,
-            parcel.range_,
-        )
+    criteria = parcel.str_criteria("Owner-name route's exemption/easement/ALTA searches")
+    if not criteria:
         return targets
 
-    section = parcel.section.lstrip("0") or parcel.section
-    township = parcel.township
-    range_ = parcel.range_
-
-    # Subdivision Exemption search.
-    exemption_rows = await _run_advanced_search(
-        page, section=section, township=township, range_=range_
-    )
-    for row in exemption_rows:
+    # One S/T/R search serves both the exemption and the last-ditch ALTA pick.
+    str_rows = await _run_advanced_search(page, **criteria)
+    for row in str_rows:
         reception = row["reception"]
         if reception and reception not in seen and _matches_exemption_filter(row["doc_type"]):
             seen.add(reception)
@@ -2341,14 +2128,11 @@ async def _select_owner_name_search_targets(
     # Easement / ROW scan, same as the partial-history route.
     targets += await _easement_row_search(page, parcel, seen)
 
-    # Last-ditch ALTA/survey search over the same S/T/R.
-    survey_rows = await _run_advanced_search(
-        page, section=section, township=township, range_=range_
-    )
+    # Last-ditch ALTA/survey pick over the same S/T/R.
     alta_hit = next(
         (
             r
-            for r in survey_rows
+            for r in str_rows
             if r["reception"] not in seen and _matches_survey_filter(r["doc_type"])
         ),
         None,
@@ -2441,7 +2225,6 @@ def _log_identify_results(info: ParcelInfo) -> None:
 async def scrape(
     geocoded: GeocodedAddress,
     tmp_dir: Path,
-    doc_filter: DocumentFilter = DEFAULT_FILTER,
     *,
     str_input: str = "",
     owner_input: str = "",
@@ -2453,8 +2236,6 @@ async def scrape(
     drives the literal browser walk; otherwise uses direct HTTP. Every phase
     writes to a per-property overview.json (see overview.py).
     """
-    from survey_art.overview import Overview, overview_path
-
     address = geocoded.one_line()
     _sweep_cache.clear()
     logger.info("Weld County scraper starting for: %s", address)
@@ -2462,36 +2243,22 @@ async def scrape(
 
     # --- Phase 1: parcel discovery (SOP Steps 1.1–1.5) ---
     parcel = await _resolve_parcel(
-        geocoded,
-        str_input=str_input,
-        owner_input=owner_input,
-        sop_strict=sop_strict,
+        geocoded, str_input=str_input, owner_input=owner_input, sop_strict=sop_strict
     )
     if not parcel:
         narration.info("We couldn't find this property in the Weld County system.")
-        return (
-            [],
-            (f"Parcel resolve failed: could not resolve {address} to a Weld parcel."),
-            0.0,
-            0,
-            0,
-        )
+        return [], f"Parcel resolve failed: could not resolve {address} to a Weld parcel.", 0, 0, 0
     _log_identify_results(parcel)
-    if parcel.owner:
-        narration.info(f"Found the property — account {parcel.account}, owned by {parcel.owner}.")
-    else:
-        narration.info(f"Found the property — account {parcel.account}.")
+    owned_by = f", owned by {parcel.owner}" if parcel.owner else ""
+    narration.info(f"Found the property — account {parcel.account}{owned_by}.")
     account = parcel.account
-    address = (
-        parcel.account
-        if re.match(r"^R\d{5,9}$", geocoded.street.strip(), re.IGNORECASE)
-        else address
-    )
+    if re.match(r"^R\d{5,9}$", geocoded.street.strip(), re.IGNORECASE):
+        address = account
 
     # Output dir + overview store. Initialized here so every later phase can
     # read/write it. Overview survives partial runs (crashes after Phase 1
     # leave a valid overview.json with just identify_results).
-    dest = make_download_dir(geocoded.county, address, base=tmp_dir)
+    dest = download_dir(geocoded.county, address, tmp_dir)
     ov = Overview(overview_path(tmp_dir, geocoded.county.key(), dest.name))
     ov.merge_section(
         "meta",
@@ -2500,10 +2267,7 @@ async def scrape(
             "input_address": geocoded.one_line(),
             "account": account,
             "sop_path": None,  # filled in by the Decision Matrix
-            "source_urls": [
-                _PORTAL_SEARCH_URL,
-                f"{_PROPERTY_REPORT_URL}?account={account}",
-            ],
+            "source_urls": [_PORTAL_SEARCH_URL, f"{_PROPERTY_REPORT_URL}?account={account}"],
         },
     )
     ov.set_section("identify_results", parcel.to_dict())
@@ -2520,8 +2284,7 @@ async def scrape(
     # Every field the report page returned, unsectioned/undeduplicated — kept
     # so nothing the county published is ever lost, even if today's grouping
     # doesn't have a home for it. The frontend deliberately does not render
-    # this section (see RAW_SECTION_KEYS in App.tsx) — it's for completeness/
-    # future use, not the curated view a surveyor reads.
+    # this section (see RAW_SECTION_KEYS in App.tsx).
     ov.set_section("raw_report_fields", report_fields)
 
     # SOP Step 1.7 Map accordion — render and save the parcel map as PNG. The
@@ -2531,8 +2294,7 @@ async def scrape(
     map_task = asyncio.create_task(_capture_map_image(account, dest))
 
     async def record_map() -> None:
-        map_path = await map_task
-        if map_path:
+        if map_path := await map_task:
             ov.merge_section(
                 "map",
                 {
@@ -2542,26 +2304,18 @@ async def scrape(
             )
 
     # --- SOP Step 1.7: Document History capture (the "Decision Frame") ---
-    # Parse the document history table directly from the property report HTML.
     # An empty result is valid — per the SOP it routes to the owner-name search.
     all_docs = _fetch_document_history(account)
     ov.set_section("document_history", [d.to_dict() for d in all_docs])
     narration.info(f"Found {len(all_docs)} recorded document(s) on file for this property.")
 
     # --- Phase 2: Decision Matrix (SOP Phase 2) ---
-    report_html = _fetch_property_report_html(account)  # cached
-    decision = _decision_matrix(all_docs, report_html)
+    decision = _decision_matrix(all_docs, _fetch_property_report_html(account))
     ov.set_section("decision_matrix", decision)
     ov.merge_section("meta", {"sop_path": decision["path"]})
-    logger.info(
-        "Decision Matrix: route %s — %s",
-        decision["path"],
-        decision["reasoning"][0],
-    )
+    logger.info("Decision Matrix: route %s — %s", decision["path"], decision["reasoning"][0])
 
     # --- Phase 3: route by Decision Matrix outcome ---
-    s = get_settings()
-    route_section: str
     if decision["path"] == "direct":
         narration.info("The survey and deed are on file — downloading them now...")
         targets = _select_direct_extraction_targets(decision, all_docs)
@@ -2569,77 +2323,41 @@ async def scrape(
         if not targets:
             narration.info("Couldn't find a survey or deed to download for this property.")
             await record_map()
-            return (
-                [],
-                (f"Direct extraction found no SURV or vesting deed for {account}."),
-                0.0,
-                0,
-                0,
-            )
-        logger.info(
-            "Direct extraction targets: %s",
-            ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
-        )
+            return [], f"Direct extraction found no SURV or vesting deed for {account}.", 0, 0, 0
     elif decision["path"] == "alternate_partial":
         narration.info(
             "The main documents aren't directly on file — checking the Clerk & "
             "Recorder's office for related records..."
         )
-        targets = await _select_partial_history_targets(
-            decision,
-            all_docs,
-            parcel,
-            username=s.weld_recorder_username,
-            password=s.weld_recorder_password,
-        )
+        targets = await _select_partial_history_targets(decision, all_docs, parcel)
         route_section = "partial_history_search"
-        if not targets:
-            logger.info(
-                "Partial history search produced no download targets — stopping. Overview at %s",
-                ov.path,
-            )
-            narration.info("No downloadable documents were found for this property.")
-            ov.set_section(route_section, {"targets": [], "results": []})
-            await record_map()
-            return [], None, 0.0, 0, 0
-        logger.info(
-            "Partial history search targets: %s",
-            ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
-        )
     elif decision["path"] == "alternate_empty":
         narration.info(
             "No documents are on file directly for this parcel — searching by "
             "owner name and section/township/range instead..."
         )
         route_section = "owner_name_search"
-        async with _recorder_search_session(
-            s.weld_recorder_username, s.weld_recorder_password
-        ) as search_page:
+        async with _recorder_search_session() as search_page:
             targets = (
                 await _select_owner_name_search_targets(search_page, parcel) if search_page else []
             )
-        if not targets:
-            logger.info(
-                "Owner-name search produced no download targets — stopping. Overview at %s",
-                ov.path,
-            )
-            narration.info("No downloadable documents were found for this property.")
-            ov.set_section(route_section, {"targets": [], "results": []})
-            await record_map()
-            return [], None, 0.0, 0, 0
-        logger.info(
-            "Owner-name search targets: %s",
-            ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
-        )
     else:
-        logger.info(
-            "Decision Matrix route %r is not handled — stopping. Overview at %s",
-            decision["path"],
-            ov.path,
-        )
+        logger.info("Decision Matrix route %r is not handled — stopping.", decision["path"])
         narration.info("We couldn't automatically determine the next step for this property.")
         await record_map()
         return [], None, 0.0, 0, 0
+
+    if not targets:
+        logger.info("%s produced no download targets — stopping.", route_section)
+        narration.info("No downloadable documents were found for this property.")
+        ov.set_section(route_section, {"targets": [], "results": []})
+        await record_map()
+        return [], None, 0.0, 0, 0
+    logger.info(
+        "%s targets: %s",
+        route_section,
+        ", ".join(f"{role}={doc.reception}({doc.doc_type})" for role, doc in targets),
+    )
 
     # Phases 4 and 5 only need S/T/R and the account, and talk to the BLM and
     # county GIS/CDOT servers rather than recording.weld.gov — so they run in
@@ -2674,25 +2392,9 @@ async def scrape(
         )
     )
 
-    ov.set_section(
-        route_section,
-        {
-            "targets": [
-                {"role": role, "reception": doc.reception, "doc_type": doc.doc_type, "url": doc.url}
-                for role, doc in targets
-            ],
-            "results": [],  # filled in after download
-        },
-    )
-
-    results, cost, in_tok, out_tok = await _download_documents(
-        address,
-        targets,
-        doc_filter,
-        dest,
-        username=s.weld_recorder_username,
-        password=s.weld_recorder_password,
-    )
+    ov.set_section(route_section, {"targets": _target_rows(targets), "results": []})
+    results = await _download_documents(targets, dest)
+    in_tok = out_tok = 0
 
     # --- Searches that run on every route, whatever Document History held. ---
     # The owner-name deed search runs for every property: a vesting deed is
@@ -2710,9 +2412,7 @@ async def scrape(
     )
     known_receptions = {doc.reception for _, doc in targets}
     supplemental: list[tuple[str, _DocRecord]] = []
-    async with _recorder_search_session(
-        s.weld_recorder_username, s.weld_recorder_password
-    ) as search_page:
+    async with _recorder_search_session() as search_page:
         if search_page:
             if route_section != "owner_name_search":
                 supplemental += await _owner_name_search(search_page, parcel, known_receptions)
@@ -2724,41 +2424,12 @@ async def scrape(
             f"Found {deeds} deed(s) recorded under the owner's name, plus "
             f"{len(supplemental) - deeds} other document(s) — downloading them now..."
         )
-        sup_results, _sup_cost, sup_in_tok, sup_out_tok = await _download_documents(
-            address,
-            supplemental,
-            doc_filter,
-            dest,
-            username=s.weld_recorder_username,
-            password=s.weld_recorder_password,
-        )
-        in_tok += sup_in_tok
-        out_tok += sup_out_tok
-        targets = targets + supplemental
-        results = results + sup_results
+        sup_results = await _download_documents(supplemental, dest)
+        targets += supplemental
+        results += sup_results
         ov.set_section(
             "owner_deed_and_easement_search",
-            {
-                "targets": [
-                    {
-                        "role": role,
-                        "reception": doc.reception,
-                        "doc_type": doc.doc_type,
-                        "url": doc.url,
-                    }
-                    for role, doc in supplemental
-                ],
-                "results": [
-                    {
-                        "role": role,
-                        "reception": doc.reception,
-                        "doc_type": doc.doc_type,
-                        "status": "downloaded" if paths else "failed",
-                        "files": [str(p) for p in paths],
-                    }
-                    for role, doc, paths in sup_results
-                ],
-            },
+            {"targets": _target_rows(supplemental), "results": _result_rows(sup_results)},
         )
 
     # --- Read every document downloaded so far for the other documents it
@@ -2768,42 +2439,18 @@ async def scrape(
     )
     known_receptions = {doc.reception for _, doc in targets}
     cross_ref_results, cr_in_tok, cr_out_tok = await _expand_cross_references(
-        address,
-        doc_filter,
-        dest,
-        ov,
-        results,
-        known_receptions,
-        username=s.weld_recorder_username,
-        password=s.weld_recorder_password,
+        dest, ov, results, known_receptions
     )
     in_tok += cr_in_tok
     out_tok += cr_out_tok
     if cross_ref_results:
-        results = results + cross_ref_results
-        targets = targets + [(role, doc) for role, doc, _ in cross_ref_results]
+        results += cross_ref_results
+        targets += [(role, doc) for role, doc, _ in cross_ref_results]
         ov.set_section(
             "cross_references",
             {
-                "targets": [
-                    {
-                        "role": role,
-                        "reception": doc.reception,
-                        "doc_type": doc.doc_type,
-                        "url": doc.url,
-                    }
-                    for role, doc, _ in cross_ref_results
-                ],
-                "results": [
-                    {
-                        "role": role,
-                        "reception": doc.reception,
-                        "doc_type": doc.doc_type,
-                        "status": "downloaded" if paths else "failed",
-                        "files": [str(p) for p in paths],
-                    }
-                    for role, doc, paths in cross_ref_results
-                ],
+                "targets": _target_rows(cross_ref_results),
+                "results": _result_rows(cross_ref_results),
             },
         )
 
@@ -2816,9 +2463,7 @@ async def scrape(
     )
     str_targets: list[tuple[str, _DocRecord]] = []
     section_index: list[dict] = []
-    async with _recorder_search_session(
-        s.weld_recorder_username, s.weld_recorder_password
-    ) as search_page:
+    async with _recorder_search_session() as search_page:
         if search_page:
             str_targets, section_index = await _section_township_range_search(
                 search_page, parcel, known_receptions
@@ -2832,50 +2477,19 @@ async def scrape(
             )
         else:
             narration.info(f"Found {len(str_targets)} additional document(s) in this section.")
-        str_results, _str_cost, str_in_tok, str_out_tok = await _download_documents(
-            address,
-            str_targets,
-            doc_filter,
-            dest,
-            username=s.weld_recorder_username,
-            password=s.weld_recorder_password,
-        )
-        in_tok += str_in_tok
-        out_tok += str_out_tok
-        targets = targets + str_targets
-        results = results + str_results
+        str_results = await _download_documents(str_targets, dest)
+        targets += str_targets
+        results += str_results
         ov.set_section(
             "section_township_range_search",
             {
-                "targets": [
-                    {
-                        "role": role,
-                        "reception": doc.reception,
-                        "doc_type": doc.doc_type,
-                        "url": doc.url,
-                    }
-                    for role, doc in str_targets
-                ],
-                "results": [
-                    {
-                        "role": role,
-                        "reception": doc.reception,
-                        "doc_type": doc.doc_type,
-                        "status": "downloaded" if paths else "failed",
-                        "files": [str(p) for p in paths],
-                    }
-                    for role, doc, paths in str_results
-                ],
+                "targets": _target_rows(str_targets),
+                "results": _result_rows(str_results),
                 # Every document the recorder indexes against this section,
                 # downloaded or not — a document that wasn't fetched is still
                 # one the surveyor may want to pull by hand.
                 "section_index": [
-                    {
-                        "reception": r["reception"],
-                        "doc_type": r["doc_type"],
-                        "rec_date": r["rec_date"],
-                    }
-                    for r in section_index
+                    {k: r[k] for k in ("reception", "doc_type", "rec_date")} for r in section_index
                 ],
             },
         )
@@ -2895,20 +2509,12 @@ async def scrape(
                 "for the records they cite..."
             )
             survey_refs, sr_in_tok, sr_out_tok = await _expand_cross_references(
-                address,
-                doc_filter,
-                dest,
-                ov,
-                survey_results,
-                known_receptions,
-                username=s.weld_recorder_username,
-                password=s.weld_recorder_password,
+                dest, ov, survey_results, known_receptions
             )
             in_tok += sr_in_tok
             out_tok += sr_out_tok
-            if survey_refs:
-                results = results + survey_refs
-                targets = targets + [(role, doc) for role, doc, _ in survey_refs]
+            results += survey_refs
+            targets += [(role, doc) for role, doc, _ in survey_refs]
 
     # --- Phase 4: GLO original survey of record (BLM General Land Office).
     # Runs regardless of which Phase 3 path fired — the original 6th P.M.
@@ -2916,10 +2522,10 @@ async def scrape(
     # for the tract, and every later ALTA ties its basis-of-bearings back to
     # it. Only needs S/T/R, so it can't fail on the Decision Matrix outcome.
     await record_map()
+    cost = 0.0
     glo_paths: list[Path] = []
     if glo_task:
-        glo_paths, glo_cost, glo_in_tok, glo_out_tok = await glo_task
-        cost += glo_cost
+        glo_paths, cost, glo_in_tok, glo_out_tok = await glo_task
         in_tok += glo_in_tok
         out_tok += glo_out_tok
         if glo_paths:
@@ -2956,81 +2562,34 @@ async def scrape(
         )
     )
 
-    # Record per-target results in overview.json. A target with zero files
-    # captured is "failed"; non-zero is "downloaded".
-    results_section: list[dict] = []
-    saved_paths: list[Path] = []
-    for role, doc, paths in results:
-        results_section.append(
-            {
-                "role": role,
-                "reception": doc.reception,
-                "doc_type": doc.doc_type,
-                "status": "downloaded" if paths else "failed",
-                "files": [str(p) for p in paths],
-            }
-        )
-        saved_paths.extend(paths)
-    ov.merge_section(route_section, {"results": results_section})
-    saved_paths.extend(glo_paths)
-    saved_paths.extend(path for path, _ in row_files)
-
-    def _glo_doc_type(filename: str) -> str:
-        name = filename.lower()
-        if "fieldnote" in name or "field_note" in name:
-            return "GLO Field Notes"
-        if "patent" in name:
-            return "GLO Land Patent"
-        return "GLO Survey Plat"
+    # Record per-target results in overview.json.
+    ov.merge_section(route_section, {"results": _result_rows(results)})
+    saved_paths = [p for _, _, paths in results for p in paths]
+    saved_paths += glo_paths
+    saved_paths += [path for path, _ in row_files]
 
     # One row per downloaded file, keyed by the filename the Results tab shows,
     # so the frontend can group the grid by category and sort by reception
     # without re-deriving either from the filename. Every route's documents land
     # here — each route writes its own section above, and a surveyor scanning
     # the grid doesn't care which search turned a document up.
-    document_rows = (
-        [
-            {
-                "file": path.name,
-                "reception": doc.reception,
-                "doc_type": doc.doc_type,
-                "category": classify(doc.doc_type),
-                "role": role,
-            }
+    files: list[tuple[str, str, str, str]] = [  # (file, reception, doc_type, role)
+        *(
+            (p.name, doc.reception, doc.doc_type, role)
             for role, doc, paths in results
-            for path in paths
-        ]
-        + [
-            {
-                "file": path.name,
-                "reception": "",
-                "doc_type": _glo_doc_type(path.name),
-                "category": classify(_glo_doc_type(path.name)),
-                "role": "glo_record",
-            }
-            for path in glo_paths
-        ]
-        + [
-            {
-                "file": path.name,
-                "reception": "",
-                "doc_type": doc_type,
-                "category": classify(doc_type),
-                "role": "road_row",
-            }
-            for path, doc_type in row_files
-        ]
-    )
-    ov.set_section(
-        "documents",
-        sorted(
-            document_rows,
-            key=lambda row: (
-                CATEGORIES.index(row["category"]),
-                reception_sort_key(row["reception"]),
-            ),
+            for p in paths
         ),
+        *((p.name, "", _glo_doc_type(p.name), "glo_record") for p in glo_paths),
+        *((p.name, "", doc_type, "road_row") for p, doc_type in row_files),
+    ]
+    document_rows = [
+        {"file": f, "reception": r, "doc_type": t, "category": classify(t), "role": role}
+        for f, r, t, role in files
+    ]
+    document_rows.sort(
+        key=lambda row: (CATEGORIES.index(row["category"]), reception_sort_key(row["reception"]))
     )
+    ov.set_section("documents", document_rows)
 
     if not saved_paths:
         return (
@@ -3045,5 +2604,13 @@ async def scrape(
             in_tok,
             out_tok,
         )
-
     return saved_paths, None, cost, in_tok, out_tok
+
+
+def _glo_doc_type(filename: str) -> str:
+    name = filename.lower()
+    if "fieldnote" in name or "field_note" in name:
+        return "GLO Field Notes"
+    if "patent" in name:
+        return "GLO Land Patent"
+    return "GLO Survey Plat"

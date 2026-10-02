@@ -508,37 +508,50 @@ def _thumbnail_bytes(image: Image.Image, max_px: int) -> bytes:
     return buf.getvalue()
 
 
-def _ask_which_reads(client, model: str, shots: list[bytes]) -> tuple[int, int, int]:
-    """Index of the image the model says reads normally, plus tokens spent."""
-    three_way = len(shots) == 3
+def _call_tool(
+    client, model: str, content: list[dict], tool: dict, max_tokens: int
+) -> tuple[dict | None, int, int]:
+    """One Converse call that forces `tool`. Returns `(tool_input, in_tokens,
+    out_tokens)`, with `tool_input` None if the model didn't call it."""
+    name = tool["toolSpec"]["name"]
     response = client.converse(
         modelId=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"text": _TURN_PROBE_PROMPT if three_way else _TURN_DIRECTION_PROMPT},
-                    *({"image": {"format": "jpeg", "source": {"bytes": s}}} for s in shots),
-                ],
-            }
-        ],
-        inferenceConfig={"maxTokens": 512, "temperature": 0},
-        toolConfig={
-            "tools": [_TURN_PROBE_TOOL if three_way else _TURN_DIRECTION_TOOL],
-            "toolChoice": {"tool": {"name": _TURN_TOOL_NAME}},
-        },
+        messages=[{"role": "user", "content": content}],
+        # Always set explicitly: an unset maxTokens reserves the model's full
+        # output budget against the account quota and invites throttling.
+        inferenceConfig={"maxTokens": max_tokens, "temperature": 0},
+        toolConfig={"tools": [tool], "toolChoice": {"tool": {"name": name}}},
     )
     usage = response.get("usage", {})
     tokens = (usage.get("inputTokens", 0), usage.get("outputTokens", 0))
     for block in response.get("output", {}).get("message", {}).get("content", []):
         tool_use = block.get("toolUse") or {}
-        if tool_use.get("name") == _TURN_TOOL_NAME:
-            try:
-                pick = int(tool_use.get("input", {}).get("readable", 1))
-            except (TypeError, ValueError):
-                pick = 1
-            return (pick if 1 <= pick <= len(shots) else 1), *tokens
-    return 1, *tokens
+        if tool_use.get("name") == name:
+            return tool_use.get("input", {}), *tokens
+    logger.warning(
+        "id_extraction: no %s call in response (stopReason=%s)", name, response.get("stopReason")
+    )
+    return None, *tokens
+
+
+def _ask_which_reads(client, model: str, shots: list[bytes]) -> tuple[int, int, int]:
+    """Index of the image the model says reads normally, plus tokens spent."""
+    three_way = len(shots) == 3
+    answer, in_tok, out_tok = _call_tool(
+        client,
+        model,
+        [
+            {"text": _TURN_PROBE_PROMPT if three_way else _TURN_DIRECTION_PROMPT},
+            *({"image": {"format": "jpeg", "source": {"bytes": s}}} for s in shots),
+        ],
+        _TURN_PROBE_TOOL if three_way else _TURN_DIRECTION_TOOL,
+        max_tokens=512,
+    )
+    try:
+        pick = int((answer or {}).get("readable", 1))
+    except (TypeError, ValueError):
+        pick = 1
+    return (pick if 1 <= pick <= len(shots) else 1), in_tok, out_tok
 
 
 def _page_turn(client, model: str, raster: Image.Image) -> tuple[int, int, int]:
@@ -585,46 +598,27 @@ def _bedrock_client():
 
 
 def _read_page(client, model: str, tiles: list[bytes]) -> tuple[list[ExtractedId], int, int]:
-    response = client.converse(
-        modelId=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    *({"image": {"format": _TILE_FORMAT, "source": {"bytes": t}}} for t in tiles),
-                    {"text": _PROMPT},
-                ],
-            }
+    answer, in_tok, out_tok = _call_tool(
+        client,
+        model,
+        [
+            *({"image": {"format": _TILE_FORMAT, "source": {"bytes": t}}} for t in tiles),
+            {"text": _PROMPT},
         ],
-        # Always set explicitly: an unset maxTokens reserves the model's full
-        # output budget against the account quota and invites throttling.
-        inferenceConfig={"maxTokens": 8192, "temperature": 0},
-        toolConfig={"tools": [_EXTRACT_TOOL], "toolChoice": {"tool": {"name": _TOOL_NAME}}},
+        _EXTRACT_TOOL,
+        max_tokens=8192,
     )
-
-    usage = response.get("usage", {})
-    tokens = (usage.get("inputTokens", 0), usage.get("outputTokens", 0))
-
-    for block in response.get("output", {}).get("message", {}).get("content", []):
-        tool_use = block.get("toolUse") or {}
-        if tool_use.get("name") != _TOOL_NAME:
-            continue
-        refs = tool_use.get("input", {}).get("references") or []
-        if not isinstance(refs, list):
-            logger.warning("id_extraction: malformed references payload: %r", refs)
-            return [], *tokens
-        found = [
-            item
-            for r in refs
-            if isinstance(r, dict)
-            for item in _classify(str(r.get("value", "")), str(r.get("context") or ""))
-        ]
-        return found, *tokens
-
-    logger.warning(
-        "id_extraction: no tool call in response (stopReason=%s)", response.get("stopReason")
-    )
-    return [], *tokens
+    refs = (answer or {}).get("references") or []
+    if not isinstance(refs, list):
+        logger.warning("id_extraction: malformed references payload: %r", refs)
+        return [], in_tok, out_tok
+    found = [
+        item
+        for r in refs
+        if isinstance(r, dict)
+        for item in _classify(str(r.get("value", "")), str(r.get("context") or ""))
+    ]
+    return found, in_tok, out_tok
 
 
 def _extract_with_bedrock(reader: PdfReader, model: str) -> IdExtraction:

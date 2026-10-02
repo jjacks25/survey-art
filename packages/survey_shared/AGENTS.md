@@ -28,14 +28,13 @@ Single-key DynamoDB table (`jobId`). Status: `PENDING` → `RUNNING` → `COMPLE
   a `kind` (`"milestone"` = plain-English progress step, `"detail"` = developer
   diagnostic) so the frontend can show a clean step list by default with the raw feed
   available on demand — see [`apps/worker/survey_art/AGENTS.md`](../../apps/worker/survey_art/AGENTS.md)
-  for how these get produced without blocking the scraper. `Job._coerce_legacy_logs()`
-  wraps any pre-existing plain-string log entries (job records written before `kind`
-  existed) as `"detail"` on the way in, so an old record still loads.
+  for how these get produced without blocking the scraper.
 - `metadata: dict | None` — the scraper's `overview.json`, stored verbatim (see the same
   doc) once the job completes. Opaque to this package — just round-tripped.
-- `location: dict | None` — `{"lat": Decimal, "lon": Decimal}` for the frontend's Map
-  tab. DynamoDB rejects native Python `float`; always go through `Decimal(str(x))`,
-  never `Decimal(x)` directly (binary float imprecision would corrupt the value).
+- `location: dict[str, float] | None` — `{"lat", "lon"}` for the frontend's Map tab.
+  DynamoDB rejects native Python `float`; `update_status()` converts every float it
+  writes via `Decimal(str(x))` (never `Decimal(x)` — binary float imprecision would
+  corrupt the value), and the typed field coerces back to float on read.
 - `task_arn: str | None` — set by the dispatcher after `ecs:RunTask`, so `cancel_job()`'s
   caller (the API) knows which Fargate task to `ecs:StopTask`.
 - `doc_prefix: str | None` — the property-identifying prefix (under `documents/` in the
@@ -47,10 +46,7 @@ Single-key DynamoDB table (`jobId`). Status: `PENDING` → `RUNNING` → `COMPLE
   by `apps/worker/survey_art/costs.py` (which owns the rates and the arithmetic; this
   package only round-trips it). `CostLine.usd` is a typed `float`, so DynamoDB's
   `Decimal`s coerce back on read instead of reaching the JSON encoder — keep it typed if
-  you add fields. The older `bedrock_cost_usd`/`fargate_cost_usd`/token/seconds scalars
-  stay alongside it: job records written before `costs` existed still carry only those,
-  and DynamoDB items don't migrate themselves, so the frontend prefers `costs` and falls
-  back to them.
+  you add fields. `fargate_seconds` alongside it is the task's wall-clock runtime.
 - `expires_at: int | None` — DynamoDB TTL attribute (`expiresAt`), set by `create_job()`
   to `created_at + JOB_TTL_SECONDS` (7 days), kept in sync with the `documents/` S3
   lifecycle rule (see [`infra/AGENTS.md`](../../infra/AGENTS.md)) — a job record and the
@@ -185,6 +181,8 @@ file gets S3's key instead.
 
 ## Tests
 
-`tests/test_jobs_model.py` covers the `Job` model's field defaults/serialization.
-`infra/tests/test_deploy_harness.py` and friends use `moto` to mock DynamoDB/S3/SQS
-rather than hitting real AWS — follow that pattern for new tests here.
+This package has no tests of its own: `apps/worker/tests/test_end_to_end.py` drives it
+for real — the API creates a job, the worker runs it and uploads results, the API reads
+them back — against the repo-wide moto `aws_env` fixture in `/conftest.py`. Test new
+behaviour here through that path (or the API tests, which share the fixture) rather than
+by unit-testing pydantic serialization.

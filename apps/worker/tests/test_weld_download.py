@@ -93,14 +93,7 @@ class _FakeContext:
 
 
 def _doc(reception: str = "1766550") -> _DocRecord:
-    return _DocRecord(
-        reception=reception,
-        rec_date="",
-        doc_type="EASEMENT",
-        grantor="",
-        grantee="",
-        url=f"https://recording.weld.gov/web/web/integration/document/{reception}",
-    )
+    return _DocRecord(reception, doc_type="EASEMENT")
 
 
 async def _fetch(ctx, tmp_path: Path, doc: _DocRecord | None = None):

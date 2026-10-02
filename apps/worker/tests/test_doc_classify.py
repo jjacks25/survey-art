@@ -29,9 +29,7 @@ from survey_art.doc_classify import (
 
 VOCABULARY: list[tuple[str, int]] = [
     (label, count)
-    for label, count in json.loads(
-        (Path(__file__).parent / "weld_document_types.json").read_text()
-    )
+    for label, count in json.loads((Path(__file__).parent / "weld_document_types.json").read_text())
 ]
 
 

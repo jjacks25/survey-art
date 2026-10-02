@@ -210,13 +210,8 @@ four `Tabs.Panel`s from the response:
 per-service knowledge, so **adding an AWS service to the breakdown needs no frontend
 change**; add the line there.
 
-Two details that are deliberate:
-
-- `costLines()` synthesises the old two-line shape (`bedrockCostUsd`/`fargateCostUsd`)
-  for job records written before `costs` existed. DynamoDB items don't migrate, and
-  those runs are still in the history sidebar, so don't drop the fallback.
-- `formatUsd()` gives sub-cent lines six decimals instead of four. At four, every small
-  line renders `$0.0000`, which reads as "free" rather than "small" — the point of
+One detail that is deliberate: `formatUsd()` gives sub-cent lines six decimals instead of four. At four, every small
+line renders `$0.0000`, which reads as "free" rather than "small" — the point of
   itemising is that the reader can see S3 and DynamoDB are genuinely negligible next to
   the model bill, not that they're zero.
 

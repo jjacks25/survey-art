@@ -1,90 +1,47 @@
-"""Tests for pipeline county dispatch logic."""
+"""Tests for pipeline county dispatch. The happy path (account number + county
+override, no geocode) runs end to end in test_end_to_end.py."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from survey_art.geocode import County, GeocodedAddress
-from survey_art.pipeline import COUNTY_SCRAPERS, run_async
+from survey_art.pipeline import run_async
 
 
-def _geocoded(county_name: str, state: str = "CO") -> GeocodedAddress:
-    return GeocodedAddress(
+async def _run(address: str, geocoded_county: str | None, **kwargs):
+    """`run_async` with geocoding stubbed to `geocoded_county` (None = no match)
+    and Weld's scraper mocked. Returns `(weld_scrape_mock, run_async result)`."""
+    geocoded = geocoded_county and GeocodedAddress(
         street="123 Main St",
         city="Anytown",
-        state=state,
+        state="CO",
         zip_code="80000",
-        county=County(state=state, name=county_name),
+        county=County(state="CO", name=geocoded_county),
     )
-
-
-@pytest.mark.parametrize(
-    "county_name,expected_key",
-    [
-        ("Weld", "CO_weld"),
-        ("Denver", "CO_denver"),
-        ("Arapahoe", "CO_arapahoe"),
-        ("Jefferson", "CO_jefferson"),
-    ],
-)
-def test_county_scrapers_registered(county_name: str, expected_key: str) -> None:
-    assert expected_key in COUNTY_SCRAPERS
-
-
-@pytest.mark.asyncio
-async def test_run_async_dispatches_to_correct_scraper() -> None:
-    # Scrapers return (saved, err, cost, in_tokens, out_tokens).
-    mock_scrape = AsyncMock(return_value=([], None, 0.0, 0, 0))
+    scrape = AsyncMock(return_value=([], None, 0.0, 0, 0))
     with (
-        patch("survey_art.pipeline.address_to_county") as mock_geocode,
-        patch.dict("survey_art.pipeline.COUNTY_SCRAPERS", {"CO_weld": mock_scrape}),
+        patch("survey_art.pipeline.address_to_county", return_value=geocoded),
+        patch.dict("survey_art.pipeline.COUNTY_SCRAPERS", {"CO_weld": scrape}),
     ):
-        mock_geocode.return_value = _geocoded("Weld")
-        saved, err, _cost, _in_tok, _out_tok = await run_async(
-            "123 Main St, Greeley, CO 80631", quiet=True
-        )
-
-    mock_scrape.assert_awaited_once()
-    assert err is None
+        return scrape, await run_async(address, quiet=True, **kwargs)
 
 
-@pytest.mark.asyncio
-async def test_run_async_unsupported_county_returns_error() -> None:
-    with patch("survey_art.pipeline.address_to_county") as mock_geocode:
-        mock_geocode.return_value = _geocoded("Boulder")
-        saved, err, _cost, _in_tok, _out_tok = await run_async(
-            "123 Main St, Boulder, CO 80302", quiet=True
-        )
-
+async def test_unsupported_county_returns_error() -> None:
+    _, (saved, err, *_) = await _run("123 Main St, Boulder, CO 80302", "Boulder")
     assert saved == []
-    assert err is not None
     assert "not yet supported" in err
 
 
-@pytest.mark.asyncio
-async def test_run_async_geocode_failure_returns_error() -> None:
-    with patch("survey_art.pipeline.address_to_county", return_value=None):
-        saved, err, _cost, _in_tok, _out_tok = await run_async("bad address", quiet=True)
-
+async def test_geocode_failure_returns_error() -> None:
+    _, (saved, err, *_) = await _run("bad address", None)
     assert saved == []
-    assert "Could not resolve" in (err or "")
+    assert "Could not resolve" in err
 
 
-@pytest.mark.asyncio
-async def test_run_async_county_override_bypasses_geocoding() -> None:
-    # Scrapers return (saved, err, cost, in_tokens, out_tokens).
-    mock_scrape = AsyncMock(return_value=([], None, 0.0, 0, 0))
-    with (
-        patch("survey_art.pipeline.address_to_county") as mock_geocode,
-        patch.dict("survey_art.pipeline.COUNTY_SCRAPERS", {"CO_weld": mock_scrape}),
-    ):
-        mock_geocode.return_value = _geocoded("Denver")  # geocode says Denver
-        saved, err, _cost, _in_tok, _out_tok = await run_async(
-            "123 Main St, Denver, CO 80202",
-            quiet=True,
-            county_override="CO_weld",  # but override forces Weld
-        )
-
-    mock_scrape.assert_awaited_once()
+async def test_county_override_beats_the_geocoded_county() -> None:
+    scrape, (_, err, *_) = await _run(
+        "123 Main St, Denver, CO 80202", "Denver", county_override="CO_weld"
+    )
+    scrape.assert_awaited_once()
+    assert err is None

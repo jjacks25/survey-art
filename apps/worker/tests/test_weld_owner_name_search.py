@@ -14,39 +14,20 @@ from survey_art.scrapers.weld_county import (
     _owner_name_search,
 )
 
+from .fakes import FakeSearchPage
 
-class _FakePage:
-    """Returns rows per search, keyed by the criteria actually left in the form."""
 
-    def __init__(self, by_query: dict[tuple[str, str], list[dict]]):
-        self._by_query = by_query
-        self.queries: list[tuple[str, str]] = []
-        self._form: dict[str, str] = {}
-        self.url = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
+def _query(form: dict[str, str]) -> tuple[str, str]:
+    return form.get("#field_BothNamesID", ""), form.get("#field_PLSSLegalID_DOT_Section", "")
 
-    async def goto(self, *a, **k):
-        pass
 
-    async def click(self, *a, **k):
-        if a and a[0] == "button:has-text('Yes - Continue')":
-            raise Exception("no dialog")
+def _page(by_query: dict[tuple[str, str], list[dict]]) -> FakeSearchPage:
+    """Returns rows per search, keyed by the (name, section) actually left in the form."""
+    return FakeSearchPage(lambda form: by_query.get(_query(form), []))
 
-    async def fill(self, selector, value, *a, **k):
-        self._form[selector] = value
 
-    async def wait_for_load_state(self, *a, **k):
-        pass
-
-    async def wait_for_timeout(self, *a, **k):
-        pass
-
-    async def evaluate(self, *a, **k):
-        query = (
-            self._form.get("#field_BothNamesID", ""),
-            self._form.get("#field_PLSSLegalID_DOT_Section", ""),
-        )
-        self.queries.append(query)
-        return self._by_query.get(query, [])
+def _queries(page: FakeSearchPage) -> list[tuple[str, str]]:
+    return [_query(form) for form in page.searches]
 
 
 def _row(reception: str, doc_type: str, rec_date: str) -> dict:
@@ -60,7 +41,7 @@ _PARCEL = ParcelInfo(
 
 @pytest.mark.asyncio
 async def test_searches_the_owner_name_against_the_parcels_section_first():
-    page = _FakePage(
+    page = _page(
         {
             ("KRIER MICHAEL K", "25"): [
                 _row("111", "WARRANTY DEED", "03-04-2011"),
@@ -72,7 +53,7 @@ async def test_searches_the_owner_name_against_the_parcels_section_first():
 
     targets = await _owner_name_search(page, _PARCEL, set())
 
-    assert page.queries == [("KRIER MICHAEL K", "25")]  # no fallback needed
+    assert _queries(page) == [("KRIER MICHAEL K", "25")]  # no fallback needed
     # Everything recorded under the owner's name comes down; the deeds are
     # tagged and sorted first (most recent first) so the vesting deed is
     # obvious, but nothing is filtered out.
@@ -87,17 +68,17 @@ async def test_searches_the_owner_name_against_the_parcels_section_first():
 async def test_falls_back_to_the_surname_then_to_a_countywide_search():
     # Tyler indexes some names "KRIER, MICHAEL K", so the assessor's spelling
     # can miss — the surname finds it, still bounded by the parcel's section.
-    page = _FakePage({("KRIER", "25"): [_row("444", "WARRANTY DEED", "03-04-2011")]})
+    page = _page({("KRIER", "25"): [_row("444", "WARRANTY DEED", "03-04-2011")]})
 
     targets = await _owner_name_search(page, _PARCEL, set())
 
-    assert page.queries == [("KRIER MICHAEL K", "25"), ("KRIER", "25")]
+    assert _queries(page) == [("KRIER MICHAEL K", "25"), ("KRIER", "25")]
     assert [doc.reception for _, doc in targets] == ["444"]
 
 
 @pytest.mark.asyncio
 async def test_keeps_what_the_earlier_queries_found_while_hunting_for_a_deed():
-    page = _FakePage(
+    page = _page(
         {
             ("KRIER MICHAEL K", "25"): [_row("111", "LIEN", "03-04-2011")],
             ("KRIER", "25"): [_row("444", "WARRANTY DEED", "03-04-2011")],
@@ -114,7 +95,7 @@ async def test_keeps_what_the_earlier_queries_found_while_hunting_for_a_deed():
 
 @pytest.mark.asyncio
 async def test_skips_documents_another_route_already_queued():
-    page = _FakePage({("KRIER MICHAEL K", "25"): [_row("111", "WARRANTY DEED", "03-04-2011")]})
+    page = _page({("KRIER MICHAEL K", "25"): [_row("111", "WARRANTY DEED", "03-04-2011")]})
     seen = {"111"}
 
     assert await _owner_name_search(page, _PARCEL, seen) == []
@@ -122,9 +103,9 @@ async def test_skips_documents_another_route_already_queued():
 
 @pytest.mark.asyncio
 async def test_no_owner_on_record_is_not_an_error():
-    page = _FakePage({})
+    page = _page({})
     assert await _owner_name_search(page, ParcelInfo(account="R1"), set()) == []
-    assert page.queries == []
+    assert _queries(page) == []
 
 
 def test_date_sort_key_handles_both_formats():
