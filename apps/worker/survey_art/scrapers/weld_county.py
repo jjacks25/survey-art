@@ -984,6 +984,7 @@ async def _pace_fetch() -> None:
     _next_fetch_at += _DOC_FETCH_INTERVAL_S
     await asyncio.sleep(wait)
 
+
 # APPLICATION_MODE=demo: how many of the ALTA's Schedule B-2 referenced documents
 # to actually fetch. Enough to show the feature working without the ~30 minutes a
 # full ~90-document ALTA takes.
@@ -1862,6 +1863,15 @@ _MAX_CROSS_REFERENCE_DOCS = 150
 _MAX_CROSS_REFERENCE_DEPTH = 3
 
 
+# Documents read for citations at once. Each read holds its whole document
+# decoded — a 36"x24" plat sheet is ~10,800x7,200 px at a byte per pixel, ~120 MB
+# a page — so a level of a dozen section-scan plats peaked at 1.5 GB on its own
+# and OOM-killed the 2 GB task mid-run (R8995911, 66 min, no traceback). Bedrock
+# calls are pooled at 16 separately (id_extraction._BEDROCK_CONCURRENCY), so six
+# documents in flight still keep that pool busy.
+_EXTRACTION_CONCURRENCY = 6
+
+
 def _extract_cited_ids(reception: str, path: Path) -> IdExtraction:
     """Read one document for the documents it cites, reusing a previous run's
     answer when there is one.
@@ -1936,6 +1946,7 @@ async def _expand_cross_references(
     """
     extracted: set[str] = set()
     searched_book_pages: set[str] = set()
+    extraction_slots = asyncio.Semaphore(_EXTRACTION_CONCURRENCY)
     # Seeded from what's already on file so a second walk (the section scan's
     # surveys, further down `scrape()`) adds to the table instead of replacing it.
     extracted_ids: list[dict] = list(ov.get("extracted_ids", []))
@@ -1958,12 +1969,11 @@ async def _expand_cross_references(
             break
         extracted.update(doc.reception for _, doc, _ in batch)
 
-        extractions = await asyncio.gather(
-            *(
-                asyncio.to_thread(_extract_cited_ids, doc.reception, paths[0])
-                for _, doc, paths in batch
-            )
-        )
+        async def extract(doc: _DocRecord, path: Path) -> IdExtraction:
+            async with extraction_slots:
+                return await asyncio.to_thread(_extract_cited_ids, doc.reception, path)
+
+        extractions = await asyncio.gather(*(extract(doc, paths[0]) for _, doc, paths in batch))
 
         next_targets: list[tuple[str, _DocRecord]] = []
         for (_role, doc, _paths), extraction in zip(batch, extractions, strict=True):

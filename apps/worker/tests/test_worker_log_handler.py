@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from survey_art import worker
 from survey_art.worker import _DynamoLogHandler
 
 
@@ -39,3 +40,22 @@ def test_other_loggers_are_tagged_detail(monkeypatch):
     handler.emit(_record("survey_art.scrapers.weld_county", "Advanced Search: 3 row(s)"))
 
     assert calls == [("job-1", "Advanced Search: 3 row(s)", "detail")]
+
+
+def test_detail_stops_at_the_budget_but_milestones_keep_going(monkeypatch):
+    """The log lives in a 400 KB DynamoDB item that the final status update also
+    has to fit in — overflowing it left a finished job stuck RUNNING."""
+    calls = []
+    monkeypatch.setattr(
+        "survey_art.worker.jobs.append_log",
+        lambda job_id, message, *, kind="detail": calls.append((message, kind)),
+    )
+    monkeypatch.setattr("survey_art.worker._LOG_DETAIL_BUDGET_BYTES", 10)
+
+    handler = _DynamoLogHandler("job-1")
+    for message in ("0123456789", "dropped", "also dropped"):
+        handler.emit(_record("survey_art.scrapers.weld_county", message))
+    handler.emit(_record("survey_art.narration", "Done."))
+
+    assert [m for m, _ in calls[:2]] == ["0123456789", worker._LOG_TRUNCATED_NOTICE]
+    assert calls[2:] == [("Done.", "milestone")]

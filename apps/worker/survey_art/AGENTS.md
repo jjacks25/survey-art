@@ -373,7 +373,9 @@ own; `_MAX_CROSS_REFERENCE_DOCS` is just a cost/runtime backstop for a pathologi
 performance property, but changing it back would quietly cost ~20 minutes a run:
 
 - Every document at a level is read concurrently (`asyncio.gather` over
-  `asyncio.to_thread(extract_document_ids, ...)`). On real Weld data *no* recorder PDF
+  `asyncio.to_thread(extract_document_ids, ...)`), at most `_EXTRACTION_CONCURRENCY`
+  (6) at a time: a read holds its whole document decoded, ~120 MB per large plat
+  sheet, and a dozen section-scan plats at once OOM-killed the task. On real Weld data *no* recorder PDF
   has a text layer, so every document pays for a Bedrock vision read — a property is
   ~340 Bedrock calls, not a handful. A level now costs about as long as its slowest
   document instead of the sum of all of them.
