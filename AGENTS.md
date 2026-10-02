@@ -88,6 +88,8 @@ pipeline.py         Dispatches to county-specific scraper via COUNTY_SCRAPERS di
 | `id_extraction.py` | Reads a survey PDF for the record IDs it cites — text layer if there is one, else Bedrock over tiled page images |
 | `worker.py` | AWS job entrypoint (Fargate one-shot or local SQS poll) |
 | `costs.py` | All-in per-run cost estimate (one line per AWS service) for the Run Details tab |
+| `deed_plot.py` | CAD drawing job: reads a property's deeds, solves and places each description, QC; also a CLI (`python -m survey_art.deed_plot`) |
+| `deed_parse.py` / `cogo.py` / `plss.py` / `cad_export.py` | Bedrock deed transcription / bearing-distance-curve math / BLM section corners / DXF + QC writer — see [`docs/deed_plotting_plan.md`](docs/deed_plotting_plan.md) |
 | `console.py` | Rich terminal UI helpers |
 
 > Note the two distinct settings accessors: `survey_art.settings.get_settings()` (scraper

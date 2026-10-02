@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # read, and they have no reason to move together.
     id_extraction_model: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
+    # Model that transcribes a deed's bearings and distances for the CAD drawing
+    # (`deed_parse.py`). Stronger than the ID reader on purpose: one wrong digit
+    # in a bearing moves a whole parcel, where a citation reader just misses a
+    # document. Re-run `python -m survey_art.deed_plot --eval` before changing it.
+    deed_parse_model: str = "us.anthropic.claude-sonnet-4-6"
+
     # "demo" caps how many of the ALTA's referenced documents Step 3A.5 downloads
     # (`_DEMO_EXCEPTION_LIMIT` in scrapers/weld_county.py), so a demo run finishes in
     # a couple of minutes instead of ~30. Every ID still lands in overview.json's

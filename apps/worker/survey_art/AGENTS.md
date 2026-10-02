@@ -423,6 +423,35 @@ print button's `data-href`) exists. And `attached`, not the default visible-wait
 button is hidden, so a visible-wait always runs to its timeout — it did, at 20s a
 document, until 2026-10-02, and that accident was the only thing pacing the county.
 
+## CAD drawing jobs (`deed_plot.py` and friends)
+
+A job with `kind == "drawing"` (see [`packages/survey_shared/AGENTS.md`](../../../packages/survey_shared/AGENTS.md))
+runs `_draw()` in `worker.py` instead of a scrape: fetch the search's PDFs back from S3,
+`deed_plot.plot_folder()`, `cad_export.export()`, upload under `{prefix}/.drawing/`.
+The design and its measured choices live in [`docs/deed_plotting_plan.md`](../../../docs/deed_plotting_plan.md);
+the things that will bite you:
+
+- **The model only transcribes.** `deed_parse.py` returns bearings/distances as
+  printed strings; `cogo.py` parses and solves them. Corrections the deed's grammar
+  settles are made in code (`deed_parse._normalise` / `_complete`), not by prompt:
+  a reverse tie starts at the corner it names, a tie-out is never reversed, and a
+  "description" whose distances don't start with a number is dropped to notes.
+- **Pages go to the model as full-width bands, never `id_extraction`'s grid.** A grid
+  cut every course line in half, and on 1512031 the model paired four courses with
+  their neighbours' distances. A cheap per-page Haiku question picks which pages to
+  read; the rest of a 12-page deed is never sent.
+- **Placement is on BLM PLSS corners** (`plss.py`, State Plane North EPSG:2231),
+  rotated onto the grid by the deed's basis of bearings, else by the corners its
+  courses run to. A rotation over 3° is reported, not applied — it has only ever
+  meant a misread corner. Only the vesting deed's aliquot parts are drawn: an
+  easement "across the SW1/4" is listed, not drawn as a 160-acre easement.
+- **Score changes with the eval, not by eye:**
+  `uv run --directory apps/worker python -m survey_art.deed_plot --eval <folder> tests/deed_ground_truth.json`
+  (real Bedrock + BLM; ~$0.70). `tests/test_deed_plot.py` covers the math offline.
+- Parses are cached in S3 under `extractions/deeds_v{N}_.../` (same helpers and
+  invariants as the citation cache above); bump `_PROMPT_VERSION` when the prompt or
+  rendering changes.
+
 ## Adding metadata/map support to another county
 
 Nothing scraper-agnostic needs to change — `_load_overview`/`_upload_map_image` just

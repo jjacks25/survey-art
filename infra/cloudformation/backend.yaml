@@ -259,6 +259,11 @@ Resources:
                 Action: [s3:PutObject, s3:GetObject]
                 Resource: !Sub '${StorageBucket.Arn}/*'
               - Effect: Allow
+                # A CAD drawing job lists its search's documents under documents/
+                # to fetch them back (jobs.download_documents()).
+                Action: s3:ListBucket
+                Resource: !GetAtt StorageBucket.Arn
+              - Effect: Allow
                 # Cross-region inference profiles fan out to the underlying model in
                 # other regions, so the foundation-model grant can't be region-scoped.
                 Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]

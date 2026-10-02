@@ -47,6 +47,15 @@ Single-key DynamoDB table (`jobId`). Status: `PENDING` → `RUNNING` → `COMPLE
   package only round-trips it). `CostLine.usd` is a typed `float`, so DynamoDB's
   `Decimal`s coerce back on read instead of reaching the JSON encoder — keep it typed if
   you add fields. `fargate_seconds` alongside it is the task's wall-clock runtime.
+- `kind: "search" | "drawing"` (default `"search"`), `source_job_id`, `drawing_job_id` —
+  a CAD drawing is its own job (`kind="drawing"`) pointing back at the search it was
+  made from; the search points at its latest drawing (`set_drawing_job()`, which
+  deliberately doesn't bump `updatedAt`). `list_jobs()` returns searches only, so the
+  sidebar never shows drawings as properties. A drawing job's `doc_prefix` is the
+  search's prefix plus `/.drawing` (`DRAWING_SUBPREFIX`): `list_result_files()` skips
+  every dot-folder under a prefix, so the drawing's files stay out of the search's
+  document grid but list normally for the drawing job. `download_documents()` is how
+  the drawing job fetches the search's PDFs back (needs `s3:ListBucket` on `TaskRole`).
 - `expires_at: int | None` — DynamoDB TTL attribute (`expiresAt`), set by `create_job()`
   to `created_at + JOB_TTL_SECONDS` (7 days), kept in sync with the `documents/` S3
   lifecycle rule (see [`infra/AGENTS.md`](../../infra/AGENTS.md)) — a job record and the

@@ -27,6 +27,11 @@ export interface Job {
    * Absent on job records written before it existed — RunCost falls back to the
    * bedrock/fargate scalars above for those. */
   costs?: CostLine[] | null;
+  /** "drawing" jobs turn a finished search's deeds into a CAD drawing. */
+  kind?: "search" | "drawing";
+  sourceJobId?: string | null;
+  /** On a search: its most recent drawing job, if one was started. */
+  drawingJobId?: string | null;
 }
 
 interface CostLine {
@@ -95,6 +100,13 @@ export class ApiClient {
 
   getJob(jobId: string) {
     return this.request<Job>(`/api/jobs/${jobId}`);
+  }
+
+  /** Start a CAD drawing job over a completed search's documents. */
+  createDrawing(jobId: string) {
+    return this.request<{ jobId: string; status: string }>(`/api/jobs/${jobId}/drawing`, {
+      method: "POST",
+    });
   }
 
   listJobs() {

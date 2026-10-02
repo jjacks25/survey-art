@@ -29,7 +29,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from survey_art import costs
+from survey_art import cad_export, costs, deed_plot, plss
 from survey_art.download import slug
 from survey_art.geocode import address_to_county
 from survey_art.id_extraction import make_thumbnail
@@ -325,6 +325,34 @@ async def _run_unless_cancelled(job_id: str, coro):
             raise _JobCancelledError
 
 
+def _draw(job: jobs.Job, tmp: Path) -> tuple[list[Path], float, int, int, str, dict]:
+    """A drawing job's whole run: fetch the search's documents back from S3,
+    plot them, and write the CAD files. Blocking; runs on a worker thread.
+
+    Returns ``(files, bedrock_usd, in_tok, out_tok, doc_prefix, metadata)``.
+    The outputs go under the search's own prefix in a dot-folder, which
+    `list_result_files()` hides from the search's document grid but lists for
+    the drawing job itself.
+    """
+    source = jobs.get_job(job.source_job_id or "")
+    if source is None or not source.doc_prefix:
+        raise RuntimeError("The search this drawing was made from no longer exists.")
+    folder = tmp / "documents"
+    narration.info("Fetching the documents from your search...")
+    jobs.download_documents(source.doc_prefix, folder)
+    if source.metadata:
+        (folder / "overview.json").write_text(json.dumps(source.metadata))
+    state = source.doc_prefix.split("/", 1)[0].upper()
+    run = deed_plot.plot_folder(folder, state=state)
+    name = source.doc_prefix.rsplit("/", 1)[-1]
+    narration.info("Writing the CAD drawing and QC report...")
+    files = cad_export.export(run, tmp / "drawing", name=name)
+    metadata = {"drawing": {"crs": f"EPSG:{plss.GRID_EPSG}",
+                            "documents": cad_export.qc_rows(run)}}  # fmt: skip
+    prefix = f"{source.doc_prefix}/{jobs.DRAWING_SUBPREFIX}"
+    return files, run.cost_usd, run.input_tokens, run.output_tokens, prefix, metadata
+
+
 async def run_job(job_id: str, address: str, county: str | None) -> int:
     """Run one scrape job end-to-end. Returns a process-style exit code."""
     job = jobs.get_job(job_id)
@@ -336,7 +364,12 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     scraper_logger = logging.getLogger("survey_art")
     log_handler = _JobLogHandler(job_id)
     scraper_logger.addHandler(log_handler)
-    narration.info(f"Starting your search for {address}...")
+    drawing = job.kind == "drawing"
+    narration.info(
+        f"Starting a CAD drawing for {address}..."
+        if drawing
+        else f"Starting your search for {address}..."
+    )
     start_time = time.time()
     saved: list[Path] = []
     cost, in_tok, out_tok = 0.0, 0, 0
@@ -356,13 +389,16 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
     try:
         with tempfile.TemporaryDirectory(prefix=f"job-{job_id}-") as tmp_name:
             tmp = Path(tmp_name)
+            # ponytail: a cancelled drawing stops being awaited, but its thread
+            # runs on until the Fargate task exits (immediately, in one-shot mode).
+            work = (
+                asyncio.to_thread(_draw, job, tmp)
+                if drawing
+                else run_async(address, tmp_dir=tmp, quiet=True, county_override=county)
+            )
             try:
-                saved, err, cost, in_tok, out_tok = await _run_unless_cancelled(
-                    job_id,
-                    asyncio.wait_for(
-                        run_async(address, tmp_dir=tmp, quiet=True, county_override=county),
-                        timeout=_JOB_TIMEOUT_SECONDS,
-                    ),
+                result = await _run_unless_cancelled(
+                    job_id, asyncio.wait_for(work, timeout=_JOB_TIMEOUT_SECONDS)
                 )
             except _JobCancelledError:
                 narration.info("This search was cancelled.")
@@ -377,6 +413,14 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
                 narration.info("This search took too long and was stopped to avoid runaway cost.")
                 logger.error("Job %s FAILED: timed out after %ss", job_id, _JOB_TIMEOUT_SECONDS)
                 return 1
+            if drawing:
+                saved, cost, in_tok, out_tok, doc_prefix, metadata = result
+                count = jobs.upload_documents(doc_prefix, saved)
+                finish(jobs.COMPLETED, file_count=count, metadata=metadata, doc_prefix=doc_prefix)
+                narration.info("All done — the CAD drawing and QC report are ready.")
+                logger.info("Job %s COMPLETED: drawing with %s file(s)", job_id, count)
+                return 0
+            saved, err, cost, in_tok, out_tok = result
             if err:
                 finish(jobs.FAILED, error=err)
                 narration.info("We hit a problem and couldn't finish this search.")

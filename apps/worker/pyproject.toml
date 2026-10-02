@@ -11,6 +11,8 @@ dependencies = [
     "boto3>=1.43.31",
     "browser-use>=0.12.0",
     "crawl4ai>=0.4.0",
+    # DXF writer for the deed-plotting CAD drawing (cad_export).
+    "ezdxf>=1.3.0",
     "httpx>=0.27.0",
     # pillow + pypdf: read a scanned survey PDF into model-sized tiles (id_extraction).
     "pillow>=11.0.0",
