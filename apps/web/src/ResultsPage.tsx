@@ -26,6 +26,7 @@ import {
 } from "@mantine/core";
 
 import { FileEntry, Job } from "./api";
+import { CadDrawing } from "./CadDrawing";
 import { LayoutContext } from "./Layout";
 import { MetadataView, PropertyMap } from "./MetadataView";
 import { TERMINAL, statusColor, fileIcon, isPdf } from "./utils";
@@ -492,6 +493,7 @@ export function ResultsPage() {
           <Tabs.Tab value="results">Results{files.length > 0 ? ` (${files.length})` : ""}</Tabs.Tab>
           <Tabs.Tab value="metadata">Property Metadata</Tabs.Tab>
           <Tabs.Tab value="map">Map</Tabs.Tab>
+          {job.kind !== "drawing" && <Tabs.Tab value="cad">CAD Drawing</Tabs.Tab>}
           <Tabs.Tab value="run-details">Run Details</Tabs.Tab>
         </Tabs.List>
 
@@ -595,6 +597,10 @@ export function ResultsPage() {
 
         <Tabs.Panel value="map" pt="sm">
           <PropertyMap job={job} />
+        </Tabs.Panel>
+
+        <Tabs.Panel value="cad" pt="sm">
+          <CadDrawing api={api} search={job} />
         </Tabs.Panel>
 
         <Tabs.Panel value="run-details" pt="sm">

@@ -71,6 +71,37 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
     return CreateJobResponse(jobId=job_id, status=jobs.PENDING)
 
 
+@app.post("/api/jobs/{job_id}/drawing", response_model=CreateJobResponse, status_code=202)
+def create_drawing(job_id: str) -> CreateJobResponse:
+    """Start a CAD drawing job for a finished search: read its vesting deed,
+    exceptions and easements and plot them (survey_art/deed_plot.py).
+
+    Rides the same queue, dispatcher and Fargate task as a search; the worker
+    tells the two apart by the job record's `kind`, so the message body and the
+    dispatcher's container overrides are unchanged.
+    """
+    source = jobs.get_job(job_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="job not found")
+    if source.kind != "search" or source.status != jobs.COMPLETED or not source.doc_prefix:
+        raise HTTPException(
+            status_code=409, detail="a drawing needs a completed search with documents"
+        )
+    drawing_id = uuid.uuid4().hex
+    jobs.create_job(
+        drawing_id, address=source.address, county=source.county, kind="drawing",
+        source_job_id=job_id,
+    )  # fmt: skip
+    jobs.set_drawing_job(job_id, drawing_id)
+    aws.client("sqs").send_message(
+        QueueUrl=get_shared_settings().require("job_queue_url"),
+        MessageBody=json.dumps(
+            {"jobId": drawing_id, "address": source.address, "county": source.county}
+        ),
+    )
+    return CreateJobResponse(jobId=drawing_id, status=jobs.PENDING)
+
+
 @app.post("/api/kmz/identify", response_model=KmzIdentifyResponse)
 async def identify_kmz(file: UploadFile) -> KmzIdentifyResponse:
     data = await file.read(_MAX_KMZ_BYTES + 1)

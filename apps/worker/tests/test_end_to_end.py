@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -370,3 +371,79 @@ async def test_a_weld_search_collects_the_sop_packet(client, aws_env, weld_offli
     category = {d["file"]: d["category"] for d in meta["documents"]}
     assert category["glo_field_notes_T5NR67W.pdf"] == "Surveys & Plats"
     assert category["state_highway_row_257A_S_0057_2.pdf"] == "Easements & Rights of Way"
+
+
+# --- CAD drawing: a second job over a finished search's documents. ---
+
+
+async def test_a_cad_drawing_runs_over_a_finished_search(client, aws_env, monkeypatch):
+    from survey_art import deed_plot, plss
+    from survey_art.deed_parse import DeedParse, DocumentExtract
+
+    truth = json.loads((Path(__file__).parent / "deed_ground_truth.json").read_text())
+
+    async def scrape(geocoded, tmp_dir, **_kwargs):
+        dest = tmp_dir / geocoded.county.key() / "R1611986"
+        saved = [
+            _pdf(dest / name)
+            for name in ("vesting_deed_4970002.pdf", "exception_1715553.pdf", "alta_4571638.pdf")
+        ]
+        (dest / "overview.json").write_text(
+            json.dumps({"identify_results": {"address": "1 Main St"}})
+        )
+        return saved, None, 0.0, 0, 0
+
+    def read_document(doc, **_):
+        descriptions = truth["documents"][doc.reception]["descriptions"]
+        return DeedParse(
+            extract=DocumentExtract.model_validate({"descriptions": descriptions}),
+            source="bedrock",
+            input_tokens=5000,
+            output_tokens=500,
+            cost_usd=0.02,
+        )
+
+    def square(state, meridian, township, range_, section):
+        x0 = 3_170_000 - (section - 15) * 5280
+        return plss.Quad.from_corners(
+            (x0, 1_391_640), (x0 + 5280, 1_391_640), (x0 + 5280, 1_386_360), (x0, 1_386_360)
+        )
+
+    _use_scraper(monkeypatch, scrape)
+    monkeypatch.setattr(deed_plot, "read_document", read_document)
+    monkeypatch.setattr(plss, "fetch_section", square)
+
+    client.post("/api/jobs", json={"address": "R1611986", "county": "CO_weld"})
+    search_id = await _process_next_message(aws_env)
+
+    # Not before the search is done, and not for a job that doesn't exist.
+    assert client.post("/api/jobs/nope/drawing").status_code == 404
+
+    created = client.post(f"/api/jobs/{search_id}/drawing")
+    assert created.status_code == 202
+    drawing_id = await _process_next_message(aws_env)
+    assert drawing_id == created.json()["jobId"]
+
+    drawing = client.get(f"/api/jobs/{drawing_id}").json()
+    assert drawing["status"] == "COMPLETED", drawing.get("error")
+    assert drawing["kind"] == "drawing"
+    assert drawing["sourceJobId"] == search_id
+    assert client.get(f"/api/jobs/{search_id}").json()["drawingJobId"] == drawing_id
+
+    rows = {d["reception"]: d for d in drawing["metadata"]["drawing"]["documents"]}
+    assert set(rows) == {"4970002", "1715553"}  # the ALTA isn't plotted
+    assert rows["1715553"]["descriptions"][0]["status"] == "ok"
+    costs = {line["key"]: line["usd"] for line in drawing["costs"]}
+    assert costs["bedrock"] == pytest.approx(0.04)
+
+    names = {f["name"] for f in client.get(f"/api/jobs/{drawing_id}/files").json()["files"]}
+    assert names == {"1_Main_St_deeds.dxf", "1_Main_St_points.csv", "1_Main_St_qc_report.csv",
+                     "qc.json"}  # fmt: skip
+    # ...and none of it leaks into the search's own document grid or the sidebar.
+    search_files = {f["name"] for f in client.get(f"/api/jobs/{search_id}/files").json()["files"]}
+    assert search_files == {"vesting_deed_4970002.pdf", "exception_1715553.pdf",
+                            "alta_4571638.pdf"}  # fmt: skip
+    assert [j["jobId"] for j in client.get("/api/jobs").json()["jobs"]] == [search_id]
+
+    # A drawing is made from a search, never from another drawing.
+    assert client.post(f"/api/jobs/{drawing_id}/drawing").status_code == 409

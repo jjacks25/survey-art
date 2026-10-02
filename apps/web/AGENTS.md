@@ -203,6 +203,16 @@ four `Tabs.Panel`s from the response:
   `job.location`, (3) a plain address-based Google Maps search, (4) a "no location yet"
   message.
 
+## CAD Drawing tab
+
+`CadDrawing.tsx` — shown on search jobs. "Create CAD drawing" calls
+`api.createDrawing()` (`POST /api/jobs/{id}/drawing`), then polls that *drawing* job
+(its id comes from the search's `drawingJobId`, so it survives a reload) every 3s.
+When it completes: download buttons for the DXF, point file and QC CSV, and a QC
+table built from `drawing.metadata.drawing.documents` (`cad_export.qc_rows()` in the
+worker). Rows with status `info` — documents that only name the area they lie in, or
+have no land description — fold into a "nothing to draw" spoiler.
+
 ## Run Details: the cost table renders whatever the worker sends
 
 `RunCost` (`ResultsPage.tsx`) maps over `job.costs` — a `CostLine[]` the worker's

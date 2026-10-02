@@ -104,6 +104,13 @@ class Job(BaseModel):
     # The per-service cost breakdown (see apps/worker/survey_art/costs.py). `usd`
     # is typed, so DynamoDB's Decimals coerce back to float on read.
     costs: list[CostLine] = Field(default_factory=list)
+    # "search" scrapes a property; "drawing" turns a finished search's documents
+    # into a CAD drawing (survey_art/deed_plot.py). A drawing job points back at
+    # its search through `source_job_id`, and the search at its latest drawing
+    # through `drawing_job_id`, so the Results page can find it in one read.
+    kind: Literal["search", "drawing"] = "search"
+    source_job_id: str | None = Field(default=None, alias="sourceJobId")
+    drawing_job_id: str | None = Field(default=None, alias="drawingJobId")
 
     def to_item(self) -> dict:
         # Alias keys for DynamoDB; drop error when unset rather than storing null.
@@ -144,7 +151,14 @@ def _saved_properties_table():
     return aws.resource("dynamodb").Table(get_shared_settings().require("saved_properties_table"))
 
 
-def create_job(job_id: str, address: str, county: str) -> Job:
+def create_job(
+    job_id: str,
+    address: str,
+    county: str,
+    *,
+    kind: Literal["search", "drawing"] = "search",
+    source_job_id: str | None = None,
+) -> Job:
     now = int(time.time())
     job = Job(
         job_id=job_id,
@@ -154,9 +168,22 @@ def create_job(job_id: str, address: str, county: str) -> Job:
         created_at=now,
         updated_at=now,
         expires_at=now + JOB_TTL_SECONDS,
+        kind=kind,
+        source_job_id=source_job_id,
     )
     _table().put_item(Item=job.to_item())
     return job
+
+
+def set_drawing_job(job_id: str, drawing_job_id: str) -> None:
+    """Point a search job at its latest drawing job. Deliberately not
+    `update_status()`: that also bumps `updatedAt`, which the Run Details tab
+    reads as the search's finish time."""
+    _table().update_item(
+        Key={"jobId": job_id},
+        UpdateExpression="SET drawingJobId = :d",
+        ExpressionAttributeValues={":d": drawing_job_id},
+    )
 
 
 def get_job(job_id: str) -> Job | None:
@@ -176,7 +203,9 @@ def list_jobs(limit: int = 100) -> list[Job]:
     "recent jobs" yet) — switch to a GSI on a constant partition + createdAt
     sort key if this table ever grows large enough for scan cost to matter."""
     items = _table().scan().get("Items", [])
-    jobs_ = [Job.from_item(item) for item in items]
+    # Drawing jobs are reached from their search's Results page, not listed
+    # as properties of their own.
+    jobs_ = [j for item in items if (j := Job.from_item(item)).kind == "search"]
     jobs_.sort(key=lambda j: j.created_at, reverse=True)
     return jobs_[:limit]
 
@@ -442,6 +471,33 @@ def upload_thumbnails(prefix: str, thumbnails: dict[str, bytes]) -> None:
         list(pool.map(put, thumbnails.items()))
 
 
+DRAWING_SUBPREFIX = ".drawing"
+
+
+def download_documents(prefix: str, dest: Path) -> list[Path]:
+    """Copy a property's documents (not its thumbnails or drawings) from
+    ``documents/{prefix}/`` into ``dest``. What a drawing job reads."""
+    s3 = aws.client("s3")
+    bucket = aws.storage_bucket()
+    base = f"{DOCUMENTS_PREFIX}/{prefix}/"
+    pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=base)
+    keys = [
+        obj["Key"]
+        for page in pages
+        for obj in page.get("Contents", [])
+        if "/" not in obj["Key"][len(base) :]
+    ]
+    dest.mkdir(parents=True, exist_ok=True)
+
+    def get(key: str) -> Path:
+        path = dest / key.rsplit("/", 1)[-1]
+        s3.download_file(bucket, key, str(path))
+        return path
+
+    with ThreadPoolExecutor(max_workers=_UPLOAD_WORKERS) as pool:
+        return list(pool.map(get, keys))
+
+
 EXTRACTIONS_PREFIX = "extractions"
 
 
@@ -546,7 +602,9 @@ def list_result_files(prefix: str) -> list[dict]:
     files: list[dict] = []
     for obj in objects:
         key = obj["Key"]
-        if key.startswith(thumbs):
+        # Dot-prefixed subfolders (.thumbnails, a drawing job's .drawing) hold
+        # derived files, never documents of the property itself.
+        if "/." in key[len(base) - 1 :]:
             continue
         name = key.rsplit("/", 1)[-1]
         thumb_key = f"{thumbs}{name}.jpg"

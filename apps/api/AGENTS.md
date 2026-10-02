@@ -37,6 +37,12 @@ scraper or a browser, so it stays small and fits scale-to-zero Lambda.
   from `job.doc_prefix` under the storage bucket's `documents/` namespace (see below) —
   returns an empty list if the job has no `doc_prefix` yet (not completed, or failed
   before any upload).
+- `POST /api/jobs/{id}/drawing` → start a CAD drawing job over a completed search
+  (404 unknown, 409 unless the job is a `COMPLETED` search with a `docPrefix`).
+  Creates a job with `kind: "drawing"` and `sourceJobId`, points the search at it
+  (`drawingJobId`), and enqueues it like any job — the worker branches on `kind`, so the
+  SQS body and the dispatcher are unchanged. Its outputs are listed by the same
+  `GET /api/jobs/{drawingId}/files`, and its QC table is `metadata.drawing`.
 - `GET /api/health` → liveness.
 - `POST /api/kmz/identify` (multipart `file`) → `{identifier, parcels}`. `identifier` is
   the account/parcel number from a county-exported KMZ, or `null`. When it's `null`, the

@@ -1,0 +1,172 @@
+{
+  "_about": "Hand-read legal descriptions from the R1611986 (S15/S16 T5N R67W, Weld County) document set in tmp/CO_weld/R1611986/. Transcribed 2026-10-02 from the recorder scans, in the deed_parse.DocumentExtract schema. Every bearing and distance is as printed. Needs a PLS spot-check before it is treated as authoritative. Used by tests/test_deed_plot.py (math, no LLM) and `python -m survey_art.deed_plot --eval` (model vs this file).",
+  "documents": {
+    "4970002": {
+      "_note": "Vesting deed. Aliquot only, no metes and bounds. The subject boundary comes from BLM PLSS geometry.",
+      "descriptions": [
+        {"label": "Parcel 1", "shape": "aliquot",
+         "aliquot_parts": [{"section": 15, "township": "5N", "range": "67W", "aliquot": ""}]},
+        {"label": "Parcel 2", "shape": "aliquot",
+         "aliquot_parts": [{"section": 16, "township": "5N", "range": "67W", "aliquot": "S1/2"}]}
+      ]
+    },
+    "1511417": {
+      "_note": "1968 highway parcel 44. Reverse tie from the NW corner. Called 12.969 ac.",
+      "descriptions": [
+        {"label": "Parcel No. 44", "shape": "parcel",
+         "start": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "NW"},
+         "called_area": "12.969 acres",
+         "courses": [
+           {"role": "tie_in", "reverse": true, "bearing": "N. 1° 56' W.", "distance": "214.2 feet"},
+           {"bearing": "S. 89° 37' 15\" E.", "distance": "2,633.8 feet"},
+           {"bearing": "N. 0° 59' 45\" W.", "distance": "214.6 feet"},
+           {"bearing": "N. 89° 37' 45\" W.", "distance": "2,637.3 feet"},
+           {"bearing": "S. 1° 56' E.", "distance": "214.2 feet"}
+         ]}
+      ]
+    },
+    "1512031": {
+      "_note": "1968 highway parcel 43. Reverse tie from the NE corner. Called 21.441 ac.",
+      "descriptions": [
+        {"label": "Parcel No. 43", "shape": "parcel",
+         "start": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "NE"},
+         "called_area": "21.441 acres",
+         "courses": [
+           {"role": "tie_in", "reverse": true, "bearing": "N. 3° 22' E.", "distance": "925.3 feet"},
+           {"bearing": "N. 6° 03' 30\" W.", "distance": "301.5 feet"},
+           {"bearing": "N. 73° 16' 30\" W.", "distance": "1,028.7 feet"},
+           {"bearing": "N. 86° 45' 30\" W.", "distance": "600.7 feet"},
+           {"bearing": "N. 84° 17' W.", "distance": "967.7 feet"},
+           {"bearing": "N. 0° 59' 45\" W.", "distance": "214.6 feet"},
+           {"bearing": "S. 89° 37' 45\" E.", "distance": "2,527.8 feet"},
+           {"bearing": "S. 0° 21' E.", "distance": "30.0 feet"},
+           {"bearing": "S. 45° 06' E.", "distance": "71.0 feet"},
+           {"bearing": "S. 0° 21' E.", "distance": "844.4 feet"}
+         ]}
+      ]
+    },
+    "1688529": {
+      "_note": "1976 highway parcel 28. Reverse tie from the NE corner of the NW1/4 (the N1/4 corner). Called 10.135 ac.",
+      "descriptions": [
+        {"label": "Parcel No. 28", "shape": "parcel",
+         "start": {"section": 15, "township": "5N", "range": "67W", "aliquot": "NW1/4", "corner": "NE"},
+         "called_area": "10.135 acres",
+         "courses": [
+           {"role": "tie_in", "reverse": true, "bearing": "N. 1° 06' 45\" W.", "distance": "597.0 feet"},
+           {"bearing": "N. 81° 36' W.", "distance": "359.3 feet"},
+           {"bearing": "N. 80° 53' 15\" W.", "distance": "1,052.9 feet"},
+           {"bearing": "N. 75° 09' 45\" W.", "distance": "675.4 feet"},
+           {"bearing": "S. 89° 43' 30\" E.", "distance": "2,040.5 feet"},
+           {"bearing": "S. 1° 06' 45\" E.", "distance": "382.4 feet"}
+         ]}
+      ]
+    },
+    "1715553": {
+      "_note": "1977 highway parcel 29. Has a curve given by radius, arc and chord. Called 5.663 ac.",
+      "descriptions": [
+        {"label": "Parcel No. 29", "shape": "parcel",
+         "start": {"section": 15, "township": "5N", "range": "67W", "aliquot": "NE1/4", "corner": "NW"},
+         "called_area": "5.663 acres",
+         "courses": [
+           {"role": "tie_in", "reverse": true, "bearing": "N. 1° 06' 45\" W.", "distance": "597.0 feet"},
+           {"bearing": "N. 1° 06' 45\" W.", "distance": "382.4 feet"},
+           {"bearing": "S. 84° 24' 30\" E.", "distance": "967.7 feet"},
+           {"bearing": "S. 65° 57' 30\" W.", "distance": "52.4 feet"},
+           {"kind": "curve", "curve": {"direction": "right", "radius": "1,295.9 feet", "arc": "904.7 feet", "chord_bearing": "S. 71° 50' W.", "chord": "886.5 feet"}},
+           {"bearing": "N. 81° 36' W.", "distance": "66.3 feet"}
+         ]}
+      ]
+    },
+    "2369866": {
+      "_note": "1994 conservator's deed to Greeley. POB is the SW corner itself, with a basis of bearings. 2369867 repeats this description word for word.",
+      "descriptions": [
+        {"label": "SW corner tract", "shape": "parcel",
+         "start": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "SW"},
+         "basis": {"from_corner": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "SW"},
+                   "to_corner": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "NW"},
+                   "bearing": "north 00°00'00\" east"},
+         "courses": [
+           {"bearing": "north 00°00'00\" east", "distance": "950.00 feet"},
+           {"bearing": "south 87°57'15\" east", "distance": "485.00 feet"},
+           {"bearing": "south 00°00'00\" west", "distance": "950.00 feet"},
+           {"bearing": "north 87°57'15\" west", "distance": "485.00 feet"}
+         ]}
+      ]
+    },
+    "2943083": {
+      "_note": "2002 deed to Greeley with two descriptions, each with a forward commencing tie and its own basis of bearings. Called 19.741 ac and 18.004 ac. Course 3 of the first description prints '995.83' with no unit.",
+      "descriptions": [
+        {"label": "SE1/4 SE1/4 Section 16", "shape": "parcel",
+         "start": {"section": 16, "township": "5N", "range": "67W", "aliquot": "", "corner": "SE"},
+         "basis": {"from_corner": {"section": 16, "township": "5N", "range": "67W", "aliquot": "SE1/4", "corner": "SE"},
+                   "to_corner": {"section": 16, "township": "5N", "range": "67W", "aliquot": "SE1/4", "corner": "SW"},
+                   "bearing": "South 89°25'41\" West"},
+         "called_area": "19.741 acres",
+         "courses": [
+           {"role": "tie_in", "bearing": "South 89°25'41\" West", "distance": "483.51 feet"},
+           {"bearing": "South 89°25'41\" West", "distance": "523.60 feet"},
+           {"bearing": "North 01°55'41\" West", "distance": "1318.73 feet"},
+           {"bearing": "North 89°27'07\" East", "distance": "995.83"},
+           {"bearing": "South 02°25'06\" East", "distance": "368.17 feet"},
+           {"bearing": "South 89°25'47\" West", "distance": "485.25 feet"},
+           {"bearing": "South 02°31'23\" East", "distance": "950.53 feet"}
+         ]},
+        {"label": "SW1/4 SW1/4 Section 15", "shape": "parcel",
+         "start": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "SW"},
+         "basis": {"from_corner": {"section": 15, "township": "5N", "range": "67W", "aliquot": "SW1/4", "corner": "SW"},
+                   "to_corner": {"section": 15, "township": "5N", "range": "67W", "aliquot": "SW1/4", "corner": "SE"},
+                   "bearing": "North 89°41'20\" East"},
+         "called_area": "18.004 acres",
+         "courses": [
+           {"role": "tie_in", "bearing": "North 89°41'20\" East", "distance": "950.00 feet"},
+           {"bearing": "North 02°25'06\" West", "distance": "949.56 feet"},
+           {"bearing": "South 89°44'35\" West", "distance": "950.03 feet"},
+           {"bearing": "North 02°25'06\" West", "distance": "368.17 feet"},
+           {"bearing": "North 89°43'33\" East", "distance": "1285.48 feet"},
+           {"bearing": "South 01°56'30\" East", "distance": "1317.44 feet"},
+           {"bearing": "South 89°41'20\" West", "distance": "324.48 feet"}
+         ]}
+      ]
+    },
+    "2786305": {
+      "_note": "2000 Greeley water-line easement: a 30' strip on a centerline, open, with a tie-out to the NE corner. Its other two pieces ('West 30 feet of the East 50 feet of the S1/2 of Sec 16...' and a 50' temporary strip) are not courses, so they belong in notes, not descriptions.",
+      "descriptions": [
+        {"label": "Permanent easement centerline", "shape": "centerline", "width": "30 feet",
+         "start": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "NW"},
+         "end": {"section": 15, "township": "5N", "range": "67W", "aliquot": "", "corner": "NE"},
+         "basis": {"from_corner": {"section": 15, "township": "5N", "range": "67W", "aliquot": "NW1/4", "corner": "NW"},
+                   "to_corner": {"section": 15, "township": "5N", "range": "67W", "aliquot": "NW1/4", "corner": "NE"},
+                   "bearing": "North 89°50'09\" East"},
+         "called_area": "3.708 acres",
+         "courses": [
+           {"role": "tie_in", "bearing": "South 02°24'59\" East", "distance": "282.83 feet"},
+           {"bearing": "South 89°21'06\" East", "distance": "599.40 feet"},
+           {"bearing": "South 74°21'06\" East", "distance": "750.54 feet"},
+           {"bearing": "South 81°50'54\" East", "distance": "1519.16 feet"},
+           {"bearing": "North 77°01'45\" East", "distance": "398.45 feet"},
+           {"bearing": "North 60°24'51\" East", "distance": "500.89 feet"},
+           {"bearing": "South 86°35'59\" East", "distance": "552.36 feet"},
+           {"bearing": "South 70°07'32\" East", "distance": "980.47 feet"},
+           {"bearing": "North 89°09'30\" East", "distance": "82.97 feet"},
+           {"role": "tie_out", "bearing": "North 04°15'48\" East", "distance": "752.54 feet"}
+         ]}
+      ]
+    },
+    "1766549": {
+      "_note": "1978 deed: 'The South 950 Feet of the East 485 Feet of the SE1/4 of Section 16'. Not metes and bounds. Plotted as a derived rectangle off the SE corner with cardinal bearings.",
+      "descriptions": [
+        {"label": "S 950' of E 485' of SE1/4 Sec 16", "shape": "parcel", "derived": true,
+         "start": {"section": 16, "township": "5N", "range": "67W", "aliquot": "", "corner": "SE"},
+         "courses": [
+           {"bearing": "North", "distance": "950 feet"},
+           {"bearing": "West", "distance": "485 feet"},
+           {"bearing": "South", "distance": "950 feet"},
+           {"bearing": "East", "distance": "485 feet"}
+         ]}
+      ]
+    },
+    "1766552": {"_note": "Water-line right-of-way grant. The only geometry is a hand sketch (Exhibit A, 1\"=5000'). Nothing to plot.", "descriptions": []},
+    "2616017": {"_note": "Meter-site easement: '100' x 100' site in the NW/4NE/4'. The exhibit is a sketch marked 'not a land survey'. Nothing to plot.", "descriptions": []},
+    "1443884": {"_note": "A 1964 chattel mortgage on cattle that a citation mis-resolved to. Nothing to plot.", "descriptions": []}
+  }
+}

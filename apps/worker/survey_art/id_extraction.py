@@ -584,7 +584,7 @@ def _page_turn(client, model: str, raster: Image.Image) -> tuple[int, int, int]:
         return 0, 0, 0
 
 
-def _bedrock_client():
+def _bedrock_client(read_timeout: int = 60):
     region = get_settings().aws_region
     return boto3.client(
         "bedrock-runtime",
@@ -593,7 +593,7 @@ def _bedrock_client():
         # LocalStack has no Bedrock — point this one client back at real AWS so the
         # containerised worker reads PDFs the same way the Fargate one does.
         endpoint_url=f"https://bedrock-runtime.{region}.amazonaws.com",
-        config=Config(retries={"max_attempts": 5, "mode": "adaptive"}),
+        config=Config(retries={"max_attempts": 5, "mode": "adaptive"}, read_timeout=read_timeout),
     )
 
 
