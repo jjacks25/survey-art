@@ -352,7 +352,7 @@ async def fetch_road_row(
                 for record in records[:_MAX_BOCC_RECORDS]:
                     pdf = await _bocc_pdf(client, record)
                     if pdf:
-                        path = dest_dir / f"county_road_row_{record['name']}.pdf"
+                        path = dest_dir / f"county_road_row_{_safe(record['name'])}.pdf"
                         path.write_bytes(pdf)
                         record["file"] = path.name
                         saved.append((path, f"County Road Right of Way — {record['doc_type']}"))

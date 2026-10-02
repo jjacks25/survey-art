@@ -1437,7 +1437,7 @@ _sweep_cache: dict[tuple, list[dict]] = {}
 
 
 @asynccontextmanager
-async def _recorder_search_session(username: str, password: str):
+async def _recorder_search_session():
     """Open an authenticated Playwright page for driving Advanced Search.
 
     Shared by the partial-history search, the owner-name search, and the
@@ -1448,6 +1448,8 @@ async def _recorder_search_session(username: str, password: str):
     """
     from playwright.async_api import async_playwright
 
+    s = get_settings()
+    username, password = s.weld_recorder_username, s.weld_recorder_password
     if not (username and password):
         logger.warning(
             "Advanced Search: WELD_RECORDER_USERNAME/PASSWORD not set — "
