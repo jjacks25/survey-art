@@ -1574,9 +1574,16 @@ def _section_scan_rank(doc_type_label: str) -> int:
 
 # The recorder Document Types a chain-of-title search downloads, exactly as
 # the recorder spells them — the list our PLS picked from the Advanced Search
-# form's Document Types box (2026-10-02). Everything else a chain owner's name
-# turns up is only listed in overview.json. To change what gets pulled, edit
-# this list.
+# form's Document Types box (2026-10-02), plus the five types a title
+# commitment also lists that the box left out (MINERAL DEED, MINERAL QUIT
+# CLAIM DEED, DRY UP COVENANT, MEMORANDUM OF LEASE, EXTENSION OIL & GAS LEASE).
+# Everything else a chain owner's name turns up is only listed in
+# overview.json. Variants the recorder files the same kind of document under
+# (corrected / joint tenancy / trustees mineral deeds, corrected O&G leases,
+# ANNEXATION PLAT) are listed too, from its full type list, so a property is
+# treated the same whichever variant its county clerk picked. Matching ignores
+# case and repeated spaces ("Historical", "WATER  AGREEMENT"). To change what
+# gets pulled, edit this list.
 _CHAIN_PULL_TYPES = frozenset(
     {
         "ACKNOWLEDGMENT",
@@ -1606,12 +1613,14 @@ _CHAIN_PULL_TYPES = frozenset(
         "DEVELOPMENT PLAN",
         "DITCH STATEMENT",
         "DRAWING",
+        "DRY UP COVENANT",
         "EASEMENT",
         "EASEMENT & RIGHT OF WAY",
         "EASEMENT DEED",
         "EASEMENT PLAT",
         "EASEMENT RIGHT OF WAY & SURFACE USE AGM",
         "EXHIBIT",
+        "EXTENSION OIL & GAS LEASE",
         "FINAL DEVELOPMENT PLAN",
         "GRANT & RELEASE OF EASEMENT",
         "HISTORICAL",
@@ -1623,6 +1632,9 @@ _CHAIN_PULL_TYPES = frozenset(
         "LOT LINE ADJUSTMENT REPLAT",
         "MAP",
         "MASTER PLAN",
+        "MEMORANDUM OF LEASE",
+        "MINERAL DEED",
+        "MINERAL QUIT CLAIM DEED",
         "MINOR RESUBDIVISION PLAT",
         "MINOR SUBDIVISION",
         "NOTARY AFFIDAVIT",
@@ -1676,6 +1688,16 @@ _CHAIN_PULL_TYPES = frozenset(
         "WATER DEED",
         "ZONING MAP",
         "ZONE CHANGE",
+        "ANNEXATION PLAT",
+        "CORRECTED MINERAL DEED",
+        "CORRECTED OIL & GAS LEASE",
+        "CORRECTED PERSONAL REP MINERAL DEED",
+        "JOINT TENANCY MINERAL DEED",
+        "MINERAL & ROYALTY DEED",
+        "MINERAL CONVEYANCE",
+        "PERSONAL REPRESENTATIVES MINERAL DEED",
+        "RATIFICATION & EXTENSION OIL & GAS",
+        "TRUSTEES MINERAL DEED",
     }
 )
 
