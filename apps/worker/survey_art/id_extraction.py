@@ -169,6 +169,28 @@ def _dedupe(ids: Iterator[ExtractedId] | list[ExtractedId]) -> list[ExtractedId]
     return out
 
 
+# A vision read sometimes degenerates into counting: 51623, 51624, ... 51834.
+# Real documents cite a few receptions apart, never four-plus in a row, so a
+# run that long from one page is the model looping, not the page.
+_COUNTING_RUN = 4
+
+
+def _drop_counting_runs(ids: list[ExtractedId]) -> list[ExtractedId]:
+    numbers = sorted({int(i.id) for i in ids if i.id_type == "reception_number"})
+    looped: set[int] = set()
+    run = numbers[:1]
+    for n in [*numbers[1:], None]:
+        if n is not None and n == run[-1] + 1:
+            run.append(n)
+            continue
+        if len(run) >= _COUNTING_RUN:
+            looped.update(run)
+        run = [n]
+    if looped:
+        logger.warning("id_extraction: dropped %d counted-up reception number(s)", len(looped))
+    return [i for i in ids if not (i.id_type == "reception_number" and int(i.id) in looped)]
+
+
 def parse_ids_from_text(text: str) -> list[ExtractedId]:
     """Pull every labelled record reference out of a block of document text."""
     return _dedupe(
@@ -310,7 +332,7 @@ _EXTRACT_TOOL = {
 # prompt aren't served. p2: skip PLS/seal and well API numbers — job b721dda1
 # fetched recorder document 22098 because it read King Surveyors' "PLS 22098"
 # off a monument cap as a reception number.
-_PROMPT_VERSION = "p2"
+_PROMPT_VERSION = "p3"
 _PROMPT = (
     "These images are tiles of one page of a land survey / title commitment. Read every "
     "one and find every reference to another recorded document: exception and easement "
@@ -625,7 +647,7 @@ def _read_page(client, model: str, tiles: list[bytes]) -> tuple[list[ExtractedId
         if isinstance(r, dict)
         for item in _classify(str(r.get("value", "")), str(r.get("context") or ""))
     ]
-    return found, in_tok, out_tok
+    return _drop_counting_runs(found), in_tok, out_tok
 
 
 def _extract_with_bedrock(reader: PdfReader, model: str) -> IdExtraction:
