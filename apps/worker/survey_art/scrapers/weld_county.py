@@ -71,6 +71,7 @@ from survey_art.download import download_dir as make_download_dir
 from survey_art.geocode import GeocodedAddress
 from survey_art.id_extraction import IdExtraction, cache_fingerprint, extract_document_ids
 from survey_art.scrapers.glo_records import fetch_glo_records
+from survey_art.scrapers.weld_road_row import fetch_road_row, road_row_references
 from survey_art.settings import get_settings
 from survey_shared import jobs
 
@@ -1299,6 +1300,8 @@ async def _run_advanced_search(
     range_: str = "",
     subdivision: str = "",
     search_name: str = "",
+    book: str = "",
+    page_no: str = "",
     start_date: str = "",
     end_date: str = "",
 ) -> list[dict]:
@@ -1320,7 +1323,19 @@ async def _run_advanced_search(
     (`#field_BothNamesID`), not a separate Basic Search page. `start_date` /
     `end_date` are MM/DD/YYYY strings for the Recording Date range.
     """
-    await page.goto(_ADVANCED_SEARCH_URL, wait_until="networkidle", timeout=30_000)
+    # Partway through a long session the recorder can bounce any page to
+    # /web/user/disclaimer ("the terms of usage have changed") — the server has
+    # dropped our disclaimer cookie, and the form never renders. Measured: 1 in 2
+    # local runs of S32-T5N-R65W's sweep hit it (at search 31), and job for
+    # R8995911 died of it at search 13. Re-asserting the cookie recovers, same as
+    # `_fetch_document`'s retry; logging in again would not (see there).
+    for attempt in range(3):
+        await page.goto(_ADVANCED_SEARCH_URL, wait_until="networkidle", timeout=30_000)
+        if "/user/disclaimer" not in page.url:
+            break
+        logger.warning("Advanced Search: bounced to the disclaimer (attempt %d/3)", attempt + 1)
+        await page.context.clear_cookies(name="disclaimerAccepted")
+        await page.context.add_cookies([_DISCLAIMER_COOKIE])
     # The form opens with a "Continue session?" dialog if any user state exists.
     # Measured across ~60 consecutive searches on one login it never appeared
     # once, so don't wait long for it.
@@ -1362,6 +1377,8 @@ async def _run_advanced_search(
         ("#field_PLSSLegalID_DOT_Range", range_.rstrip("EeWw")),
         ("#field_PlattedLegalID_DOT_Subdivision", subdivision),
         ("#field_BothNamesID", search_name),
+        ("#field_BookPageID_DOT_Book", book),
+        ("#field_BookPageID_DOT_Page", page_no),
         ("#field_RecordingDateID_DOT_StartDate", start_date),
         ("#field_RecordingDateID_DOT_EndDate", end_date),
     ):
@@ -1389,12 +1406,14 @@ async def _run_advanced_search(
         }"""
     )
     logger.info(
-        "Advanced Search (S=%s T=%s R=%s Sub=%s Name=%s Dates=%s-%s): %d row(s)",
+        "Advanced Search (S=%s T=%s R=%s Sub=%s Name=%s Bk/Pg=%s/%s Dates=%s-%s): %d row(s)",
         section,
         township,
         range_,
         subdivision,
         search_name,
+        book,
+        page_no,
         start_date or "*",
         end_date or "*",
         len(rows),
@@ -1729,6 +1748,58 @@ def _select_schedule_b2_exception_targets(
     return targets
 
 
+_CITED_BOOK_PAGE_RE = re.compile(r"Book (\d+) Page (\d+)")
+_CITED_YEAR_RE = re.compile(r"\b(1[89]\d\d|20\d\d)\b")
+
+
+async def _resolve_book_page_citations(
+    page, items: list, known_receptions: set[str], resolved: dict[str, str] | None = None
+) -> list[tuple[str, _DocRecord]]:
+    """Turn cited Book/Page references into download targets via the recorder's
+    Book/Page search.
+
+    This is how anything older than ~1994 gets found at all: Weld only indexed
+    legal descriptions from then on, so an S/T/R search is blind to the deeds,
+    road rights-of-way and railroad reservations recorded before it. Measured on
+    S15-T5N-R67W: 82 documents, two from 1908-1912 and the rest 1994+. Those
+    older documents are what an ALTA cites by book and page.
+
+    Book numbers repeat across eras, so a Book/Page hit is only trusted when its
+    recording year matches a year printed in the citation. From R1611986's ALTA,
+    Book 233 Page 185 ("Union Pacific reservations, Dec 17 1908") resolves to the
+    1908 Union Pacific warranty deed, but Book 1583 Page 294 (a 1961 highway
+    deed) resolves to a 1996 deed of trust. A citation with no year, or no
+    matching hit, is not fetched and stays in `extracted_ids` for a manual look.
+    Mutates `known_receptions` in place, and records each citation it matched in
+    `resolved` (Book/Page id -> reception) when given.
+    """
+    targets: list[tuple[str, _DocRecord]] = []
+    for item in items:
+        m = _CITED_BOOK_PAGE_RE.fullmatch(item.id)
+        years = set(_CITED_YEAR_RE.findall(f"{item.context} {item.raw}"))
+        if not (m and years):
+            logger.info("Book/Page %s: no recording year cited, not auto-fetched", item.id)
+            continue
+        rows = await _run_advanced_search(page, book=m[1], page_no=m[2])
+        # rec_date is "MM/DD/YYYY hh:mm AM"
+        hit = next((r for r in rows if r["reception"] and r["rec_date"][6:10] in years), None)
+        if not hit:
+            logger.info(
+                "Book/Page %s: no recorded document from %s (%d other hit(s))",
+                item.id,
+                "/".join(sorted(years)),
+                len(rows),
+            )
+            continue
+        if resolved is not None:
+            resolved[item.id] = hit["reception"]
+        if hit["reception"] in known_receptions:
+            continue
+        known_receptions.add(hit["reception"])
+        targets.append(("exception", _row_to_record(hit)))
+    return targets
+
+
 # Safety backstop for the cross-reference walk below. Real recorder data is a
 # finite graph and `extracted`/`known_receptions` already stop a document from
 # being read or fetched twice, so this only guards the pathological case (a
@@ -1821,6 +1892,7 @@ async def _expand_cross_references(
       than one per citing document.
     """
     extracted: set[str] = set()
+    searched_book_pages: set[str] = set()
     # Seeded from what's already on file so a second walk (the section scan's
     # surveys, further down `scrape()`) adds to the table instead of replacing it.
     extracted_ids: list[dict] = list(ov.get("extracted_ids", []))
@@ -1881,6 +1953,36 @@ async def _expand_cross_references(
                 f"{len(found)} other recorded document(s) — downloading them now..."
             )
             next_targets += found
+
+        # Book/Page citations need a recorder search to become a reception
+        # number, so they're resolved for the whole level in one session.
+        book_pages = [
+            item
+            for extraction in extractions
+            for item in extraction.ids
+            if item.id_type == "book_page" and item.id not in searched_book_pages
+        ]
+        if (
+            book_pages
+            and depth < _MAX_CROSS_REFERENCE_DEPTH
+            and discovered < _MAX_CROSS_REFERENCE_DOCS
+        ):
+            searched_book_pages.update(item.id for item in book_pages)
+            async with _recorder_search_session(username, password) as search_page:
+                if search_page:
+                    resolved: dict[str, str] = dict(ov.get("book_page_resolutions", {}))
+                    found = await _resolve_book_page_citations(
+                        search_page, book_pages, known_receptions, resolved
+                    )
+                    ov.set_section("book_page_resolutions", resolved)
+                    found = found[: _MAX_CROSS_REFERENCE_DOCS - discovered]
+                    discovered += len(found)
+                    if found:
+                        narration.info(
+                            f"Found {len(found)} older document(s) cited by book and "
+                            "page — downloading them now..."
+                        )
+                    next_targets += found
 
         if depth >= _MAX_CROSS_REFERENCE_DEPTH:
             narration.info(
@@ -2613,8 +2715,7 @@ async def scrape(
     # too — a surveyor wants to know about anything else recorded here, not
     # just what this property's own history happened to cite. ---
     narration.info(
-        "Searching the Clerk & Recorder for other documents recorded in this "
-        "property's section..."
+        "Searching the Clerk & Recorder for other documents recorded in this property's section..."
     )
     str_targets: list[tuple[str, _DocRecord]] = []
     section_index: list[dict] = []
@@ -2746,6 +2847,38 @@ async def scrape(
             },
         )
 
+    # --- Phase 5: state & county road right-of-way packet. Also independent of
+    # the Phase 3 path. The Schedule B-2 road exceptions it starts from were
+    # already fetched by the cross-reference walk above; this adds the county's
+    # road petitions/vacations and CDOT's highway ROW plans, and logs which of
+    # those exceptions were and weren't found. ---
+    narration.info(
+        "Assembling the road right-of-way packet: county road records and state "
+        "highway right-of-way plans next to this property..."
+    )
+    row_files, row_log = await fetch_road_row(
+        account=account,
+        section=parcel.section,
+        township=parcel.township,
+        range_=parcel.range_,
+        dest_dir=dest,
+    )
+    downloaded = {doc.reception for _, doc, paths in results if paths}
+    row_log["schedule_b_road_exceptions"] = road_row_references(
+        ov.get("extracted_ids", []), ov.get("book_page_resolutions", {}), downloaded
+    )
+    ov.set_section("road_right_of_way", row_log)
+    missing = [r for r in row_log["schedule_b_road_exceptions"] if r["status"] != "downloaded"]
+    narration.info(
+        f"Found {len(row_files)} road right-of-way record(s) and plan set(s)"
+        + (
+            f"; {len(missing)} road exception(s) cited on the survey couldn't be located "
+            "automatically and are listed in the property metadata."
+            if missing
+            else "."
+        )
+    )
+
     # Record per-target results in overview.json. A target with zero files
     # captured is "failed"; non-zero is "downloaded".
     results_section: list[dict] = []
@@ -2763,6 +2896,7 @@ async def scrape(
         saved_paths.extend(paths)
     ov.merge_section(route_section, {"results": results_section})
     saved_paths.extend(glo_paths)
+    saved_paths.extend(path for path, _ in row_files)
 
     def _glo_doc_type(filename: str) -> str:
         name = filename.lower()
@@ -2777,26 +2911,39 @@ async def scrape(
     # without re-deriving either from the filename. Every route's documents land
     # here — each route writes its own section above, and a surveyor scanning
     # the grid doesn't care which search turned a document up.
-    document_rows = [
-        {
-            "file": path.name,
-            "reception": doc.reception,
-            "doc_type": doc.doc_type,
-            "category": classify(doc.doc_type),
-            "role": role,
-        }
-        for role, doc, paths in results
-        for path in paths
-    ] + [
-        {
-            "file": path.name,
-            "reception": "",
-            "doc_type": _glo_doc_type(path.name),
-            "category": classify(_glo_doc_type(path.name)),
-            "role": "glo_record",
-        }
-        for path in glo_paths
-    ]
+    document_rows = (
+        [
+            {
+                "file": path.name,
+                "reception": doc.reception,
+                "doc_type": doc.doc_type,
+                "category": classify(doc.doc_type),
+                "role": role,
+            }
+            for role, doc, paths in results
+            for path in paths
+        ]
+        + [
+            {
+                "file": path.name,
+                "reception": "",
+                "doc_type": _glo_doc_type(path.name),
+                "category": classify(_glo_doc_type(path.name)),
+                "role": "glo_record",
+            }
+            for path in glo_paths
+        ]
+        + [
+            {
+                "file": path.name,
+                "reception": "",
+                "doc_type": doc_type,
+                "category": classify(doc_type),
+                "role": "road_row",
+            }
+            for path, doc_type in row_files
+        ]
+    )
     ov.set_section(
         "documents",
         sorted(

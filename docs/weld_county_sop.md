@@ -311,6 +311,23 @@ Anything found and not already downloaded this run gets pulled too.
 > separate from the route's own results section, so a surveyor can see at a glance which
 > documents were targeted directly versus turned up by this broader sweep.
 
+### Book/Page citations and the pre-1994 gap
+
+The recorder only indexed legal descriptions (Section/Township/Range) from about **1994**
+on. A section search can't see anything older: S15-T5N-R67W returns 82 documents, two from
+1908-1912 and the rest 1994+. Older deeds, road rights-of-way and railroad reservations are
+reachable only by **reception number** or **Book/Page**, which is how an ALTA cites them.
+
+The Advanced Search form has Book and Page fields (`#field_BookPageID_DOT_Book` /
+`_Page`), and `_resolve_book_page_citations()` uses them for every `book_page` id the
+cross-reference walk extracts. **Book numbers repeat across eras**, so a hit is only
+accepted when its recording year matches a year printed in the citation — Book 1583 Page
+294 is cited as a 1961 highway deed and the recorder's hit is a 1996 deed of trust. A
+citation with no year, or no year-matched hit, is left in `extracted_ids` for a manual pull.
+Of R1611986's 8 Book/Page citations: 2 resolved (1889 Book 86/273, 1908 Book 233/185), 2
+rejected as the wrong era, 2 not in the index at all (1916, 1934), 2 with no year.
+Resolutions are recorded in `overview.json` → `book_page_resolutions`.
+
 ---
 
 ## Phase 4 — GLO original survey of record
@@ -349,32 +366,91 @@ integration would actually search on.
 
 ## Phase 5 — County & state road right-of-way
 
-*Not yet automated.* Assembles the road ROW packet a title commitment's Schedule B-2 usually
-just cites by reception/date rather than attaches: both county roads (established or vacated
-by the Weld County Board of County Commissioners) and state highways (CDOT). Two sources:
+Assembles the complete road right-of-way (ROW) packet for the parcel: county roads
+(established or vacated by the Weld County Board of County Commissioners, "BOCC") and
+state highways (Colorado Department of Transportation, "CDOT"). The ALTA / title
+commitment's Schedule B-2 lists these ROWs as exceptions; this phase pulls the underlying
+recorded instruments and the governing plan sheets. Run it after the vesting deed / ALTA
+is in hand (Paths A–C). Source: the "State and County Road ROW" training video.
 
-- **County roads** — Weld's BOCC minutes and resolutions live in a Laserfiche WebLink
-  (`minutes.weld.gov/WebLink/`), searchable by date or by the Section/Township/Range recorded
-  in each entry's properties panel. Road petitions, viewers' reports, and vacation
-  resolutions show up here; some cite a Book/Page that's then pullable from the recorder
-  directly.
-- **State highways** — CDOT's Online Transportation Information System (OTIS,
-  `dtdapps.codot.gov/otis`) → **Highway Data Explorer** → search by county + route number +
-  milepost range → **Documents** tab → **ROW Plans**. Plan sets include a
-  "R.O.W. Tabulation of Properties" sheet listing parcels by owner/location/easement type.
+**Step 5.1 — Harvest ROW references from Schedule B-2.** Read the ALTA's Schedule B-2 and
+log every road-ROW exception. From the video (parcel in S15-T5N-R67W): (9) *"Rights of way
+for County Roads, 30 feet on either side of section and township lines, as established by
+the Resolution of the Board of County Commissioners of Weld County, recorded October 14,
+1889 in Book 86 at Page 273"*; (11/12) *"right of way for Colorado State Highway No. 16 … as
+granted to The Department of Highways, State of Colorado, by Deed recorded January 2, 1968
+at Reception No. 1511418."* Pull each one that carries a Reception or Book/Page from the
+recorder, the same way as Path A's exception walk.
 
-**Implementation note for whoever picks this up:** Schedule B-2 reception numbers for road
-ROW exceptions are already being extracted in Path A's exception walk (`extracted_ids` in
-`overview.json`) — Phase 5 mostly needs the *county-road and CDOT plan-sheet* lookups that
-aren't reachable by reception number at all, not a second pass over what Path A already
-found.
+**Step 5.2 — Weld GIS Hub "Right of Way Theme".** GIS Hub → Interactive Maps
+(`gishub.weldgov.com/pages/interactive-maps`) → *View Right of Way Theme*. Find the parcel
+(address or S-T-R, as in Phase 1) and note the abutting county roads and mapped ROW. Those
+road names/numbers drive the BOCC and CDOT searches below.
+
+**Step 5.3 — County road establishment / vacation records (BOCC).** Historical road
+petitions, viewers' reports and vacation resolutions are in the BOCC Laserfiche WebLink
+(`minutes.weld.gov/WebLink/`). Browse or search by the date or Book/Page cited in the
+Schedule B exception, or by the entry's Section/Township/Range fields. Worked example from
+the video, path `BOCC\1906\04-April\1906-04-07`, entry 060007: *4/7/1906 Petition to open
+road: commencing SW corner SE of Sec 21, T5, R67 … Viewers appointed, see Book 11 page 106*;
+*7/11/1906 Viewers report approved; declared public highway*; *3/10/1914 Quit Claim Deed for
+R/W in Sec 28, T5, R67*; *3/2/1937 Resolution to vacate road being NE corner Sec 16, T5,
+R67*. Confirm each record against the Details / Entry Properties panel
+(Quarter/Section/Township/Range). Follow any *"see County Clerk and Recorder Book __ Page
+__"* citation to the recorder.
+
+**Step 5.4 — CDOT OTIS.** For every state highway exception (e.g. SH 16 / SH 34), open the
+Online Transportation Information System (`dtdapps.codot.gov/otis`). Its menu links Highway
+Data Explorer, Traffic Data Explorer, Maps, and the CDOT Right of Way manual.
+
+**Step 5.5 — ROW plans in the Highway Data Explorer** (`dtdapps.codot.gov/otis/HighwayData`).
+Tabs: Search, Highway Details, Traffic Statistics, Video Log, Documents, Structures. On
+*Search → Search by highway segment*, set County = Weld, Route = the SH number from 5.1, and
+Begin/End Reference (mileposts) bracketing the parcel, or click the route on the map. Then
+*Documents → ROW Plans*.
+
+**Step 5.6 — Download the state highway ROW plan set.** Each plan opens in CDOT's OnBase
+viewer (`oitco.hylandcloud.com/cdotrmpop/`). A set typically has the title sheet
+*"DEPARTMENT OF TRANSPORTATION — STATE HIGHWAY NO. NN — WELD COUNTY"*, a *Conventional
+Signs* sheet, and an *"R.O.W. TABULATION OF PROPERTIES IN WELD COUNTY — S.H. NO. NN"* sheet
+listing Parcel Number, Owner, Address, Location (Part of Sec _, T _, R _), area, and
+easement type (Permanent / Temporary Construction / Drainage). Find the row matching the
+owner or S-T-R and keep the plan sheets.
+
+**Step 5.7 — Log and exit.** Record the abutting county roads, BOCC petition/vacation
+records (Book/Page + dates), recorded road-ROW reception numbers, state highway number(s),
+CDOT plan project/sheet numbers, and all file paths. Flag any Schedule B exception that
+couldn't be located (recorded pre-1893, in another county, or a plan not yet digitized) in
+the log rather than blocking.
+
+> **Implementation.** [`scrapers/weld_road_row.py`](../apps/worker/survey_art/scrapers/weld_road_row.py)
+> `fetch_road_row()`, called from `scrape()` after Phase 4 regardless of routing path. Everything
+> except OnBase is plain HTTP — no LLM agent, no login:
+>
+> | Step | How it's done |
+> |---|---|
+> | 5.1 | Already done by the cross-reference walk (`_expand_cross_references`): receptions directly, Book/Page through the recorder's Book/Page search (see "Book/Page citations" below). `road_row_references()` picks the road exceptions out of `extracted_ids` and marks each `downloaded` / `not located`. |
+> | 5.2 | Not the GIS Hub map UI — the same ArcGIS layers behind it. `Parcels_open_data` gives the parcel shape; `Address_Centerlines_open_data` within 100 ft gives road names (`CC_FULLNAME`: `WCR 56`, `HIGHWAY 257`). |
+> | 5.3 | WebLink's JSON search, `SearchService.aspx/GetSearchListing`, with `{[Commissioner Records]:[Section]="15",[Township]="05",[Range]="67"}`. **Township/section are zero-padded** — `"5"` finds nothing. Rows are kept when Document Type or Notes read as a road record (`RDF - Road File Only`, `HWY257`, `WCR76`). PDF: `GeneratePDF10.aspx` → poll `DocumentService.aspx/PDFTransition` until `finished` (rendering is gradual; fetching early returns an HTML stub) → `PDF10/{key}/{entryId}`. |
+> | 5.4–5.5 | CDOT's route layer (`dtdapps.codot.gov/server/rest/services/LRS/Routes_webmerc/MapServer/0`) within 300 ft gives the route IDs (`034A`, `257A`); the milepost is the M value at the route vertex nearest the parcel. OTIS's own JSON API, `otis/API/TRANSYS/RowPlans/{route}/{begin}/{end}`, lists the plans for ±0.25 mi of it. |
+> | 5.6 | OnBase needs a browser (the viewer mints a one-time token): open the `docpop.aspx?docid=` link, catch the `PdfHandler.ashx` request, re-fetch it in the same context. The tabulation-sheet owner match is **not** automated — whole plan sets are kept (up to 6 per route, newest first). |
+> | 5.7 | `overview.json` → `road_right_of_way`: `abutting_roads`, `bocc_road_records`, `state_highways` (route, milepost, plans, files), `schedule_b_road_exceptions` (with status), `errors`. |
+>
+> Measured on R1611986: 10 road segments (US 34 Bypass, SH 257, WCR 56, …), one BOCC road file
+> (6/24/1936, `HWY257`), US 34 ≈ MP 102.3 / 34D ≈ MP 0.2 / SH 257 ≈ MP 4.2, six plan sets
+> (~115 MB), 53 s. SH 257's 1961 plan S 0057(2) is the same 1961 highway conveyance the ALTA
+> cites at Book 1583 Page 294. Of the ALTA's 13 road exceptions, the ones cited only by a
+> 1930s Book/Page are logged `not located` — those books aren't in the recorder's Book/Page
+> index (see below).
 
 ---
 
 ## Document Type Cheat Sheet
 
-The Property Report's Document History uses short codes; the recorder's Advanced Search uses
-full names.
+Document types are unique per county, and sometimes per city or governing body — this
+table is Weld's. The Property Report's Document History uses short codes; the recorder's
+Advanced Search uses full names. The Document Types multiselect is the most common failure
+point, which is why the scraper leaves it blank and filters result rows in Python instead.
 
 | Property Report code | Document Type | Advanced Search filter value(s) |
 |---|---|---|
@@ -388,7 +464,7 @@ full names.
 | `EASE` | Easement | `EASEMENT`, `EASEMENT DEED`, `EASEMENT PLAT` |
 | `ROW` | Right of Way | `RIGHT OF WAY`, `RIGHT OF WAY EASEMENT`, `R/W AGREEMENT`, `AMENDED RIGHT OF WAY` |
 | `SUBX` / `EXEMPT` | Subdivision Exemption | `SUBDIVISION EXEMPTION`, `EXEMPTION`, `MINOR SUBDIVISION`, `AMENDED EXEMPTION` |
-| `AFF` | Affidavit | `AFFIDAVIT` |
+| `AFF` | Affidavit (Witness / State / Comment) | `AFFIDAVIT` |
 | `NOV` / `NOD` | Notice of Valuation / Decision | `NOTICE OF VALUATION`, `NOTICE OF DECISION` |
 
 `_SURVEY_TYPE_CODES` in
@@ -399,23 +475,68 @@ keep that set as the source of truth for which document types survive filtering.
 
 ## URL Reference
 
-| Purpose | URL |
-|---|---|
-| Property Report (older skin) | `https://propertyportal.weld.gov/propertyrptlist.aspx?account={Account}` |
-| Property Report (current scraper form) | `https://propertyreport.weld.gov/?account={Account}` |
-| Property Portal map | `https://maps.weld.gov/propertyportal/` |
-| Recorder — document viewer | `https://recording.tylerhost.net/web/document/{ReceptionId}` |
-| Recorder — Advanced Search | `https://recording.tylerhost.net/Search/Advanced` |
-| Recorder mirror (used in code) | `https://recording.weld.gov/web/web/integration/document/{ReceptionId}` |
-| BLM GLO Records (Phase 4) | `https://glorecords.blm.gov/default.aspx` |
-| Weld BOCC minutes / Laserfiche (Phase 5) | `https://minutes.weld.gov/WebLink/` |
-| CDOT OTIS — Highway Data Explorer (Phase 5) | `https://dtdapps.codot.gov/otis/HighwayData` |
+Checked 2026-09-28. "Used in code" means the scraper talks to it directly.
 
-> **Anonymous access.** The SOP states registration is only required to purchase certified
-> copies — anonymous viewing should be sufficient for ALTA/exemption/easement documents on
-> `recording.tylerhost.net`. Today's scraper always logs in via the `recording.weld.gov`
-> mirror regardless. Worth A/B-testing whether that mirror actually requires auth or the code
-> is just being conservative — see [What's not yet automated](#whats-not-yet-automated).
+| Purpose | URL | Status |
+|---|---|---|
+| Weld GIS landing | `https://www.weld.gov/Government/Departments/Geographic-Information-Systems` | 403 to scripts; fine in a browser |
+| Weld GIS Hub — Interactive Maps / Right of Way Theme (5.2) | `https://gishub.weldgov.com/pages/interactive-maps` | live |
+| Weld GIS Hub (older host) | `https://gis.weld.lgcsrv.com/maps/interactive-maps` | does not resolve |
+| Property Portal (search) | `https://apps.weld.gov/propertyportal/` | used in code |
+| Property Portal map | `https://maps.weld.gov/propertyportal/` | live |
+| Account map (screenshot for the Map tab) | `https://maps.weld.gov/mapanaccount/?Account={Account}` | used in code |
+| Property Report | `https://propertyreport.weld.gov/?account={Account}` | used in code |
+| Property Report (older skin) | `https://propertyportal.weld.gov/propertyrptlist.aspx?account={Account}` | does not resolve |
+| Weld parcels layer (ArcGIS; KMZ lookup, Phase 5) | `https://services.arcgis.com/ewjSqmSyHJnkfBLL/arcgis/rest/services/Parcels_open_data/FeatureServer/0` | used in code |
+| Weld road centerlines (ArcGIS; Phase 5.2) | `https://services.arcgis.com/ewjSqmSyHJnkfBLL/arcgis/rest/services/Address_Centerlines_open_data/FeatureServer/0` | used in code |
+| Clerk & Recorder Self-Service Web | `https://recording.weld.gov/web/` | used in code |
+| Recorder — Advanced Search | `https://recording.weld.gov/web/search/DOCSEARCH524S12` | used in code |
+| Recorder — document by reception | `https://recording.weld.gov/web/web/integration/document/{Reception}` | used in code |
+| Recorder — document by Tyler doc id | `https://recording.weld.gov/web/document/{DocId}?search=DOCSEARCH524S12` | live (e.g. `DOCCUSI3-34283`) |
+| Recorder (Tyler-hosted name in the video) | `https://recording.tylerhost.net/Welcome`, `/Search/Advanced`, `/web/document/{ReceptionId}` | does not resolve |
+| BLM GLO Records (Phase 4) | `https://glorecords.blm.gov/default.aspx` | used in code (redirects to `/s/`) |
+| GLO — Survey Details / Plat Image | `https://glorecords.blm.gov/details/survey/` | reference |
+| GLO — Field Note Volume Details | `https://glorecords.blm.gov/details/fieldnote/` | reference |
+| BOCC records (Laserfiche WebLink, 5.3) | `https://minutes.weld.gov/WebLink/` | used in code |
+| CDOT OTIS (5.4) | `https://dtdapps.codot.gov/otis` | live |
+| CDOT OTIS — Highway Data Explorer (5.5) | `https://dtdapps.codot.gov/otis/HighwayData` | reference (code uses its API) |
+| CDOT OTIS — ROW Plans API | `https://dtdapps.codot.gov/otis/API/TRANSYS/RowPlans/{route}/{beginMP}/{endMP}` | used in code |
+| CDOT route layer (mileposts) | `https://dtdapps.codot.gov/server/rest/services/LRS/Routes_webmerc/MapServer/0` | used in code |
+| CDOT OnBase plan viewer (5.6) | `https://oitco.hylandcloud.com/cdotrmpop/docpop/docpop.aspx?docid={id}` | used in code |
+
+> **Anonymous access.** The video says registration is only needed to buy certified copies.
+> That is not true of today's site: an anonymous session gets a *"must be a registered user"*
+> stub instead of document images, and Advanced Search returns no rows. The scraper logs in
+> (`WELD_RECORDER_USERNAME` / `_PASSWORD`; free account at
+> `https://recording.weld.gov/web/user/register`).
+
+---
+
+## Glossary
+
+| Term | Meaning here |
+|---|---|
+| **Account number** | Assessor's key, `R` + digits (`R1611986`). What every search in this tool starts from. |
+| **Parcel number** | 12-digit assessor parcel id (`095715000012`); encodes township/range/section. |
+| **S-T-R / PLSS** | Section-Township-Range in the Public Land Survey System. Weld is all **6th Principal Meridian**; townships are N, ranges W (`S15-T5N-R67W`). |
+| **Reception number** | The recorder's sequential document number — the canonical key. Old documents show a one-letter type prefix in search results (`W 135027`); the number alone is the key. |
+| **Book/Page** | The pre-reception-era citation (`Book 86 at Page 273`). Book numbers repeat across eras — always check the year. |
+| **Tyler doc id** | The recorder's internal id (`DOCC2526395`, `DOCCUSI3-34283`), the `data-documentid` on each search row. Unique even when reception/Book-Page aren't. |
+| **ALTA** | ALTA/NSPS Land Title Survey. Recorded as `SURV`. |
+| **Schedule B-2** | The exceptions list on a title commitment / ALTA — the recorded matters burdening the parcel. The main source of cross-references. |
+| **Vesting deed** | The deed that put title in the current owner (`WD`, `SWD`, `QCD`, `GEN`, …). |
+| **Document History** | The Property Report's table of documents linked to the account. Often incomplete — see Paths B/C. |
+| **BOCC** | Board of County Commissioners. Establishes and vacates county roads; its records are in the Laserfiche WebLink. |
+| **RDF** | BOCC Document Type "Road File Only" — a county road file (petition, viewers' report, resolution). |
+| **WCR** | Weld County Road (`WCR 56`). |
+| **CDOT route id** | Highway number + segment letter: `034A` (US 34 mainline), `034D`, `257A` (SH 257). |
+| **Milepost / reference point** | Distance along a CDOT route; OTIS searches and ROW plans are keyed on it. |
+| **OTIS** | CDOT's Online Transportation Information System; the Highway Data Explorer lists ROW plans by route and milepost. |
+| **OnBase** | CDOT's document repository (Hyland) that serves the ROW plan PDFs. |
+| **ROW plan set** | CDOT's right-of-way plans for a project; includes the "R.O.W. Tabulation of Properties" sheet. |
+| **GLO** | BLM General Land Office — the original 1860s-1880s federal survey plats and field notes (Phase 4). |
+| **USR** | Use by Special Review (county land-use permit). |
+| **KMZ** | Zipped KML (Google Earth). Either a county parcel export (carries the account number) or a user drawing (geometry only). |
 
 ---
 
@@ -433,8 +554,8 @@ keep that set as the source of truth for which document types survive filtering.
 Document History (filtered to survey-relevant types) returns 4 documents: `WD (1999)`,
 `QCN (2008)`, `SURV (2020)`, `SWD (2024)`. Path A applies. Expected outputs:
 `{role}_4970002.pdf` (2024 SWD vesting deed) and the 2020 `SURV` row as the ALTA, plus one
-`exception_<reception>.pdf` per Schedule B-2 reference. This is the same parcel a Phase 4/5
-integration would search GLO Township 5N Range 67W and Weld's road-ROW sources against.
+`exception_<reception>.pdf` per Schedule B-2 reference. Phase 4 searches GLO Township 5N
+Range 67W; Phase 5's measured results for this parcel are in its Implementation note.
 
 ---
 
@@ -442,24 +563,30 @@ integration would search GLO Township 5N Range 67W and Weld's road-ROW sources a
 
 | Failure | Recovery |
 |---|---|
-| Property Portal map fails to render | Hard refresh; confirm WebGL; fall back to the PDF Maps tile and supply the parcel manually. |
-| Identify Results shows multiple parcels (e.g. split by an easement) | Process each parcel separately — independent runs. |
-| Recorder prompts for login | Anonymous viewing is documented as sufficient — click Cancel and continue if it's just a viewing gate. |
-| Schedule B-2 reception returns no result | Likely recorded in a different county or pre-1893; log and continue, don't block the run. |
-| Document History expands but stays blank without `No documents found.` | UI error — reload once and retry. Do **not** treat as Path C. |
+| Property Portal map fails to render after Step 1.3 | Hard refresh (Ctrl+F5); confirm WebGL is enabled; retry. Still failing: fall back to the PDF Maps tile and supply the parcel manually. |
+| Identify Results shows multiple parcels (e.g. split by an easement) | Process each parcel separately — each is its own SOP run. |
+| Recorder prompts for login | Required today for document images and Advanced Search results (see URL Reference). The scraper logs in once per browser session. **Never log in again mid-session** — it poisons the disclaimer cookie. |
+| Recorder bounces to "the terms of usage have changed" (`/web/user/disclaimer`) mid-session | The server dropped the `disclaimerAccepted` cookie. Re-set the cookie and reload — both `_fetch_document` and `_run_advanced_search` do this. Seen after ~13-31 consecutive searches. |
+| Schedule B-2 reception returns no result | Recorded in a different county or pre-1893. Log it; don't block. |
+| Schedule B-2 Book/Page returns nothing, or a document from the wrong decade | Book numbers repeat across eras, and many 1910s-1960s books aren't in the Book/Page index. Log it for a manual pull; don't accept a hit whose year doesn't match. |
+| Section/Township/Range search finds nothing older than ~1994 | Expected — legal descriptions weren't indexed before then. Old documents come only from citations (reception or Book/Page). |
+| Document History expands but stays blank without `No documents found.` | UI error — reload once and retry Step 1.7. Still absent: treat as a routing failure, **not** Path C. |
+| BOCC WebLink search returns 0 for a known section | Township/section must be zero-padded (`"05"`, not `"5"`). |
+| Save dialog defaults to a different folder (manual runs) | Type the absolute `{Output_Folder}` path into the filename field. |
 
 ---
 
 ## What's not yet automated
 
-1. **Phase 5** (road right-of-way) — no BOCC Laserfiche or CDOT OTIS integration exists.
-2. **Exhibit A cross-reference parsing** (Paths B and C) — prior-deed reception numbers or
-   extra S/T/R values cited inside a vesting/quit-claim deed's legal description aren't
-   extracted; would need OCR or a vision LLM since Tyler PDFs are scanned images.
+1. **Phase 5's tabulation-sheet match** (Step 5.6) — whole CDOT plan sets are downloaded;
+   finding the parcel's own row on the "R.O.W. Tabulation of Properties" sheet is left to the
+   surveyor. BOCC entries' "see Book __ Page __" citations aren't followed either (they'd
+   need the same vision read `id_extraction.py` does).
+2. **Exhibit A cross-reference parsing** (Paths B and C) — extra S/T/R values cited inside a
+   quit-claim deed's legal description aren't extracted.
 3. **Output naming/folder structure** — today's files are `{role}_{reception}.pdf` under a
    flat `tmp/{county}/{account}/`. The `Client → Project → Instruments → [Document Type]`
-   hierarchy is a UI/export concern, not something the scraper itself builds. GLO files
-   (Phase 4) follow the same flat layout, named by whatever `browser-use` saved them as.
-4. **Anonymous vs. authenticated recorder access** — see the URL Reference note above.
+   hierarchy (and the video's `{Client_Name}_ROW_<Reception>.pdf` names) is a UI/export
+   concern, not something the scraper itself builds.
 
 These are the natural next slices for extending Weld coverage.

@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import pytest
 
+from survey_art.id_extraction import ExtractedId
 from survey_art.scrapers.weld_county import (
     _RESULT_ROW_CAP,
     ParcelInfo,
+    _resolve_book_page_citations,
     _run_advanced_search,
     _search_all_rows,
     _section_township_range_search,
@@ -28,6 +30,7 @@ class _FakePage:
         self.form: dict[str, str] = {}
         self.searches: list[dict[str, str]] = []
         self.clicks: list[str] = []
+        self.url = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
 
     async def goto(self, *a, **k):
         pass
@@ -152,6 +155,8 @@ async def test_each_search_clears_the_one_before_it():
         "#field_PLSSLegalID_DOT_Range": "65",
         "#field_PlattedLegalID_DOT_Subdivision": "",
         "#field_BothNamesID": "",
+        "#field_BookPageID_DOT_Book": "",
+        "#field_BookPageID_DOT_Page": "",
         "#field_RecordingDateID_DOT_StartDate": "",
         "#field_RecordingDateID_DOT_EndDate": "",
     }
@@ -161,3 +166,38 @@ async def test_each_search_clears_the_one_before_it():
 async def test_skips_search_when_str_incomplete():
     parcel = ParcelInfo(account="R123")
     assert await _section_township_range_search(_FakePage([]), parcel, set()) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_book_page_citation_only_resolves_to_a_hit_from_the_cited_year():
+    """Book numbers repeat across eras — R1611986's ALTA cites Book 1583 Page 294
+    as a 1961 highway deed, and the recorder's hit for it is a 1996 deed of trust."""
+    by_book = {
+        "233": [
+            {"reception": "135027", "doc_type": "WARRANTY DEED", "rec_date": "12/17/1908 12:00 AM"}
+        ],
+        "1583": [
+            {"reception": "2526395", "doc_type": "DEED OF TRUST", "rec_date": "12/26/1996 11:49 AM"}
+        ],
+    }
+    page = _FakePage(lambda form: by_book.get(form["#field_BookPageID_DOT_Book"], []))
+    items = [
+        ExtractedId(
+            id="Book 233 Page 185",
+            id_type="book_page",
+            context="Reservations by Union Pacific Railroad Company recorded December 17, 1908",
+        ),
+        ExtractedId(
+            id="Book 1583 Page 294",
+            id_type="book_page",
+            context="Parcel conveyed to Department of Highways recorded April 27, 1961",
+        ),
+        ExtractedId(id="Book 999 Page 411", id_type="book_page", context="right of way deed"),
+    ]
+    known: set[str] = set()
+
+    targets = await _resolve_book_page_citations(page, items, known)
+
+    assert [(role, doc.reception) for role, doc in targets] == [("exception", "135027")]
+    assert known == {"135027"}
+    assert len(page.searches) == 2  # no year cited -> not searched at all
