@@ -65,7 +65,8 @@ class TestEstimate:
         slow = _by_key(costs.estimate(**{**REAL_RUN, "elapsed_s": 6116.0}))
         fast = _by_key(costs.estimate(**REAL_RUN))
 
-        assert slow["fargate"]["usd"] == approx(fast["fargate"]["usd"] * 2, rel=1e-6)
+        # `usd` is rounded to 6 places, so allow for that rounding step.
+        assert slow["fargate"]["usd"] == approx(fast["fargate"]["usd"] * 2, abs=2e-6)
 
     def test_storage_scales_with_bytes_kept(self):
         big = _by_key(costs.estimate(**{**REAL_RUN, "document_bytes": 74_000_000}))

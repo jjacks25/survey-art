@@ -954,8 +954,36 @@ _DOC_EXTENSIONS = (".tif", ".tiff", ".pdf", ".jpg", ".jpeg", ".png")
 # Pacing for the document viewer — see the retry comment in _download_documents().
 # Measured: 90 back-to-back fetches got 38 documents; the same receptions all
 # succeeded when requested on their own.
-_DOC_FETCH_ATTEMPTS = 4
-_DOC_FETCH_PAUSE_S = 2.0
+# Three, not four: across 20 production jobs (1,852 documents saved), 196 receptions
+# failed every attempt while only 2 needed a 4th to succeed — and each dead attempt
+# burns ~25s of a download slot waiting for a button that never appears.
+_DOC_FETCH_ATTEMPTS = 3
+_DOC_FETCH_PAUSE_S = 2.0  # retry backoff, growing per attempt
+
+# Spacing between viewer opens, shared by every concurrent fetch — this, not
+# `weld_download_concurrency`, is what sets the rate recording.weld.gov sees.
+# Measured live (2026-10-02), 40-50 documents from a cold session: at ~1/s the
+# recorder withheld the print button after ~28 and kept doing so for minutes
+# (32/40 saved). At 12/min and at this setting it blipped once around document
+# 36 and every miss cleared on the first retry (50/50 both times). The old
+# ~10/min — imposed by accident by the 20s visible-wait — moved 250/250 in prod.
+# A short burst is allowed first, since most batches are a cross-reference
+# level of 2-10 documents and the throttle only trips well past that.
+_DOC_FETCH_INTERVAL_S = 6.0
+_DOC_FETCH_BURST = 10
+_next_fetch_at = 0.0
+
+
+async def _pace_fetch() -> None:
+    """Wait for this fetch's slot: up to `_DOC_FETCH_BURST` unused slots bank up
+    while idle, then one per `_DOC_FETCH_INTERVAL_S`."""
+    global _next_fetch_at
+    now = asyncio.get_running_loop().time()
+    _next_fetch_at = max(_next_fetch_at, now - (_DOC_FETCH_BURST - 1) * _DOC_FETCH_INTERVAL_S)
+    wait = max(0.0, _next_fetch_at - now)
+    _next_fetch_at += _DOC_FETCH_INTERVAL_S
+    await asyncio.sleep(wait)
+
 
 # APPLICATION_MODE=demo: how many of the ALTA's Schedule B-2 referenced documents
 # to actually fetch. Enough to show the feature working without the ~30 minutes a
@@ -1041,12 +1069,11 @@ async def _fetch_document(
     """
     doc_saved: list[Path] = []
     for attempt in range(_DOC_FETCH_ATTEMPTS):
-        # Pace every attempt, not just the retries. Those 80/80 measurements
-        # were taken with a paused *serial* loop, and what the county's server
-        # reacts to is the request rate — so each concurrent worker keeps
-        # pacing itself exactly as the serial version did, and concurrency
-        # (`weld_download_concurrency`) is what provides the speedup instead.
-        await asyncio.sleep(_DOC_FETCH_PAUSE_S * (attempt + 1))
+        # Pace every attempt, not just the retries: what the county's server
+        # reacts to is the request rate, so every fetch in flight shares one
+        # schedule (`_pace_fetch`), and retries back off on top of it.
+        await asyncio.sleep(_DOC_FETCH_PAUSE_S * attempt)
+        await _pace_fetch()
         if attempt:
             # Re-assert the disclaimer cookie rather than re-authenticating.
             # Hitting the login endpoint again is actively harmful: when the
@@ -1079,8 +1106,13 @@ async def _fetch_document(
             # requests, which keeps the network busy long after the button
             # exists. A timeout here isn't fatal — fall through and let the
             # `href` check below produce the real diagnostic.
+            #
+            # `state="attached"`: the button is in the DOM but hidden, so the
+            # default visible-wait never succeeds and every document used to sit
+            # out the whole timeout (measured: 20.5s each, vs ~2s attached). The
+            # timeout now only bounds receptions that have no image at all.
             try:
-                await doc_page.wait_for_selector("#printCustom", timeout=20_000)
+                await doc_page.wait_for_selector("#printCustom", state="attached", timeout=10_000)
             except Exception:
                 pass
 
@@ -1463,6 +1495,10 @@ async def _search_all_rows(page, **criteria: str) -> list[dict]:
         mid = start + (end - start) / 2
         return await sweep(start, mid) + await sweep(mid + timedelta(days=1), end)
 
+    key = tuple(sorted(criteria.items()))
+    if key in _sweep_cache:
+        return list(_sweep_cache[key])
+
     by_reception: dict[str, dict] = {}
     for row in await sweep(_RECORDS_BEGIN, date.today()):
         by_reception.setdefault(row["reception"], row)
@@ -1471,7 +1507,15 @@ async def _search_all_rows(page, **criteria: str) -> list[dict]:
         ", ".join(f"{k}={v}" for k, v in criteria.items() if v) or "no criteria",
         len(by_reception),
     )
-    return list(by_reception.values())
+    _sweep_cache[key] = list(by_reception.values())
+    return list(_sweep_cache[key])
+
+
+# One run's date-swept results, by criteria. The easement scan and the section
+# scan both sweep the same S/T/R — 31 searches, ~3 minutes on S32-T5N-R65W — so
+# the second one reuses the first. Cleared at the start of every `scrape()` so a
+# long-lived local worker never serves one job's index to the next.
+_sweep_cache: dict[tuple, list[dict]] = {}
 
 
 @asynccontextmanager
@@ -1819,6 +1863,15 @@ _MAX_CROSS_REFERENCE_DOCS = 150
 _MAX_CROSS_REFERENCE_DEPTH = 3
 
 
+# Documents read for citations at once. Each read holds its whole document
+# decoded — a 36"x24" plat sheet is ~10,800x7,200 px at a byte per pixel, ~120 MB
+# a page — so a level of a dozen section-scan plats peaked at 1.5 GB on its own
+# and OOM-killed the 2 GB task mid-run (R8995911, 66 min, no traceback). Bedrock
+# calls are pooled at 16 separately (id_extraction._BEDROCK_CONCURRENCY), so six
+# documents in flight still keep that pool busy.
+_EXTRACTION_CONCURRENCY = 6
+
+
 def _extract_cited_ids(reception: str, path: Path) -> IdExtraction:
     """Read one document for the documents it cites, reusing a previous run's
     answer when there is one.
@@ -1893,6 +1946,7 @@ async def _expand_cross_references(
     """
     extracted: set[str] = set()
     searched_book_pages: set[str] = set()
+    extraction_slots = asyncio.Semaphore(_EXTRACTION_CONCURRENCY)
     # Seeded from what's already on file so a second walk (the section scan's
     # surveys, further down `scrape()`) adds to the table instead of replacing it.
     extracted_ids: list[dict] = list(ov.get("extracted_ids", []))
@@ -1915,12 +1969,11 @@ async def _expand_cross_references(
             break
         extracted.update(doc.reception for _, doc, _ in batch)
 
-        extractions = await asyncio.gather(
-            *(
-                asyncio.to_thread(_extract_cited_ids, doc.reception, paths[0])
-                for _, doc, paths in batch
-            )
-        )
+        async def extract(doc: _DocRecord, path: Path) -> IdExtraction:
+            async with extraction_slots:
+                return await asyncio.to_thread(_extract_cited_ids, doc.reception, path)
+
+        extractions = await asyncio.gather(*(extract(doc, paths[0]) for _, doc, paths in batch))
 
         next_targets: list[tuple[str, _DocRecord]] = []
         for (_role, doc, _paths), extraction in zip(batch, extractions, strict=True):
@@ -2403,6 +2456,7 @@ async def scrape(
     from survey_art.overview import Overview, overview_path
 
     address = geocoded.one_line()
+    _sweep_cache.clear()
     logger.info("Weld County scraper starting for: %s", address)
     narration.info(f"Searching the Weld County property records for {address}...")
 
@@ -2470,16 +2524,22 @@ async def scrape(
     # future use, not the curated view a surveyor reads.
     ov.set_section("raw_report_fields", report_fields)
 
-    # SOP Step 1.7 Map accordion — render and save the parcel map as PNG.
-    map_path = await _capture_map_image(account, dest)
-    if map_path:
-        ov.merge_section(
-            "map",
-            {
-                "image_path": str(map_path),
-                "iframe_url": _MAP_IFRAME_URL.format(account=account),
-            },
-        )
+    # SOP Step 1.7 Map accordion — render and save the parcel map as PNG. The
+    # ESRI map takes ~30s to paint and nothing downstream reads it, so it renders
+    # in the background while the recorder research runs; `record_map()` must be
+    # awaited before every return so map.png is on disk for the upload.
+    map_task = asyncio.create_task(_capture_map_image(account, dest))
+
+    async def record_map() -> None:
+        map_path = await map_task
+        if map_path:
+            ov.merge_section(
+                "map",
+                {
+                    "image_path": str(map_path),
+                    "iframe_url": _MAP_IFRAME_URL.format(account=account),
+                },
+            )
 
     # --- SOP Step 1.7: Document History capture (the "Decision Frame") ---
     # Parse the document history table directly from the property report HTML.
@@ -2508,6 +2568,7 @@ async def scrape(
         route_section = "direct_extraction"
         if not targets:
             narration.info("Couldn't find a survey or deed to download for this property.")
+            await record_map()
             return (
                 [],
                 (f"Direct extraction found no SURV or vesting deed for {account}."),
@@ -2539,6 +2600,7 @@ async def scrape(
             )
             narration.info("No downloadable documents were found for this property.")
             ov.set_section(route_section, {"targets": [], "results": []})
+            await record_map()
             return [], None, 0.0, 0, 0
         logger.info(
             "Partial history search targets: %s",
@@ -2563,6 +2625,7 @@ async def scrape(
             )
             narration.info("No downloadable documents were found for this property.")
             ov.set_section(route_section, {"targets": [], "results": []})
+            await record_map()
             return [], None, 0.0, 0, 0
         logger.info(
             "Owner-name search targets: %s",
@@ -2575,7 +2638,41 @@ async def scrape(
             ov.path,
         )
         narration.info("We couldn't automatically determine the next step for this property.")
+        await record_map()
         return [], None, 0.0, 0, 0
+
+    # Phases 4 and 5 only need S/T/R and the account, and talk to the BLM and
+    # county GIS/CDOT servers rather than recording.weld.gov — so they run in
+    # the background for the whole recorder walk instead of after it.
+    glo_task = None
+    if parcel.township and parcel.range_:
+        narration.info(
+            "Looking up the original BLM General Land Office survey of record "
+            f"for Township {parcel.township} Range {parcel.range_}..."
+        )
+        glo_task = asyncio.create_task(
+            fetch_glo_records(
+                state=geocoded.county.state,
+                county=geocoded.county.name,
+                section=parcel.section,
+                township=parcel.township,
+                range_=parcel.range_,
+                dest_dir=dest,
+            )
+        )
+    narration.info(
+        "Assembling the road right-of-way packet: county road records and state "
+        "highway right-of-way plans next to this property..."
+    )
+    row_task = asyncio.create_task(
+        fetch_road_row(
+            account=account,
+            section=parcel.section,
+            township=parcel.township,
+            range_=parcel.range_,
+            dest_dir=dest,
+        )
+    )
 
     ov.set_section(
         route_section,
@@ -2818,20 +2915,10 @@ async def scrape(
     # township survey and field notes are the earliest authoritative survey
     # for the tract, and every later ALTA ties its basis-of-bearings back to
     # it. Only needs S/T/R, so it can't fail on the Decision Matrix outcome.
+    await record_map()
     glo_paths: list[Path] = []
-    if parcel.township and parcel.range_:
-        narration.info(
-            "Looking up the original BLM General Land Office survey of record "
-            f"for Township {parcel.township} Range {parcel.range_}..."
-        )
-        glo_paths, glo_cost, glo_in_tok, glo_out_tok = await fetch_glo_records(
-            state=geocoded.county.state,
-            county=geocoded.county.name,
-            section=parcel.section,
-            township=parcel.township,
-            range_=parcel.range_,
-            dest_dir=dest,
-        )
+    if glo_task:
+        glo_paths, glo_cost, glo_in_tok, glo_out_tok = await glo_task
         cost += glo_cost
         in_tok += glo_in_tok
         out_tok += glo_out_tok
@@ -2852,17 +2939,7 @@ async def scrape(
     # already fetched by the cross-reference walk above; this adds the county's
     # road petitions/vacations and CDOT's highway ROW plans, and logs which of
     # those exceptions were and weren't found. ---
-    narration.info(
-        "Assembling the road right-of-way packet: county road records and state "
-        "highway right-of-way plans next to this property..."
-    )
-    row_files, row_log = await fetch_road_row(
-        account=account,
-        section=parcel.section,
-        township=parcel.township,
-        range_=parcel.range_,
-        dest_dir=dest,
-    )
+    row_files, row_log = await row_task
     downloaded = {doc.reception for _, doc, paths in results if paths}
     row_log["schedule_b_road_exceptions"] = road_row_references(
         ov.get("extracted_ids", []), ov.get("book_page_resolutions", {}), downloaded

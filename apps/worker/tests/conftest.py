@@ -15,3 +15,14 @@ os.environ.setdefault("MODEL", "test-model")
 os.environ.setdefault("APPLICATION_MODE", "regular")
 os.environ.setdefault("LLM_PROVIDER", "openrouter")
 os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
+
+import pytest  # noqa: E402
+
+from survey_art.scrapers import weld_county  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _clear_weld_sweep_cache():
+    """`scrape()` clears this per run; tests that call the search helpers
+    directly would otherwise see an earlier test's fake recorder rows."""
+    weld_county._sweep_cache.clear()

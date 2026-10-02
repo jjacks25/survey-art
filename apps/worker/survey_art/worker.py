@@ -49,7 +49,7 @@ narration = logging.getLogger("survey_art.narration")
 _FARGATE_VCPU_HOUR_USD = 0.04048
 _FARGATE_GB_HOUR_USD = 0.004445
 _FARGATE_VCPUS = 1  # WorkerTaskDefinition: Cpu: '1024'
-_FARGATE_MEM_GB = 2  # WorkerTaskDefinition: Memory: '2048'
+_FARGATE_MEM_GB = 4  # WorkerTaskDefinition: Memory: '4096'
 
 # On-demand Bedrock price per 1K tokens, (input, output) — from https://claude.com/pricing
 # (Bedrock tracks Anthropic's own published rates 1:1). Keyed by the substring a Bedrock
@@ -132,6 +132,18 @@ def _cost_fields(
     }
 
 
+# The whole run log lives in the job's DynamoDB item, which is capped at 400 KB —
+# and the final status update has to fit in it too. A long Weld run blew through
+# that: `append_log` started failing silently, then `update_status` raised and the
+# job never reached a terminal state. Past this budget only milestones (a few KB a
+# run) are still recorded; CloudWatch keeps every line regardless.
+_LOG_DETAIL_BUDGET_BYTES = 250_000
+_LOG_TRUNCATED_NOTICE = (
+    "Technical log truncated here to stay within the job record's size limit — "
+    "the complete log is in CloudWatch (/ecs/survey-art-worker)."
+)
+
+
 class _DynamoLogHandler(logging.Handler):
     """Writes one formatted log record to the job's `logs` list in DynamoDB.
 
@@ -155,11 +167,17 @@ class _DynamoLogHandler(logging.Handler):
         # touched from the single QueueListener thread that calls emit().
         self.appends = 0
         self.bytes = 0
+        self.truncated = False
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             kind = "milestone" if record.name == narration.name else "detail"
             message = self.format(record)
+            if kind == "detail" and self.bytes >= _LOG_DETAIL_BUDGET_BYTES:
+                if not self.truncated:
+                    self.truncated = True
+                    jobs.append_log(self.job_id, _LOG_TRUNCATED_NOTICE, kind="detail")
+                return
             self.appends += 1
             self.bytes += len(message.encode())
             jobs.append_log(self.job_id, message, kind=kind)

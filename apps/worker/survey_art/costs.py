@@ -53,7 +53,7 @@ _FARGATE_GB_HOUR = 0.004445
 # WorkerTaskDefinition in infra/cloudformation/backend.yaml: Cpu '1024', Memory '2048'.
 # Change those and these must change with them.
 _FARGATE_VCPUS = 1
-_FARGATE_MEM_GB = 2
+_FARGATE_MEM_GB = 4
 
 # The `documents/` lifecycle rule in backend.yaml, kept in sync with JobsTable's TTL.
 # A run's files are billed for storage only until they expire.
