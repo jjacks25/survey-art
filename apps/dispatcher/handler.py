@@ -1,22 +1,17 @@
-"""Dispatcher Lambda: SQS message -> ECS RunTask (Fargate scraper worker).
+"""Dispatcher Lambda, two triggers:
 
-Triggered by the job queue. For each message it launches one Fargate task in the
-public subnet (assignPublicIp=ENABLED so it has egress with no NAT Gateway),
-passing the job parameters as container environment overrides.
+- SQS job message -> ECS RunTask: one Fargate worker in the public subnet
+  (public IP, so egress needs no NAT), job params as env overrides. The task ARN
+  goes on the job so the API can ecs:StopTask it on cancel.
+- EventBridge "ECS Task State Change" (STOPPED): a task killed from outside (OOM,
+  Fargate failure) never records its own failure, so its job would sit RUNNING
+  forever. Fail it here unless the worker already finished it.
 
-Environment:
-    CLUSTER_ARN        — ECS cluster
-    TASK_DEFINITION    — worker task definition (family or ARN)
-    CONTAINER_NAME     — container name inside the task definition
-    SUBNET_ID          — public subnet id
-    SECURITY_GROUP_ID  — worker security group (no inbound, egress only)
-    JOBS_TABLE         — DynamoDB jobs table (to record the launched task's ARN,
-                         so the API can later ecs:StopTask it on cancel)
+Env: CLUSTER_ARN, TASK_DEFINITION, CONTAINER_NAME, SUBNET_ID, SECURITY_GROUP_ID,
+JOBS_TABLE.
 
-This file is the only copy of the handler: `infra/deploy.py` splices it into the
-dispatcher-handler marker line in `cloudformation/backend.yaml` at deploy time, where it
-becomes the function's inline `Code.ZipFile`. Keep it under 4096 characters
-(CloudFormation's inline-code cap) and dependency-free beyond the Lambda runtime's boto3.
+The only copy of the handler: `infra/deploy.py` splices it into backend.yaml as
+inline `Code.ZipFile`. Keep it under 4096 chars and boto3-only.
 """
 
 from __future__ import annotations
@@ -31,42 +26,60 @@ ecs = boto3.client("ecs")
 dynamodb = boto3.resource("dynamodb")
 
 
+def _task_stopped(detail, table):
+    env = {
+        e["name"]: e["value"]
+        for o in detail.get("overrides", {}).get("containerOverrides", [])
+        for e in o.get("environment", [])
+    }
+    reasons = [c["reason"] for c in detail.get("containers", []) if c.get("reason")]
+    reason = (reasons or [detail.get("stoppedReason") or "unknown reason"])[0]
+    try:
+        table.update_item(
+            Key={"jobId": env["JOB_ID"]},
+            UpdateExpression="SET #s = :f, #e = :e, updatedAt = :u",
+            ConditionExpression="#s IN (:p, :r)",
+            ExpressionAttributeNames={"#s": "status", "#e": "error"},
+            ExpressionAttributeValues={
+                ":f": "FAILED",
+                ":e": f"The search's server stopped unexpectedly: {reason}",
+                ":u": int(time.time()),
+                ":p": "PENDING",
+                ":r": "RUNNING",
+            },
+        )
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        pass  # already finished, cancelled, or deleted
+    return {"stopped": detail["taskArn"]}
+
+
 def handler(event, _context):
-    cluster = os.environ["CLUSTER_ARN"]
-    task_def = os.environ["TASK_DEFINITION"]
-    container = os.environ["CONTAINER_NAME"]
-    subnet = os.environ["SUBNET_ID"]
-    sg = os.environ["SECURITY_GROUP_ID"]
-    jobs_table = dynamodb.Table(os.environ["JOBS_TABLE"])
+    table = dynamodb.Table(os.environ["JOBS_TABLE"])
+    if event.get("detail-type") == "ECS Task State Change":
+        return _task_stopped(event["detail"], table)
 
     launched = []
     for record in event.get("Records", []):
         body = json.loads(record["body"])
         job_id = body["jobId"]
-        address = body["address"]
-        county = body.get("county") or ""
-
+        env = {"JOB_ID": job_id, "ADDRESS": body["address"], "COUNTY": body.get("county") or ""}
         resp = ecs.run_task(
-            cluster=cluster,
-            taskDefinition=task_def,
+            cluster=os.environ["CLUSTER_ARN"],
+            taskDefinition=os.environ["TASK_DEFINITION"],
             launchType="FARGATE",
             count=1,
             networkConfiguration={
                 "awsvpcConfiguration": {
-                    "subnets": [subnet],
-                    "securityGroups": [sg],
+                    "subnets": [os.environ["SUBNET_ID"]],
+                    "securityGroups": [os.environ["SECURITY_GROUP_ID"]],
                     "assignPublicIp": "ENABLED",
                 }
             },
             overrides={
                 "containerOverrides": [
                     {
-                        "name": container,
-                        "environment": [
-                            {"name": "JOB_ID", "value": job_id},
-                            {"name": "ADDRESS", "value": address},
-                            {"name": "COUNTY", "value": county},
-                        ],
+                        "name": os.environ["CONTAINER_NAME"],
+                        "environment": [{"name": k, "value": v} for k, v in env.items()],
                     }
                 ]
             },
@@ -77,7 +90,7 @@ def handler(event, _context):
         if not task_arns:
             raise RuntimeError(f"RunTask launched no task for job {job_id}: {resp.get('failures')}")
 
-        jobs_table.update_item(
+        table.update_item(
             Key={"jobId": job_id},
             UpdateExpression="SET taskArn = :t, updatedAt = :u",
             ExpressionAttributeValues={":t": task_arns[0], ":u": int(time.time())},

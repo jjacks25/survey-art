@@ -25,6 +25,7 @@ import os
 import queue
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -301,6 +302,9 @@ def _upload_map_image(job_id: str, metadata: dict | None) -> None:
 # (Fargate) mode this process exiting IS the task stopping, so no separate ecs:StopTask
 # call is needed.
 _JOB_TIMEOUT_SECONDS = 2 * 60 * 60
+_TIMEOUT_ERROR = (
+    f"Search exceeded the {_JOB_TIMEOUT_SECONDS // 3600}-hour time limit and was stopped."
+)
 
 # How often a running job checks whether the user cancelled it. On Fargate the API's
 # ecs:StopTask kills the process anyway; the local poll-loop worker has no task to
@@ -405,11 +409,7 @@ async def run_job(job_id: str, address: str, county: str | None) -> int:
                 logger.info("Job %s CANCELLED: scrape stopped", job_id)
                 return 0
             except TimeoutError:
-                hours = _JOB_TIMEOUT_SECONDS // 3600
-                finish(
-                    jobs.FAILED,
-                    error=f"Search exceeded the {hours}-hour time limit and was stopped.",
-                )
+                finish(jobs.FAILED, error=_TIMEOUT_ERROR)
                 narration.info("This search took too long and was stopped to avoid runaway cost.")
                 logger.error("Job %s FAILED: timed out after %ss", job_id, _JOB_TIMEOUT_SECONDS)
                 return 1
@@ -464,7 +464,22 @@ async def _run_once() -> int:
     if not job_id or not address:
         logger.error("JOB_ID and ADDRESS environment variables are required")
         return 2
+    # Backstop for the in-loop `wait_for` timeout: a blocked event loop or a task
+    # that swallows cancellation never lets that fire, so a thread outside the
+    # loop fails the job and kills the process (which stops the Fargate task).
+    watchdog = threading.Timer(_JOB_TIMEOUT_SECONDS + 300, _hard_timeout, args=(job_id,))
+    watchdog.daemon = True
+    watchdog.start()
     return await run_job(job_id, address, county)
+
+
+def _hard_timeout(job_id: str) -> None:
+    logger.error("Job %s FAILED: watchdog fired, the run stopped responding", job_id)
+    try:
+        jobs.update_status(job_id, jobs.FAILED, error=_TIMEOUT_ERROR)
+    finally:
+        logging.shutdown()
+        os._exit(1)
 
 
 async def _poll_loop() -> int:
@@ -483,7 +498,12 @@ async def _poll_loop() -> int:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
     if os.environ.get("JOB_ID"):
-        sys.exit(asyncio.run(_run_once()))
+        code = asyncio.run(_run_once())
+        # Hard exit: a leftover non-daemon thread (a hung blocking call in an
+        # executor) would otherwise keep the process — and the billed Fargate
+        # task — alive forever after the job has already been recorded.
+        logging.shutdown()
+        os._exit(code)
     asyncio.run(_poll_loop())
 
 

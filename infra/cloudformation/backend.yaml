@@ -464,6 +464,29 @@ Resources:
       FunctionName: !Ref DispatcherFunction
       BatchSize: 1
 
+  # A worker killed from outside (OOM, Fargate failure) can't mark its own job
+  # failed — route its STOPPED event to the dispatcher, which does it instead.
+  WorkerStoppedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt EcsCluster.Arn]
+          lastStatus: [STOPPED]
+      Targets:
+        - Id: dispatcher
+          Arn: !GetAtt DispatcherFunction.Arn
+
+  WorkerStoppedPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DispatcherFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WorkerStoppedRule.Arn
+
   # ---------------- API Gateway (HTTP API + Cognito JWT authorizer) ----------------
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
