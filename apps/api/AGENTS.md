@@ -43,6 +43,10 @@ scraper or a browser, so it stays small and fits scale-to-zero Lambda.
   (`drawingJobId`), and enqueues it like any job — the worker branches on `kind`, so the
   SQS body and the dispatcher are unchanged. Its outputs are listed by the same
   `GET /api/jobs/{drawingId}/files`, and its QC table is `metadata.drawing`.
+- `GET`/`PUT /api/jobs/{id}/flags {files}` → the filenames starred on the Results tab.
+  Stored on the job's **saved property** (`flagged`, keyed by `job.address`), not the job —
+  jobs expire after 7 days and a re-run is a new job. That's also why `save_property()`
+  is an `UpdateItem`: a `PutItem` would wipe `flagged` every time the property is re-run.
 - `GET /api/health` → liveness.
 - `POST /api/kmz/identify` (multipart `file`) → `{identifier, parcels}`. `identifier` is
   the account/parcel number from a county-exported KMZ, or `null`. When it's `null`, the

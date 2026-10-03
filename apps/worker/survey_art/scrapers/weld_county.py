@@ -116,7 +116,13 @@ class _DocRecord:
 
 def _row_to_record(row: dict) -> _DocRecord:
     """An Advanced Search result row (see `_run_advanced_search`) as a download target."""
-    return _DocRecord(row["reception"], rec_date=row["rec_date"], doc_type=row["doc_type"])
+    return _DocRecord(
+        row["reception"],
+        rec_date=row["rec_date"],
+        doc_type=row["doc_type"],
+        grantor="; ".join(row.get("grantors", [])),
+        grantee="; ".join(row.get("grantees", [])),
+    )
 
 
 def _target_rows(targets) -> list[dict]:
@@ -2924,18 +2930,29 @@ async def scrape(
     # without re-deriving either from the filename. Every route's documents land
     # here — each route writes its own section above, and a surveyor scanning
     # the grid doesn't care which search turned a document up.
-    files: list[tuple[str, str, str, str]] = [  # (file, reception, doc_type, role)
-        *(
-            (p.name, doc.reception, doc.doc_type, role)
-            for role, doc, paths in results
-            for p in paths
-        ),
-        *((p.name, "", doc_type, "glo_record") for p, doc_type in glo_files),
-        *((p.name, "", doc_type, "road_row") for p, doc_type in row_files),
+    # Date, parties and Book/Page ride along so the Results tab can search on
+    # what a title commitment cites ("BK. 571, PG. 55", "1917"), not just the
+    # reception number. Book/Page is only known for citations resolved by it.
+    book_pages = {rec: bp for bp, rec in ov.get("book_page_resolutions", {}).items()}
+    no_doc = _DocRecord("")
+    files: list[tuple[str, str, str, _DocRecord]] = [  # (file, doc_type, role, doc)
+        *((p.name, doc.doc_type, role, doc) for role, doc, paths in results for p in paths),
+        *((p.name, doc_type, "glo_record", no_doc) for p, doc_type in glo_files),
+        *((p.name, doc_type, "road_row", no_doc) for p, doc_type in row_files),
     ]
     document_rows = [
-        {"file": f, "reception": r, "doc_type": t, "category": classify(t), "role": role}
-        for f, r, t, role in files
+        {
+            "file": f,
+            "reception": doc.reception,
+            "doc_type": t,
+            "category": classify(t),
+            "role": role,
+            "rec_date": doc.rec_date,
+            "grantor": doc.grantor,
+            "grantee": doc.grantee,
+            "book_page": book_pages.get(doc.reception, ""),
+        }
+        for f, t, role, doc in files
     ]
     document_rows.sort(
         key=lambda row: (CATEGORIES.index(row["category"]), reception_sort_key(row["reception"]))

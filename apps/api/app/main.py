@@ -28,6 +28,7 @@ from .schemas import (
     CreateJobRequest,
     CreateJobResponse,
     FilesResponse,
+    FlagsRequest,
     JobListResponse,
     JobResponse,
     JobSummary,
@@ -163,6 +164,25 @@ def get_files(job_id: str) -> FilesResponse:
     if not job.doc_prefix:
         return FilesResponse(jobId=job_id, files=[])
     return FilesResponse(jobId=job_id, files=jobs.list_result_files(job.doc_prefix))
+
+
+@app.get("/api/jobs/{job_id}/flags", response_model=FlagsRequest)
+def get_flags(job_id: str) -> FlagsRequest:
+    """Filenames flagged on this job's property — stored on the saved property
+    (keyed by the job's `address`), so they survive re-runs and job expiry."""
+    job = jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return FlagsRequest(files=jobs.get_flagged(job.address))
+
+
+@app.put("/api/jobs/{job_id}/flags", response_model=FlagsRequest)
+def set_flags(job_id: str, req: FlagsRequest) -> FlagsRequest:
+    job = jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    jobs.set_flagged(job.address, req.files)
+    return FlagsRequest(files=jobs.get_flagged(job.address))
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)

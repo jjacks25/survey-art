@@ -134,6 +134,10 @@ class SavedProperty(BaseModel):
     address: str
     county: str
     saved_at: int = Field(alias="savedAt")
+    # Filenames the user starred on the Results tab. Kept here rather than on
+    # the job because jobs expire after 7 days and a re-run is a new job — the
+    # documents (and their filenames) live under the same S3 prefix either way.
+    flagged: list[str] = Field(default_factory=list)
 
     def to_item(self) -> dict:
         return self.model_dump(by_alias=True, exclude_none=True)
@@ -319,10 +323,27 @@ def save_property(address: str, county: str) -> None:
     the raw address string — the same fallback `property_key()` uses before a
     job has a `doc_prefix` — so re-running the same input overwrites the same
     record's `saved_at` rather than piling up duplicates."""
-    _saved_properties_table().put_item(
-        Item=SavedProperty(
-            key=address, address=address, county=county, saved_at=int(time.time())
-        ).to_item()
+    # UpdateItem, not PutItem: a put would replace the item and drop its `flagged` list.
+    _saved_properties_table().update_item(
+        Key={"propertyKey": address},
+        UpdateExpression="SET #a = :a, #c = :c, savedAt = :t",
+        ExpressionAttributeNames={"#a": "address", "#c": "county"},  # dodge reserved words
+        ExpressionAttributeValues={":a": address, ":c": county, ":t": int(time.time())},
+    )
+
+
+def get_flagged(key: str) -> list[str]:
+    """The filenames flagged on saved property `key` (a job's `address`)."""
+    item = _saved_properties_table().get_item(Key={"propertyKey": key}).get("Item")
+    return list(item.get("flagged", [])) if item else []
+
+
+def set_flagged(key: str, files: list[str]) -> None:
+    """Replace saved property `key`'s flagged filenames."""
+    _saved_properties_table().update_item(
+        Key={"propertyKey": key},
+        UpdateExpression="SET flagged = :f",
+        ExpressionAttributeValues={":f": sorted(set(files))},
     )
 
 

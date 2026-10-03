@@ -304,9 +304,10 @@ Resources:
                 Resource: !GetAtt JobsTable.Arn
               - Effect: Allow
                 # Backs POST /api/jobs (jobs.save_property()) and
-                # GET /api/saved-properties (jobs.list_saved_properties()) — no
+                # GET /api/saved-properties (jobs.list_saved_properties()) and
+                # GET/PUT /api/jobs/{id}/flags (jobs.get_flagged/set_flagged) — no
                 # DeleteItem, this table is never pruned by the API.
-                Action: [dynamodb:PutItem, dynamodb:Scan]
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Scan]
                 Resource: !GetAtt SavedPropertiesTable.Arn
               - Effect: Allow
                 Action: sqs:SendMessage

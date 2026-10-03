@@ -162,3 +162,21 @@ def test_result_files_expose_inline_and_attachment_urls(client):
     assert "response-content-disposition" not in entry["url"].lower()
     assert "attachment" in entry["downloadUrl"].lower()
     assert "exception_1766551.pdf" in entry["downloadUrl"]
+
+
+def test_flags_survive_a_rerun_of_the_same_property(client):
+    first = client.post("/api/jobs", json={"address": "R1234567"}).json()["jobId"]
+    assert client.get(f"/api/jobs/{first}/flags").json() == {"files": []}
+
+    put = client.put(
+        f"/api/jobs/{first}/flags", json={"files": ["alta_4508544.pdf", "exception_32228.pdf"]}
+    )
+    assert put.json() == {"files": ["alta_4508544.pdf", "exception_32228.pdf"]}
+
+    # Re-running re-saves the property; that must not wipe what was flagged.
+    second = client.post("/api/jobs", json={"address": "R1234567"}).json()["jobId"]
+    assert client.get(f"/api/jobs/{second}/flags").json()["files"] == [
+        "alta_4508544.pdf",
+        "exception_32228.pdf",
+    ]
+    assert client.get("/api/jobs/nope/flags").status_code == 404

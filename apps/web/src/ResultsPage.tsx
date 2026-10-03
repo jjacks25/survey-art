@@ -7,6 +7,7 @@ import {
   Box,
   Button,
   Center,
+  Chip,
   Code,
   Divider,
   Group,
@@ -18,7 +19,7 @@ import {
   Table,
   Tabs,
   Text,
-  TextInput,
+  Textarea,
   Timeline,
   Title,
   Tooltip,
@@ -41,6 +42,45 @@ export interface DocInfo {
   doc_type: string;
   category: string;
   role: string;
+  // Newer runs only — absent on rows written before the worker recorded them.
+  rec_date?: string; // "MM/DD/YYYY hh:mm AM"
+  grantor?: string;
+  grantee?: string;
+  book_page?: string; // "Book 571 Page 55", only for citations resolved by Book/Page
+}
+
+/** Title commitments write Book/Page every which way — "BK. 571, PG. 55",
+ * "Book 571 Page 55", "B571 P55". Fold them all to the worker's form so the
+ * comma inside one doesn't split it into two search terms. */
+function normalizeBookPage(text: string): string {
+  return text.replace(
+    /\bb(?:oo)?k?\.?\s*(\d+)\s*[,/]?\s*p(?:a?ge?|g)?\.?\s*(\d+)/gi,
+    "book $1 page $2"
+  );
+}
+
+/** The search box as a list of terms: commas, semicolons and newlines separate
+ * them, and a document matching *any* term is shown — so pasting the 27
+ * reception numbers off an ALTA's exception list finds all 27 at once. */
+function searchTerms(query: string): string[] {
+  return normalizeBookPage(query)
+    .replace(/\brec(?:eption)?\.?\s*(?:no\.?|#)?\s*(?=\d)/gi, "") // "REC. NO. 32228" → "32228"
+    .toLowerCase()
+    .split(/[,;\n]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function matchesTerm(term: string, name: string, info?: DocInfo): boolean {
+  const reception = (info?.reception || splitFilename(name).reception).replace(/^0+/, "");
+  // A bare number is a reception number or a recording year — substring
+  // matching would pull in every reception that merely contains those digits.
+  if (/^\d+$/.test(term)) {
+    return reception === term.replace(/^0+/, "") || (term.length === 4 && !!info?.rec_date?.includes(`/${term}`));
+  }
+  return [name, info?.reception, info?.doc_type, info?.category, info?.rec_date,
+    info?.grantor, info?.grantee, info?.book_page]
+    .some((field) => field?.toLowerCase().includes(term));
 }
 
 /** Fallback grouping for a file with no `documents` row: the scraper's filenames
@@ -58,15 +98,36 @@ const ROLE_CATEGORIES: Record<string, string> = {
   section_township_range_search: "Chain of title",
 };
 
+const FLAGGED_GROUP = "★ Flagged";
+
 /** `{role}_{reception}.{ext}` → its two halves. */
 function splitFilename(name: string): { role: string; reception: string } {
   const match = /^(.*)_([^_]+)\.[^.]+$/.exec(name);
   return match ? { role: match[1], reception: match[2] } : { role: "", reception: "" };
 }
 
-function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void, info?: DocInfo) {
+function renderFileCard(
+  f: FileEntry,
+  onPreview: (f: FileEntry) => void,
+  info: DocInfo | undefined,
+  flagged: boolean,
+  onToggleFlag: (name: string) => void
+) {
   return (
     <Box key={f.name} style={{ position: "relative", minWidth: 0 }}>
+      <Tooltip label={flagged ? "Unflag" : "Flag as important"} withArrow>
+        <ActionIcon
+          onClick={() => onToggleFlag(f.name)}
+          variant={flagged ? "filled" : "default"}
+          color="yellow"
+          size="sm"
+          aria-label={`${flagged ? "Unflag" : "Flag"} ${f.name}`}
+          aria-pressed={flagged}
+          style={{ position: "absolute", top: 4, left: 4, zIndex: 1 }}
+        >
+          <Text span size="xs">{flagged ? "★" : "☆"}</Text>
+        </ActionIcon>
+      </Tooltip>
       {/* Anchor, not a button: an <a download> inside the card's
           UnstyledButton would be invalid nested-interactive markup,
           so it sits alongside it and floats over the corner. */}
@@ -127,6 +188,11 @@ function renderFileCard(f: FileEntry, onPreview: (f: FileEntry) => void, info?: 
           {info?.doc_type && (
             <Text size="xs" c="dimmed" ta="center" lineClamp={2} style={{ wordBreak: "break-word", width: "100%" }}>
               {info.doc_type}
+            </Text>
+          )}
+          {(info?.rec_date || info?.book_page) && (
+            <Text size="xs" c="dimmed" ta="center">
+              {[info.rec_date?.slice(0, 10), info.book_page].filter(Boolean).join(" · ")}
             </Text>
           )}
           <Text size="xs" c="dimmed">{(f.size / 1024).toFixed(1)} KB</Text>
@@ -261,6 +327,8 @@ export function ResultsPage() {
   const [deleting, setDeleting] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
   const [fileSearch, setFileSearch] = useState("");
+  const [flagged, setFlagged] = useState<Set<string>>(new Set());
+  const [flaggedOnly, setFlaggedOnly] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // What the worker knows about each file, keyed by the filename the S3 listing
@@ -275,16 +343,29 @@ export function ResultsPage() {
     return index;
   }, [job?.metadata]);
 
-  // Matches the reception number and document type as well as the filename —
-  // a surveyor searching "easement" or "4508544" means the document, not the
-  // string the scraper happened to save it under.
-  const matchesSearch = (f: FileEntry) => {
-    const q = fileSearch.trim().toLowerCase();
-    if (!q) return true;
-    const info = docIndex.get(f.name);
-    return [f.name, info?.reception, info?.doc_type, info?.category]
-      .some((field) => field?.toLowerCase().includes(q));
-  };
+  // Matches reception number, doc type, recording date/year, parties and
+  // Book/Page as well as the filename — a surveyor searching "easement",
+  // "4508544" or "bk 571 pg 55" means the document, not the string the scraper
+  // happened to save it under. See searchTerms() for multi-term queries.
+  const terms = useMemo(() => searchTerms(fileSearch), [fileSearch]);
+  const matchesSearch = (f: FileEntry) =>
+    (!flaggedOnly || flagged.has(f.name)) &&
+    (terms.length === 0 || terms.some((t) => matchesTerm(t, f.name, docIndex.get(f.name))));
+
+  // Optimistic: flip it locally, then save the whole set. On failure, reload
+  // what the server actually has rather than leave the UI lying.
+  function saveFlags(next: Set<string>) {
+    setFlagged(next);
+    if (!jobId) return;
+    api.setFlags(jobId, [...next]).catch(() =>
+      api.getFlags(jobId).then(({ files }) => setFlagged(new Set(files))).catch(() => {})
+    );
+  }
+  function toggleFlag(name: string) {
+    const next = new Set(flagged);
+    if (!next.delete(name)) next.add(name);
+    saveFlags(next);
+  }
 
   // Documents grouped by what they are, in the order the worker sorted them
   // (doc_classify.py's CATEGORIES — surveys and plats first, financing paper
@@ -294,7 +375,13 @@ export function ResultsPage() {
   // run from before this existed — still shows up, under "Other".
   const fileGroups = useMemo(() => {
     const byName = new Map(files.map((f) => [f.name, f]));
-    const groups = new Map<string, FileEntry[]>();
+    // Flagged documents lead the page in their own group (a Map keeps insertion
+    // order) instead of sitting in their category further down.
+    const groups = new Map<string, FileEntry[]>([[FLAGGED_GROUP, []]]);
+    const add = (category: string, file: FileEntry) => {
+      const key = flagged.has(file.name) ? FLAGGED_GROUP : category;
+      groups.set(key, [...(groups.get(key) ?? []), file]);
+    };
     const placed = new Set<string>();
     for (const row of (Array.isArray(job?.metadata?.documents)
       ? (job?.metadata?.documents as DocInfo[])
@@ -302,15 +389,14 @@ export function ResultsPage() {
       const file = byName.get(row.file);
       if (!file || placed.has(row.file) || !matchesSearch(file)) continue;
       placed.add(row.file);
-      groups.set(row.category, [...(groups.get(row.category) ?? []), file]);
+      add(row.category, file);
     }
     for (const file of files) {
       if (placed.has(file.name) || !matchesSearch(file)) continue;
       const { role } = splitFilename(file.name);
-      const category = ROLE_CATEGORIES[role] ?? "Other";
-      groups.set(category, [...(groups.get(category) ?? []), file]);
+      add(ROLE_CATEGORIES[role] ?? "Other", file);
     }
-    return [...groups.entries()].map(([category, entries]) => ({
+    return [...groups.entries()].filter(([, entries]) => entries.length).map(([category, entries]) => ({
       category,
       // Indexed rows arrive in reception order already; fallback ones don't.
       files: entries
@@ -323,7 +409,7 @@ export function ResultsPage() {
           return Number.isFinite(nx) && Number.isFinite(ny) ? nx - ny : x.localeCompare(y);
         }),
     }));
-  }, [files, docIndex, fileSearch, job?.metadata]);
+  }, [files, docIndex, terms, flagged, flaggedOnly, job?.metadata]);
 
   const matchingFileCount = useMemo(
     () => fileGroups.reduce((n, g) => n + g.files.length, 0),
@@ -353,8 +439,12 @@ export function ResultsPage() {
       if (TERMINAL.has(j.status)) {
         if (pollRef.current) clearInterval(pollRef.current);
         if (j.status === "COMPLETED") {
-          const { files } = await api.getFiles(id);
+          const [{ files }, flags] = await Promise.all([
+            api.getFiles(id),
+            api.getFlags(id).catch(() => ({ files: [] as string[] })),
+          ]);
           setFiles(files);
+          setFlagged(new Set(flags.files));
         }
         loadHistory();
       }
@@ -369,6 +459,7 @@ export function ResultsPage() {
   useEffect(() => {
     setJob(null);
     setFiles([]);
+    setFlagged(new Set());
     setError(null);
     if (pollRef.current) clearInterval(pollRef.current);
     if (!jobId) return;
@@ -527,12 +618,39 @@ export function ResultsPage() {
             <Text c="dimmed" size="sm">No documents found.</Text>
           ) : (
             <Stack gap="md">
-              <TextInput
-                placeholder="Search documents (reception number, doc type, filename)..."
-                value={fileSearch}
-                onChange={(e) => setFileSearch(e.currentTarget.value)}
-                maw={320}
-              />
+              <Group align="flex-end" gap="sm">
+                <Textarea
+                  placeholder="Search: reception #, doc type, year, grantor/grantee, Bk/Pg — separate several with commas or new lines"
+                  value={fileSearch}
+                  onChange={(e) => setFileSearch(e.currentTarget.value)}
+                  autosize
+                  minRows={1}
+                  maxRows={6}
+                  w={480}
+                  maw="100%"
+                />
+                <Chip checked={flaggedOnly} onChange={setFlaggedOnly} color="yellow">
+                  ★ Flagged only ({flagged.size})
+                </Chip>
+                {(terms.length > 0 || flaggedOnly) && matchingFileCount > 0 && (() => {
+                  const shown = fileGroups.flatMap((g) => g.files.map((f) => f.name));
+                  const allFlagged = shown.every((n) => flagged.has(n));
+                  return (
+                    <Button
+                      size="xs"
+                      variant="light"
+                      color="yellow"
+                      onClick={() => {
+                        const next = new Set(flagged);
+                        shown.forEach((n) => (allFlagged ? next.delete(n) : next.add(n)));
+                        saveFlags(next);
+                      }}
+                    >
+                      {allFlagged ? "Unflag" : "Flag"} all {shown.length} shown
+                    </Button>
+                  );
+                })()}
+              </Group>
               {citations && citations.cited > 0 && (
                 <Text size="xs" c="dimmed">
                   Cited documents: downloaded {citations.downloaded} of the {citations.cited}{" "}
@@ -544,7 +662,10 @@ export function ResultsPage() {
                 </Text>
               )}
               {matchingFileCount === 0 ? (
-                <Text c="dimmed" size="sm">No documents match "{fileSearch}".</Text>
+                <Text c="dimmed" size="sm">
+                  No documents match{fileSearch.trim() ? ` "${fileSearch.trim()}"` : ""}
+                  {flaggedOnly ? " among the flagged ones" : ""}.
+                </Text>
               ) : (
                 fileGroups.map((group) => (
                   <Box key={group.category}>
@@ -555,7 +676,7 @@ export function ResultsPage() {
                     />
                     <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="sm">
                       {group.files.map((f) =>
-                        renderFileCard(f, setPreviewFile, docIndex.get(f.name))
+                        renderFileCard(f, setPreviewFile, docIndex.get(f.name), flagged.has(f.name), toggleFlag)
                       )}
                     </SimpleGrid>
                   </Box>
