@@ -172,6 +172,15 @@ four `Tabs.Panel`s from the response:
   plain `url` must stay inline or the iframe preview would download instead of render.
   Whether the browser then shows a "save as" dialog or drops the file straight into
   Downloads is the viewer's own setting — a page can't force the picker.
+  **Search and flags.** The search box takes several terms separated by commas, `;` or
+  new lines and shows a document matching *any* of them, so a surveyor can paste the
+  reception numbers off an ALTA's exception list. A bare number matches a reception
+  exactly (or a 4-digit recording year), never as a substring; "REC. NO." prefixes are
+  stripped and Book/Page spellings (`BK. 571, PG. 55`) are normalised before the comma
+  split (`searchTerms()`/`matchesTerm()`). The ☆ in each card's top-left flags it; flags
+  save via `api.setFlags()` per property (see [`apps/api/AGENTS.md`](../api/AGENTS.md)),
+  and "Flag all N shown" flags whatever the current search shows. Flagged documents leave
+  their category and render first, in a "★ Flagged" group (`FLAGGED_GROUP`).
 - **Property Metadata** — `MetadataView` renders `job.metadata` (the scraper's
   `overview.json`, opaque/per-county — see
   [`apps/worker/survey_art/AGENTS.md`](../worker/survey_art/AGENTS.md)) as nested tables.

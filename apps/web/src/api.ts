@@ -117,6 +117,19 @@ export class ApiClient {
     return this.request<{ properties: SavedProperty[] }>("/api/saved-properties");
   }
 
+  /** Filenames flagged on this job's property — kept per property, so they
+   * carry over to re-runs (see `jobs.get_flagged()` on the API side). */
+  getFlags(jobId: string) {
+    return this.request<{ files: string[] }>(`/api/jobs/${jobId}/flags`);
+  }
+
+  setFlags(jobId: string, files: string[]) {
+    return this.request<{ files: string[] }>(`/api/jobs/${jobId}/flags`, {
+      method: "PUT",
+      body: JSON.stringify({ files }),
+    });
+  }
+
   getFiles(jobId: string) {
     return this.request<{ jobId: string; files: FileEntry[] }>(`/api/jobs/${jobId}/files`);
   }

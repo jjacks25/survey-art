@@ -74,6 +74,13 @@ class SavedPropertiesResponse(BaseModel):
     properties: list[SavedPropertySummary]
 
 
+class FlagsRequest(BaseModel):
+    """Flagged filenames for a job's property — body and response of
+    `GET`/`PUT /api/jobs/{id}/flags`."""
+
+    files: list[str] = Field(default_factory=list, max_length=5000)
+
+
 class FileEntry(BaseModel):
     name: str
     size: int
