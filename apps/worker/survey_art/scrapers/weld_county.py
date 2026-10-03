@@ -1266,11 +1266,16 @@ async def _run_advanced_search(page, **criteria: str) -> list[dict]:
             rows = await _advanced_search_once(page, **criteria)
             if "/user/disclaimer" not in page.url:
                 return rows
-        except Exception:
-            if "/user/disclaimer" not in page.url:
+        except Exception as exc:
+            # A slow submit can still be navigating when the results are read
+            # ("Execution context was destroyed" — jobs 813c4d81, c70469e7 on
+            # R8995911), and page.url doesn't show where it went until it lands.
+            await page.wait_for_load_state()
+            if "/user/disclaimer" not in page.url and "context was destroyed" not in str(exc):
                 raise
         logger.warning(
-            "Advanced Search: bounced to the disclaimer (attempt %d/%d)",
+            "Advanced Search: bounced to %s (attempt %d/%d)",
+            page.url,
             attempt + 1,
             _DISCLAIMER_RETRIES,
         )
