@@ -238,15 +238,23 @@ Resources:
                   - !Sub 'arn:aws:ecs:*:${AWS::AccountId}:task-definition/${ProjectName}-*:*'
                   - !Sub 'arn:aws:ecs:*:${AWS::AccountId}:task/${ProjectName}-*/*'
               - Sid: EcsDescribe
-                # ecs:Describe*/List* don't support resource-level scoping.
+                # ecs:Describe*/List* and DeregisterTaskDefinition don't support
+                # resource-level scoping.
                 Effect: Allow
                 Action:
+                  - ecs:DeregisterTaskDefinition
                   - ecs:DescribeClusters
                   - ecs:DescribeTaskDefinition
                   - ecs:DescribeTasks
                   - ecs:ListTasks
                   - ecs:ListTagsForResource
                 Resource: '*'
+              - Sid: Events
+                # Backend's WorkerStoppedRule gets a CFN-generated name
+                # (${ProjectName}-backend-WorkerStoppedRule-<suffix>).
+                Effect: Allow
+                Action: events:*
+                Resource: !Sub 'arn:aws:events:*:${AWS::AccountId}:rule/${ProjectName}-*'
               - Sid: Lambda
                 Effect: Allow
                 Action: lambda:*
