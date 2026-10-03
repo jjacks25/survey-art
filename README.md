@@ -134,7 +134,7 @@ the worker talks to real AWS for that one client and to LocalStack for everythin
 | `WELD_RECORDER_USERNAME` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `WELD_RECORDER_PASSWORD` | Optional (Weld Phase 3) | — | Login for `recording.weld.gov` |
 | `WELD_DOWNLOAD_CONCURRENCY` | No | `4` | How many recorder documents to fetch at once. A politeness limit against a county server, not a throughput dial — raise it a step at a time and watch for retry warnings in the log |
-| `WELD_SECTION_DOWNLOAD_LIMIT` | No | `250` | How many of the section-wide scan's documents to download. The search itself is complete — it sweeps past the recorder's 100-row render cap by recording date, and one section can hold 800+ documents — so this is the cost/runtime dial. Every document found is listed in `overview.json` either way; the ones fetched are the most survey-relevant first (plats and surveys, then easements/ROW, then deeds, financing paper last). `0` means no cap |
+| `WELD_SECTION_DOWNLOAD_LIMIT` | No | `250` | Safety cap on the chain-of-title search's downloads. It normally fetches a few dozen. Plats and surveys go first, then easements/ROW. `0` means no cap |
 | `CO_DENVER_USERNAME` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
 | `CO_DENVER_PASSWORD` | Optional (Denver) | — | Login for the Denver Kofile recorder portal |
 | `WELD_HEADED` | No | `0` | Set to `1` to show the Playwright browser window |
@@ -270,11 +270,12 @@ read it before modifying scraper logic. Key points:
   owner's most recent vesting deed and any affidavits, then runs the same
   S/T/R Advanced Search filtered to subdivision-exemption types, the
   easement/ROW types above, and finally a SURVEY/ALTA fallback search.
-- **Full section/township/range document scan** (implemented): runs unconditionally
-  after every route above (and after the cross-reference walk), via an unfiltered
-  `_run_advanced_search()` on the same S/T/R — no doc-type filter this time — so
-  anything else recorded against the section that neither the property's own history
-  nor cross-reference harvesting surfaced still gets downloaded. Deduplicated against
+- **Chain-of-title search** (implemented): runs unconditionally after every route above
+  (and after the cross-reference walk). Searches the county under the current owner's
+  name and each prior owner's, walking back through deeds, plus the parcel's S/T/R on its
+  own, and downloads only the PLS's document types (`_CHAIN_PULL_TYPES`). The name search
+  isn't bounded by S/T/R, since most pre-1994 documents have no legal indexed (see the
+  SOP's "Chain-of-title search"). Deduplicated against
   the whole run's `known_receptions`; results land in `overview.json` under
   `section_township_range_search`, separate from the route's own results section.
 - **GLO original survey of record** (implemented): runs unconditionally near the end of

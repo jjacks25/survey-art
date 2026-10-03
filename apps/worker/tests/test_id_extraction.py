@@ -429,3 +429,12 @@ class TestExtractDocumentIds:
         result = extract_document_ids(tmp_path / "missing.pdf")
 
         assert result == IdExtraction()
+
+
+def test_a_read_that_counts_up_drops_the_counted_run_but_keeps_neighbours():
+    def rec(n: str) -> id_extraction.ExtractedId:
+        return id_extraction.ExtractedId(id=n, id_type="reception_number")
+
+    ids = [rec(n) for n in ("3917346", "51623", "51624", "51625", "51626", "1424062", "1424063")]
+    kept = [i.id for i in id_extraction._drop_counting_runs(ids)]
+    assert kept == ["3917346", "1424062", "1424063"]

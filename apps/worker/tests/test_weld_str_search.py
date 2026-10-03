@@ -15,7 +15,6 @@ from survey_art.scrapers.weld_county import (
     _search_all_rows,
     _section_township_range_search,
 )
-from survey_art.settings import get_settings
 
 from .fakes import FakeSearchPage
 
@@ -28,50 +27,115 @@ def _rows(*receptions: str, doc_type: str = "WARRANTY DEED") -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_returns_unseen_rows_tagged_with_str_role():
-    parcel = ParcelInfo(account="R123", section="15", township="5N", range_="67W")
+async def test_keeps_what_a_title_commitment_lists_and_drops_the_rest():
+    """The PLS's document types, plus ROW takes recorded as warranty deeds —
+    not financing, not the chain's sales of land, not another township's paper."""
+    owner = "PETROLEUM EXPLORATION & MANAGEMENT LLC"
+    parcel = ParcelInfo(account="R8995911", owner=owner, section="32", township="5N", range_="65W")
+    s32 = ["Section: 32 Township: 5 Range: 65"]
     page = FakeSearchPage(
         [
-            {"reception": "1111", "doc_type": "WARRANTY DEED", "rec_date": "01/01/2020"},
-            {"reception": "2222", "doc_type": "LIEN", "rec_date": "02/02/2021"},
+            {
+                "reception": "4508544",
+                "doc_type": "WARRANTY DEED",
+                "rec_date": "07/25/2019",
+                "grantors": [owner],
+                "grantees": ["WELD CO"],
+                "legals": s32,
+            },
+            {
+                "reception": "1564302",
+                "doc_type": "OIL & GAS LEASE",
+                "rec_date": "03/23/1971",
+                "grantors": [owner],
+                "grantees": ["HOOVLER PAUL V"],
+                "legals": [],
+            },
+            {
+                "reception": "4744164",
+                "doc_type": "MINERAL DEED",
+                "rec_date": "08/09/2021",
+                "grantors": [owner],
+                "grantees": ["HOLLOWAY EDWARD A"],
+                "legals": ["Section: 19 Township: 3 Range: 66"],
+            },
+            {
+                "reception": "1015046",
+                "doc_type": "WARRANTY DEED",
+                "rec_date": "09/29/1947",
+                "grantors": [owner],
+                "grantees": ["BEJARANO NAVOR"],
+                "legals": [],
+            },
+            {
+                "reception": "9",
+                "doc_type": "DEED OF TRUST",
+                "rec_date": "01/01/2020",
+                "grantors": [owner],
+                "grantees": ["NBH BANK"],
+                "legals": s32,
+            },
+            {"reception": "1111", "doc_type": "PLAT", "rec_date": "01/01/2000", "legals": s32},
         ]
     )
-    seen: set[str] = {"2222"}  # already downloaded via another route
+    seen: set[str] = {"1111"}  # already downloaded via another route
 
     targets, index = await _section_township_range_search(page, parcel, seen)
 
-    assert [(role, doc.reception) for role, doc in targets] == [
-        ("section_township_range_search", "1111")
-    ]
-    assert seen == {"1111", "2222"}
-    # The index reports what the section holds, including rows other routes took.
-    assert [r["reception"] for r in index] == ["1111", "2222"]
+    assert sorted(doc.reception for _, doc in targets) == ["1564302", "4508544"]
+    assert seen == {"1111", "1564302", "4508544"}
+    assert len(index) == 6  # everything found is listed, pulled or not
+    # County-wide, not bounded by section, and searched without the LLC suffix.
+    assert page.searches[0]["#field_BothNamesID"] == "PETROLEUM EXPLORATION & MANAGEMENT"
+    assert page.searches[0]["#field_PLSSLegalID_DOT_Section"] == ""
 
 
 @pytest.mark.asyncio
-async def test_downloads_the_survey_relevant_end_of_a_big_section_first():
-    """The cap decides what a run gives up, so it must give up financing paper.
+async def test_walks_the_chain_of_title_back_through_deed_grantors():
+    """A deed into the owner names the one before as grantor, who is searched
+    next — here through a deed indexed to the neighbouring section, as
+    R8995911's own vesting deed is. A deed into the owner from somewhere else
+    is not followed."""
+    by_name = {
+        "PETROLEUM EXPLORATION & MANAGEMENT": [
+            {
+                "reception": "4372901",
+                "doc_type": "WARRANTY DEED",
+                "rec_date": "02/02/2018",
+                "grantors": ["THURMAN HAYS & CO LLP"],
+                "grantees": ["PETROLEUM EXPLORATION & MANAGEMENT LLC"],
+                "legals": ["Section: 31 Township: 5 Range: 65"],
+            },
+            {
+                "reception": "4487834",
+                "doc_type": "WARRANTY DEED",
+                "rec_date": "05/09/2019",
+                "grantors": ["INCLINE MINERALS LLC"],
+                "grantees": ["PETROLEUM EXPLORATION & MANAGEMENT LLC"],
+                "legals": ["Section: 18 Township: 4 Range: 66"],
+            },
+        ],
+        "THURMAN HAYS & CO": [
+            {
+                "reception": "1138328",
+                "doc_type": "RIGHT OF WAY",
+                "rec_date": "09/15/1952",
+                "grantors": ["THURMAN HAYS & CO"],
+                "grantees": ["WELD CO COLORADO"],
+                "legals": [],
+            },
+        ],
+    }
+    owner = "PETROLEUM EXPLORATION & MANAGEMENT LLC"
+    parcel = ParcelInfo(account="R1", owner=owner, section="32", township="5N", range_="65W")
+    page = FakeSearchPage(lambda form: by_name.get(form["#field_BothNamesID"], []))
 
-    S32-T5N-R65W has 872 documents and 289 of them are deeds of trust; keeping
-    those instead of the section's 8 surveys would be the wrong 250.
-    """
-    parcel = ParcelInfo(account="R123", section="15", township="5N", range_="67W")
-    page = FakeSearchPage(
-        _rows("1", "2", doc_type="DEED OF TRUST")
-        + _rows("3", doc_type="SURVEY")
-        + _rows("4", doc_type="RIGHT OF WAY EASEMENT")
-        + _rows("5", doc_type="WARRANTY DEED")
-    )
-    settings = get_settings()
-    original = settings.weld_section_download_limit
-    settings.weld_section_download_limit = 3
-    try:
-        targets, index = await _section_township_range_search(page, parcel, set())
-    finally:
-        settings.weld_section_download_limit = original
+    targets, _ = await _section_township_range_search(page, parcel, set())
 
-    assert [doc.reception for _, doc in targets] == ["3", "4", "5"]
-    assert len(index) == 5  # nothing is hidden from the metadata
+    # Each chain owner by name, then the section on its own.
+    assert [s["#field_BothNamesID"] for s in page.searches] == [*by_name, ""]
+    assert page.searches[-1]["#field_PLSSLegalID_DOT_Section"] == "32"
+    assert [doc.reception for _, doc in targets] == ["1138328"]
 
 
 @pytest.mark.asyncio
@@ -181,3 +245,34 @@ async def test_a_repeated_sweep_reuses_the_first_one():
 
     assert second == first
     assert len(page.searches) == searches
+
+
+@pytest.mark.asyncio
+async def test_a_search_bounced_to_the_disclaimer_is_rerun(monkeypatch):
+    """The bounce can land on the search submit itself, after the form loaded —
+    which every R8995911 job from 2026-09-28 to 2026-10-02 died of."""
+    monkeypatch.setattr("survey_art.scrapers.weld_county._DISCLAIMER_BACKOFF_S", 0)
+    page = FakeSearchPage(_rows("1"))
+    bounced = []
+
+    async def evaluate(*a, **k):
+        if not bounced:
+            bounced.append(True)
+            page.url = "https://recording.weld.gov/web/user/disclaimer"
+            return []
+        page.url = "https://recording.weld.gov/web/search/DOCSEARCH524S12"
+        return _rows("1")
+
+    class Ctx:
+        async def clear_cookies(self, **k):
+            pass
+
+        async def add_cookies(self, cookies):
+            pass
+
+    page.evaluate = evaluate
+    page.context = Ctx()
+
+    rows = await _run_advanced_search(page, section="32")
+
+    assert [r["reception"] for r in rows] == ["1"]

@@ -169,6 +169,28 @@ def _dedupe(ids: Iterator[ExtractedId] | list[ExtractedId]) -> list[ExtractedId]
     return out
 
 
+# A vision read sometimes degenerates into counting: 51623, 51624, ... 51834.
+# Real documents cite a few receptions apart, never four-plus in a row, so a
+# run that long from one page is the model looping, not the page.
+_COUNTING_RUN = 4
+
+
+def _drop_counting_runs(ids: list[ExtractedId]) -> list[ExtractedId]:
+    numbers = sorted({int(i.id) for i in ids if i.id_type == "reception_number"})
+    looped: set[int] = set()
+    run = numbers[:1]
+    for n in [*numbers[1:], None]:
+        if n is not None and n == run[-1] + 1:
+            run.append(n)
+            continue
+        if len(run) >= _COUNTING_RUN:
+            looped.update(run)
+        run = [n]
+    if looped:
+        logger.warning("id_extraction: dropped %d counted-up reception number(s)", len(looped))
+    return [i for i in ids if not (i.id_type == "reception_number" and int(i.id) in looped)]
+
+
 def parse_ids_from_text(text: str) -> list[ExtractedId]:
     """Pull every labelled record reference out of a block of document text."""
     return _dedupe(
@@ -306,6 +328,11 @@ _EXTRACT_TOOL = {
 # wrong citations. Measured on the R1611986 sample: 7 spurious emissions of those
 # three ids across 8 documents that contain none of them, against 0 with the
 # placeholders below. Keep example ids unmistakably fake.
+# Bump when `_PROMPT` changes what gets reported, so cached answers from the old
+# prompt aren't served. p2: skip PLS/seal and well API numbers — job b721dda1
+# fetched recorder document 22098 because it read King Surveyors' "PLS 22098"
+# off a monument cap as a reception number.
+_PROMPT_VERSION = "p3"
 _PROMPT = (
     "These images are tiles of one page of a land survey / title commitment. Read every "
     "one and find every reference to another recorded document: exception and easement "
@@ -317,8 +344,10 @@ _PROMPT = (
     "the images. Include brief context saying what the document is.\n\n"
     "Tiles overlap, so the same reference may appear twice — report it each time you see "
     "it; duplicates are removed later. Skip dates, bearings, distances, section/township/"
-    "range numbers and ordinance numbers. If a tile has no references, that's fine — call "
-    "record_references with whatever the others contain, or an empty list."
+    "range numbers, ordinance numbers, surveyor license / PLS and seal numbers (e.g. on "
+    "a monument cap), and oil & gas well API numbers. If a tile has no references, "
+    "that's fine — call record_references with whatever the others contain, or an empty "
+    "list."
 )
 
 
@@ -618,7 +647,7 @@ def _read_page(client, model: str, tiles: list[bytes]) -> tuple[list[ExtractedId
         if isinstance(r, dict)
         for item in _classify(str(r.get("value", "")), str(r.get("context") or ""))
     ]
-    return found, in_tok, out_tok
+    return _drop_counting_runs(found), in_tok, out_tok
 
 
 def _extract_with_bedrock(reader: PdfReader, model: str) -> IdExtraction:
@@ -757,10 +786,15 @@ def cache_fingerprint(model: str | None = None) -> str:
 
     And so is the orientation pass, for the same reason: it changes the answer
     for a tenth of the pages in the corpus without touching tile geometry.
+
+    And the prompt version (`_PROMPT_VERSION`), when the prompt changes what
+    counts as a reference.
     """
     model = model or get_settings().id_extraction_model
     render = f"{_TILE_MAX_NATIVE_PX}_{_TILE_MAX_PX}_{_TILE_FORMAT}{_TILE_QUALITY}"
-    return f"{model}_{render}_turn{_TURN_PROBE_MAX_PX}".replace("/", "_").replace(":", "_")
+    return f"{model}_{render}_turn{_TURN_PROBE_MAX_PX}_{_PROMPT_VERSION}".replace("/", "_").replace(
+        ":", "_"
+    )
 
 
 def extract_document_ids(pdf_path: Path, *, model: str | None = None) -> IdExtraction:

@@ -295,16 +295,40 @@ packet itself becomes the de facto survey of record.
 
 ---
 
-## Full section/township/range document scan
+## Chain-of-title search
 
 After whichever research route above finishes (and after cross-reference expansion), the
-scraper runs one more unfiltered Advanced Search — same S/T/R fields as the easement/ROW
-scan, but **no doc-type post-filter** — to catch anything else recorded against this
-parcel's section that neither Document History nor cross-reference harvesting turned up.
-Anything found and not already downloaded this run gets pulled too.
+scraper chases the chain of title the way a title company does:
+
+1. Search the **current owner's** name ("Search Name as Grantor or Grantee") across the
+   whole county, with entity suffixes (LLC, LLP, LTD, ...) dropped, since the recorder
+   indexes the same entity with and without them.
+2. Every deed *into* that owner names the previous owner as its grantor. Search that name
+   next, and keep walking back, up to 8 owners. Only deeds indexed to the parcel's
+   township and range, or with no legal indexed at all, are followed, so the walk doesn't
+   wander off through every other tract an owner bought.
+3. Also search the parcel's S/T/R on its own (date-swept past the 100-row cap), for what
+   the chain can't reach: documents recorded under other people's names.
+4. From both, download only the recorder Document Types our PLS picked (`_CHAIN_PULL_TYPES`:
+   easements, ROW, plats, surveys, exemptions, O&G leases, patents, vacations, ...), plus
+   deeds to a government or ditch company (a ROW take recorded as a plain WARRANTY DEED),
+   and never a document indexed to a **different** township. Everything else is listed in
+   `overview.json` but not downloaded.
+
+**Why not bound it by S/T/R?** The recorder indexes legal descriptions only from ~1994,
+and a parcel's documents are often indexed to the neighbouring section. Measured on
+R8995911 (S32-T5N-R65W) against its 27-item title commitment (FCIF25219389): only **3**
+of those documents are indexed to S32, and its own 2018 vesting deeds are indexed to S31.
+The chain search (Petroleum Exploration & Management ← Thurman Hays & Co / Chet Hays
+Family Co ← Hays Thurman) downloads 49 documents covering 15 of the 27. The old unfiltered
+section scan downloaded 124+ and covered 2.
+
+Names go in "Grantor or Grantee", not Grantee alone: an owner granting an easement or
+dedicating ROW is the grantor.
 
 > **Implementation.** `_section_township_range_search()`, called unconditionally at the end
-> of `scrape()` regardless of routing path. Deduplicates against the run's whole
+> of `scrape()` regardless of routing path. What gets downloaded is
+> `_is_chain_pull()` (`_CHAIN_PULL_TYPES`, `_PUBLIC_GRANTEES`). Deduplicates against the run's whole
 > `known_receptions` set (already includes everything from direct extraction, the
 > easement/ROW scan, and cross-reference expansion), so nothing already on disk is
 > re-downloaded. Results land in `overview.json` under `section_township_range_search`,
